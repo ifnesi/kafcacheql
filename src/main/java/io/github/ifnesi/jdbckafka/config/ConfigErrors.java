@@ -10,7 +10,7 @@ import java.sql.SQLNonTransientConnectionException;
 public final class ConfigErrors {
 
     /** SQLState for "SQL client unable to establish SQL connection". */
-    static final String SQLSTATE = "08001";
+    public static final String SQLSTATE = "08001";
 
     private ConfigErrors() {}
 

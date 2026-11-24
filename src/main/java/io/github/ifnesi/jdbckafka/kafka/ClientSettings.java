@@ -3,6 +3,7 @@ package io.github.ifnesi.jdbckafka.kafka;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.github.ifnesi.jdbckafka.config.ConfigErrors;
 import io.github.ifnesi.jdbckafka.config.DriverConfig;
+import io.github.ifnesi.jdbckafka.config.DriverLoader;
 import io.github.ifnesi.jdbckafka.config.Secrets;
 import java.sql.SQLException;
 import java.util.Collections;
@@ -35,11 +36,11 @@ public final class ClientSettings {
     /** The fixed consumer settings and their values. group.id must be absent. */
     static final Map<String, String> FIXED = fixed();
 
-    private static final Set<String> KNOWN = Stream.of(
+    private static final Set<String> KNOWN = DriverLoader.call(() -> Stream.of(
                     ConsumerConfig.configNames(), AdminClientConfig.configNames(), ProducerConfig.configNames(),
                     AbstractKafkaSchemaSerDeConfig.baseConfigDef().names())
             .flatMap(Set::stream)
-            .collect(Collectors.toUnmodifiableSet());
+            .collect(Collectors.toUnmodifiableSet()));
 
     /** Prefixes of Schema Registry client and Kafka settings that no definition lists one by one. */
     private static final List<String> KNOWN_PREFIXES = List.of(
@@ -55,9 +56,18 @@ public final class ClientSettings {
         this.schemaRegistry = Collections.unmodifiableMap(schemaRegistry);
     }
 
+    /** Validation loads the classes settings name, so it runs with the driver's class loader (DriverLoader). */
     public static ClientSettings of(DriverConfig config) throws SQLException {
+        return DriverLoader.call(() -> build(config));
+    }
+
+    private static ClientSettings build(DriverConfig config) throws SQLException {
         Map<String, String> given = config.clientSettings();
-        Map<String, String> settings = ShadedNames.rewrite(given);
+        Map<String, String> settings = new LinkedHashMap<>(ShadedNames.rewrite(given));
+        if (given.containsKey(JaasSettings.KEY)) {
+            settings.put(JaasSettings.KEY, JaasSettings.prepare(given.get(JaasSettings.KEY), ShadedNames.PREFIX));
+        }
+        settings = registryCredentialsFromUrl(settings);
         checkFixed(settings);
         warnUnknown(given.keySet());
 
@@ -139,6 +149,78 @@ public final class ClientSettings {
         }
     }
 
+    private static final String REGISTRY_URL = AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG;
+    private static final String CREDENTIALS_SOURCE = "basic.auth.credentials.source";
+    private static final String USER_INFO = "basic.auth.user.info";
+    private static final String PREFIXED_USER_INFO = "schema.registry.basic.auth.user.info";
+
+    /**
+     * Credentials written into schema.registry.url (Confluent reads them with basic.auth.credentials.source
+     * URL, its default) move to basic.auth.user.info: the clients log their URL settings in full but hide
+     * basic.auth.user.info. They are read by java.net.URL, as Confluent reads them (Secrets.urlCredentials),
+     * and taken as written, as Confluent takes URL.getUserInfo(). Every '@' in the setting must end a URL's
+     * credentials: any other, which would reach the clients' logs as written, is refused. basic.auth.user.info
+     * applies to every URL, so a list where only some URLs carry credentials is refused too: moving them would
+     * send them to URLs that had none.
+     */
+    private static Map<String, String> registryCredentialsFromUrl(Map<String, String> settings) throws SQLException {
+        String urls = settings.get(REGISTRY_URL);
+        if (urls == null || !urls.contains("@")) {
+            return settings;
+        }
+        Set<String> credentials = new java.util.LinkedHashSet<>();
+        List<String> withoutCredentials = new java.util.ArrayList<>();
+        int bare = 0;
+        for (String url : urls.split(",")) {
+            String entry = url.trim();
+            if (entry.indexOf('@') < 0) {
+                bare++;
+                withoutCredentials.add(entry);
+                continue;
+            }
+            Secrets.UrlCredentials parsed = Secrets.urlCredentials(entry).orElse(null);
+            if (parsed != null && parsed.ambiguous()) {
+                throw ConfigErrors.problem("schema.registry.url has more than one '@' before a host: percent-encode "
+                        + "an '@' inside credentials as %40, or set them in basic.auth.user.info");
+            }
+            if (parsed == null || parsed.userInfo() == null || parsed.withoutUserInfo().indexOf('@') >= 0) {
+                throw ConfigErrors.problem("schema.registry.url has an '@' that doesn't end a URL's credentials "
+                        + "(scheme://user:password@host): percent-encode '@', '/', '?' and '#' inside credentials, "
+                        + "or set them in basic.auth.user.info");
+            }
+            credentials.add(parsed.userInfo());
+            withoutCredentials.add(parsed.withoutUserInfo());
+        }
+        if (credentials.isEmpty()) {
+            return settings;
+        }
+        if (credentials.size() > 1) {
+            throw ConfigErrors.problem("schema.registry.url holds different credentials in its URLs: set them once, "
+                    + "in basic.auth.user.info");
+        }
+        if (bare > 0) {
+            throw ConfigErrors.problem("schema.registry.url gives credentials to some of its URLs only: give every URL "
+                    + "the same credentials, or set them once in basic.auth.user.info");
+        }
+        String userInfo = credentials.iterator().next();
+        String source = settings.get(CREDENTIALS_SOURCE);
+        if (source != null && !source.equals("URL") && !source.equals("USER_INFO")) {
+            throw ConfigErrors.problem("schema.registry.url holds credentials, but basic.auth.credentials.source is "
+                    + source + ": keep the credentials in one place");
+        }
+        for (String key : List.of(USER_INFO, PREFIXED_USER_INFO)) {
+            if (settings.containsKey(key) && !settings.get(key).equals(userInfo)) {
+                throw ConfigErrors.problem("schema.registry.url and " + key + " hold different credentials: "
+                        + "keep them in " + key + " only");
+            }
+        }
+        Map<String, String> out = new LinkedHashMap<>(settings);
+        out.put(REGISTRY_URL, String.join(",", withoutCredentials));
+        out.put(CREDENTIALS_SOURCE, "USER_INFO");
+        out.put(USER_INFO, userInfo);
+        return out;
+    }
+
     private static Map<String, Object> only(Map<String, String> settings, Set<String> names) {
         Map<String, Object> out = new TreeMap<>();
         settings.forEach((k, v) -> {
@@ -159,7 +241,9 @@ public final class ClientSettings {
                 AbstractKafkaSchemaSerDeConfig.baseConfigDef().parse(schemaRegistry);
             }
         } catch (ConfigException e) {
-            throw ConfigErrors.problem("Invalid client setting: " + Secrets.redact(e.getMessage(), given));
+            Map<String, Object> all = new TreeMap<>(given);
+            all.putAll(schemaRegistry);
+            throw ConfigErrors.problem("Invalid client setting: " + Secrets.redact(e.getMessage(), all));
         }
     }
 }

@@ -46,6 +46,23 @@ class KafkaDriverTest {
                 .getMessage().contains("offline"));
     }
 
+    /** Invalid input is always an SQLException with SQLState 08001, never an unchecked exception. */
+    @Test
+    void everyConfigurationErrorIsAnSqlException() throws Exception {
+        java.nio.file.Path bad = java.nio.file.Files.createTempFile("bad", ".properties");
+        java.nio.file.Files.writeString(bad, "a=\\uXXXX\n");
+        Properties p = new Properties();
+        p.setProperty("config.file", bad.toString());
+        for (String url : java.util.List.of("jdbc:kafka://h:1?cache.path=%00", "jdbc:kafka://h:1?config.file=%00",
+                "jdbc:kafka://h:1?topic...mode=append", "jdbc:kafka://u:p@h:1",
+                "jdbc:kafka://h:1?sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule%20required%20password=a%20b;")) {
+            SQLException e = assertThrows(SQLException.class, () -> driver.connect(url, null), url);
+            assertEquals("08001", e.getSQLState(), url);
+        }
+        assertEquals("08001", assertThrows(SQLException.class, () -> driver.connect("jdbc:kafka://h:1", p)).getSQLState());
+        java.nio.file.Files.delete(bad);
+    }
+
     @Test
     void validConfigurationReachesTheConnectionStep() {
         // Until connections are built.

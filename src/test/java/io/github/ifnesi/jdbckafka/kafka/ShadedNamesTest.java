@@ -19,19 +19,7 @@ class ShadedNamesTest {
         assertEquals(P, ShadedNames.prefixOf(P + "org.apache.kafka.clients.CommonClientConfigs"));
     }
 
-    @Test
-    void jaasRewritesOnlyTheLoginModuleAndLeavesItsOptionsByteForByte() {
-        String options = " required username='k' password='s3cr3t org.apache.kafka. ;=\"x\"';";
-        assertEquals(P + PLAIN + options, ShadedNames.jaas(PLAIN + options, P));
-        assertEquals("  \t" + P + PLAIN + options, ShadedNames.jaas("  \t" + PLAIN + options, P));
-        assertEquals(P + PLAIN + ";", ShadedNames.jaas(PLAIN + ";", P));
-    }
 
-    @Test
-    void jaasWithAnotherLoginModuleIsUnchanged() {
-        String krb = "com.sun.security.auth.module.Krb5LoginModule required useKeyTab=true;";
-        assertEquals(krb, ShadedNames.jaas(krb, P));
-    }
 
     @Test
     void classNamesAndLists() {
@@ -57,7 +45,7 @@ class ShadedNamesTest {
         in.put("security.protocol", "SASL_SSL");
 
         Map<String, String> out = ShadedNames.rewrite(in, P);
-        assertEquals(P + PLAIN + " required;", out.get("sasl.jaas.config"));
+        assertEquals(PLAIN + " required;", out.get("sasl.jaas.config"), "JaasSettings' job");
         assertEquals(P + in.get("sasl.login.callback.handler.class"), out.get("sasl.login.callback.handler.class"));
         assertEquals(P + in.get("value.subject.name.strategy"), out.get("value.subject.name.strategy"));
         assertEquals(P + in.get("value.schema.id.deserializer"), out.get("value.schema.id.deserializer"));

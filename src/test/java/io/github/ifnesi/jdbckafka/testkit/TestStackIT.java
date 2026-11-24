@@ -12,6 +12,8 @@ import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
+import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
+import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericDatumWriter;
@@ -94,6 +96,38 @@ class TestStackIT {
         ConsumerRecord<byte[], byte[]> r = only(TestStack.readAll(topic, true));
         assertNotNull(r.headers().lastHeader("__key_schema_id"));
         assertNotNull(r.headers().lastHeader("__value_schema_id"));
+        assertEquals("key-as-avro-string", decode(topic, r, true).toString(), "the key that was asked for");
+        assertEquals(order("o1", 1), decode(topic, r, false));
+    }
+
+    @Test
+    void avroPrefixAndHeaderRecordsDecodeToWhatWasSent() {
+        String topic = TestStack.uniqueTopic("avro-roundtrip");
+        TestStack.createTopic(topic, 1, Map.of());
+        TestStack.sendAvro(topic, "k1", order("p", 2.5), null, TestStack.SchemaIdIn.PREFIX);
+        TestStack.sendAvro(topic, "k2", order("h", 3.5), null, TestStack.SchemaIdIn.HEADER);
+        List<ConsumerRecord<byte[], byte[]>> rs = TestStack.readAll(topic, true);
+        assertEquals(order("p", 2.5), decode(topic, rs.get(0), false));
+        assertEquals(order("h", 3.5), decode(topic, rs.get(1), false));
+    }
+
+    @Test
+    void readAllStopsAtTheEndOffsetsItTook() {
+        String topic = TestStack.uniqueTopic("snapshot");
+        TestStack.createTopic(topic, 1, Map.of());
+        TestStack.sendString(topic, "k", "before", null);
+        List<String> values = TestStack.readAll(topic, true, () -> TestStack.sendString(topic, "k", "after", null))
+                .stream().map(r -> utf8(r.value())).toList();
+        assertEquals(List.of("before"), values);
+        assertEquals(List.of("before", "after"), TestStack.readAll(topic, true).stream().map(r -> utf8(r.value())).toList());
+    }
+
+    /** Confluent's deserializer: it reads the schema reference from the header first, then from the prefix. */
+    private static Object decode(String topic, ConsumerRecord<byte[], byte[]> r, boolean isKey) {
+        try (KafkaAvroDeserializer d = new KafkaAvroDeserializer()) {
+            d.configure(Map.of(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, TestStack.REGISTRY), isKey);
+            return d.deserialize(topic, r.headers(), isKey ? r.key() : r.value());
+        }
     }
 
     @Test
@@ -101,30 +135,30 @@ class TestStackIT {
         String topic = TestStack.uniqueTopic("plain");
         TestStack.createTopic(topic, 1, Map.of());
         byte[] raw = {(byte) 0xff, 0, 1, 2};
-        TestStack.sendJson(topic, "j", "{\"a\":1}", 1_000L);
-        TestStack.sendString(topic, "s", "hello", 2_000L);
-        TestStack.sendBytes(topic, raw, raw, 3_000L);
-        TestStack.sendTombstone(topic, "j", 4_000L);
+        TestStack.sendJson(topic, "j", "{\"a\":1}", TestStack.recent(1_000L));
+        TestStack.sendString(topic, "s", "hello", TestStack.recent(2_000L));
+        TestStack.sendBytes(topic, raw, raw, TestStack.recent(3_000L));
+        TestStack.sendTombstone(topic, "j", TestStack.recent(4_000L));
 
         List<ConsumerRecord<byte[], byte[]>> rs = TestStack.readAll(topic, true);
         assertEquals(4, rs.size());
         assertEquals("{\"a\":1}", utf8(rs.get(0).value()));
-        assertEquals(1_000L, rs.get(0).timestamp());
+        assertEquals(TestStack.recent(1_000L), rs.get(0).timestamp());
         assertEquals("hello", utf8(rs.get(1).value()));
         assertEquals("s", utf8(rs.get(1).key()));
         assertArrayEquals(raw, rs.get(2).key());
         assertArrayEquals(raw, rs.get(2).value());
         assertEquals("j", utf8(rs.get(3).key()));
         assertNull(rs.get(3).value(), "tombstone");
-        assertEquals(4_000L, rs.get(3).timestamp());
+        assertEquals(TestStack.recent(4_000L), rs.get(3).timestamp());
     }
 
     @Test
     void transactionsCommitAndAbort() {
         String topic = TestStack.uniqueTopic("tx");
         TestStack.createTopic(topic, 1, Map.of());
-        TestStack.inTransaction(true, p -> p.send(new ProducerRecord<>(topic, utf8("k"), utf8("committed"))));
-        TestStack.inTransaction(false, p -> p.send(new ProducerRecord<>(topic, utf8("k"), utf8("aborted"))));
+        TestStack.inTransaction(topic, true, p -> p.send(new ProducerRecord<>(topic, utf8("k"), utf8("committed"))));
+        TestStack.inTransaction(topic, false, p -> p.send(new ProducerRecord<>(topic, utf8("k"), utf8("aborted"))));
 
         List<String> committed = TestStack.readAll(topic, true).stream().map(r -> utf8(r.value())).toList();
         List<String> all = TestStack.readAll(topic, false).stream().map(r -> utf8(r.value())).toList();

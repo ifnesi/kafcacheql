@@ -95,6 +95,28 @@ class JdbcUrlTest {
     }
 
     @Test
+    void toStringHidesCredentials() throws SQLException {
+        String s = JdbcUrl.parse("jdbc:kafka://h:1?sasl.jaas.config=URL-CANARY&client.id=x").toString();
+        assertFalse(s.contains("URL-CANARY"), s);
+        assertTrue(s.contains("client.id=x"), s);
+        for (String url : java.util.List.of("http://alice:FIRST,COMMA-CANARY@r:8081", "http://alice:HEAD@TAIL/SLASH-CANARY@r:8081",
+                "http://alice:ONE-CANARY@r1:8081,http://alice:TWO-CANARY@r2:8082")) {
+            String shown = JdbcUrl.parse("jdbc:kafka://h:1?schema.registry.url=" + url).toString();
+            assertFalse(shown.contains("CANARY"), shown);
+        }
+    }
+
+    @Test
+    void credentialsInTheHostListAreRefusedWithoutBeingEchoed() {
+        SQLException e = assertThrows(SQLException.class,
+                () -> JdbcUrl.parse("jdbc:kafka://test:AUTHORITY-CANARY@localhost:9092"));
+        assertFalse(e.getMessage().contains("AUTHORITY-CANARY"), e.getMessage());
+        assertTrue(e.getMessage().contains("can't hold credentials"), e.getMessage());
+        SQLException odd = assertThrows(SQLException.class, () -> JdbcUrl.parse("jdbc:kafka://what%20ever:1"));
+        assertFalse(odd.getMessage().contains("what%20ever"), "only host characters are quoted back");
+    }
+
+    @Test
     void accepts() {
         assertTrue(JdbcUrl.accepts("jdbc:kafka://h:1"));
         assertTrue(JdbcUrl.accepts("jdbc:kafka:anything"), "accepted, then rejected as malformed by parse");

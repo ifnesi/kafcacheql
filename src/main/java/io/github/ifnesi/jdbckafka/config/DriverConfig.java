@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -49,7 +50,8 @@ public record DriverConfig(
 
     public static final String BOOTSTRAP_SERVERS = "bootstrap.servers";
     private static final String TOPIC_PREFIX = "topic.";
-    private static final Pattern TOPIC_NAME = Pattern.compile("[A-Za-z0-9._-]{1,249}");
+    /** Kafka's rule: 1 to 249 of A-Z, a-z, 0-9, '.', '_' and '-', but not "." or "..". */
+    private static final Pattern TOPIC_NAME = Pattern.compile("(?!\\.{1,2}$)[A-Za-z0-9._-]{1,249}");
     private static final Pattern DURATION = Pattern.compile("([0-9]{1,18})(ms|s|m|h|d)");
 
     /** The topic's overrides; {@link TopicSettings#NONE} when it has none. */
@@ -119,8 +121,9 @@ public record DriverConfig(
         }
 
         boolean offline = bool(own, DriverProperty.OFFLINE);
-        Optional<Path> cachePath = Optional.ofNullable(own.get(DriverProperty.CACHE_PATH))
-                .map(v -> path(DriverProperty.CACHE_PATH.key(), v));
+        String cachePathValue = own.get(DriverProperty.CACHE_PATH);
+        Optional<Path> cachePath = cachePathValue == null
+                ? Optional.empty() : Optional.of(path(DriverProperty.CACHE_PATH.key(), cachePathValue));
         if (offline && cachePath.isEmpty()) {
             throw ConfigErrors.problem("offline=true needs cache.path: the cluster ID that names the default cache "
                     + "file can't be looked up offline");
@@ -184,7 +187,7 @@ public record DriverConfig(
                 String topic = key.substring(TOPIC_PREFIX.length(), key.length() - suffix.length());
                 if (!TOPIC_NAME.matcher(topic).matches()) {
                     throw ConfigErrors.problem("Invalid topic name in " + key
-                            + ": topic names are 1 to 249 of A-Z, a-z, 0-9, '.', '_' and '-'");
+                            + ": topic names are 1 to 249 of A-Z, a-z, 0-9, '.', '_' and '-', and not . or ..");
                 }
                 Object parsed = switch (setting) {
                     case MODE -> Mode.parse(value).orElseThrow(
@@ -274,15 +277,19 @@ public record DriverConfig(
     }
 
     /** {@code ~} and {@code ~/...} start at the user's home directory. */
-    static Path path(String key, String value) {
+    static Path path(String key, String value) throws SQLException {
         String home = System.getProperty("user.home");
-        if (value.equals("~")) {
-            return Path.of(home);
+        try {
+            if (value.equals("~")) {
+                return Path.of(home);
+            }
+            if (value.startsWith("~/")) {
+                return Path.of(home, value.substring(2));
+            }
+            return Path.of(value);
+        } catch (InvalidPathException e) {
+            throw ConfigErrors.problem("Invalid value for " + key + ": not a file path (" + e.getReason() + ")");
         }
-        if (value.startsWith("~/")) {
-            return Path.of(home, value.substring(2));
-        }
-        return Path.of(value);
     }
 
     private static Map<String, String> readConfigFile(Path file) throws SQLException {
@@ -290,7 +297,11 @@ public record DriverConfig(
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             props.load(reader);
         } catch (IOException e) {
-            throw ConfigErrors.problem("config.file " + file + " can't be read: " + e, e);
+            throw ConfigErrors.problem("config.file " + file + " can't be read: " + e.getClass().getSimpleName()
+                    + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            // Properties.load: a malformed unicode escape. Its message quotes nothing from the file.
+            throw ConfigErrors.problem("config.file " + file + " isn't a valid properties file: " + e.getMessage());
         }
         Map<String, String> values = strings(props);
         if (values.containsKey(DriverProperty.CONFIG_FILE.key())) {

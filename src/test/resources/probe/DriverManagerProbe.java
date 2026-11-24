@@ -22,6 +22,11 @@ public class DriverManagerProbe {
         } catch (SQLException e) {
             System.out.println("sqlite=not registered");
         }
+        // Opening a cache uses SQLite; it mustn't register SQLite's driver as a side effect.
+        try (io.github.ifnesi.jdbckafka.cache.CacheStore cache = io.github.ifnesi.jdbckafka.cache.CacheStore.open(
+                java.nio.file.Path.of(args[1]), java.util.Optional.of("probe-cluster"))) {
+            System.out.println("driversAfterCache=" + DriverManager.drivers().map(d -> d.getClass().getName()).toList());
+        }
     }
 
     private static String jarOf(String className) throws ClassNotFoundException {

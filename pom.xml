@@ -155,6 +155,11 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-jar-plugin</artifactId>
           <version>3.5.1</version>
+          <configuration>
+            <!-- Without it, a build without `clean` keeps the last shaded JAR as the project's JAR, and
+                 shade processes its own output again. -->
+            <forceCreation>true</forceCreation>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -264,6 +269,8 @@
           <systemPropertyVariables>
             <shadedJar>${project.build.directory}/${project.build.finalName}.jar</shadedJar>
             <otherKafkaClients>${project.build.directory}/it-libs/kafka-clients-3.9.1.jar</otherKafkaClients>
+            <!-- ShadedJarIT's isolated class loader has no SLF4J provider; that is expected, not news. -->
+            <slf4j.internal.verbosity>ERROR</slf4j.internal.verbosity>
           </systemPropertyVariables>
         </configuration>
       </plugin>
@@ -292,6 +299,7 @@
                     <exclude>META-INF/*.EC</exclude>
                     <exclude>META-INF/versions/*/module-info.class</exclude>
                     <exclude>module-info.class</exclude>
+                    <exclude>META-INF/DEPENDENCIES</exclude>
                     <!-- Shade doesn't relocate multi-release copies; the relocated base classes run on Java 21. -->
                     <exclude>META-INF/versions/*/com/fasterxml/**</exclude>
                     <exclude>META-INF/versions/*/org/yaml/**</exclude>

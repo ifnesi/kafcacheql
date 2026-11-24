@@ -18,7 +18,8 @@ import org.slf4j.spi.SLF4JServiceProvider;
 /**
  * The tests' SLF4J provider (registered in src/test/resources/META-INF/services): records every log line,
  * at every level, between {@link #start()} and {@link #stop()}, so tests can check what the driver and the
- * clients log. Outside a capture it prints WARN and ERROR to stderr and drops the rest.
+ * clients log, without printing them. Outside a capture it prints WARN and ERROR to stderr and drops the rest.
+ * There is one buffer for the JVM: tests run one at a time (JUnit's default), and captures don't overlap.
  */
 public final class LogCapture implements SLF4JServiceProvider {
 
@@ -103,7 +104,7 @@ public final class LogCapture implements SLF4JServiceProvider {
                 line += "\n" + trace;
             }
             record(line);
-            if (level.toInt() >= Level.WARN.toInt()) {
+            if (!capturing && level.toInt() >= Level.WARN.toInt()) {
                 System.err.println(line);
             }
         }

@@ -41,6 +41,26 @@ class ShadedLoginIT {
         assertEquals(TestStack.admin().describeCluster().clusterId().get(), out.get("clusterId"));
     }
 
+    /** JAAS allows comments and quoted option keys; neither may break the rewrite for the shaded JAR. */
+    @Test
+    void commentsInTheJaasConfigDontBreakTheLogin() throws Exception {
+        for (String jaas : java.util.List.of(
+                "/* a comment */ org.apache.kafka.common.security.plain.PlainLoginModule required username='test' password='test-secret';",
+                "// a line comment\\norg.apache.kafka.common.security.plain.PlainLoginModule required username=\"test\" password=\"test-secret\";",
+                "org.apache.kafka.common.security.plain.PlainLoginModule required username='test' password='test-secret' \"ignored option\"='x';")) {
+            Map<String, String> out = probe(config(jaas), "rewritten");
+            assertEquals("ok", out.get("login"), jaas + " -> " + out);
+        }
+    }
+
+    /** Through the driver, from a thread whose context class loader can't see the relocated login module. */
+    @Test
+    void theDriverLogsInWhateverTheCallersContextClassLoader() throws Exception {
+        Map<String, String> out = probe(config("test-secret"), "driver-blind");
+        assertEquals("ok", out.get("login"), out.toString());
+        assertEquals(TestStack.admin().describeCluster().clusterId().get(), out.get("clusterId"));
+    }
+
     @Test
     void withoutTheRewriteTheLoginModuleIsntFound() throws Exception {
         Map<String, String> out = probe(config("test-secret"), "raw");
@@ -57,14 +77,17 @@ class ShadedLoginIT {
         assertFalse(out.get("error").contains("wrong-password"), "no credential in the error");
     }
 
-    private static Path config(String password) throws Exception {
+    private static Path config(String passwordOrJaas) throws Exception {
+        String jaas = passwordOrJaas.contains("LoginModule") ? passwordOrJaas
+                : "org.apache.kafka.common.security.plain.PlainLoginModule required username='test' password='"
+                        + passwordOrJaas + "';";
         Path f = Files.createTempFile(dir, "client", ".properties");
         Files.writeString(f, """
                 bootstrap.servers=%s
                 security.protocol=SASL_PLAINTEXT
                 sasl.mechanism=PLAIN
-                sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username='test' password='%s';
-                """.formatted(SASL_BOOTSTRAP, password));
+                sasl.jaas.config=%s
+                """.formatted(SASL_BOOTSTRAP, jaas));
         return f;
     }
 
@@ -72,7 +95,8 @@ class ShadedLoginIT {
         Path source = Path.of(ShadedLoginIT.class.getResource("/probe/ShadedLoginProbe.java").toURI());
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process p = new ProcessBuilder(java, "-cp", System.getProperty("shadedJar"), source.toString(),
-                "jdbc:kafka://?config.file=" + configFile, mode).redirectErrorStream(true).start();
+                "jdbc:kafka://?config.file=" + configFile, mode, "jdbc:kafka://" + TestStack.BOOTSTRAP)
+                .redirectErrorStream(true).start();
         assertTrue(p.waitFor(90, TimeUnit.SECONDS), "probe finished");
         String output = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertEquals(0, p.exitValue(), output);

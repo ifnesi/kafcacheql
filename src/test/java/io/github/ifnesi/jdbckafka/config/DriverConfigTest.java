@@ -170,7 +170,19 @@ class DriverConfigTest {
         }
 
         @Test
-        void homeDirectoryIsExpanded() {
+        void aPathTheFileSystemCantHoldFailsAsConfiguration() {
+            assertTrue(fails(URL + "?cache.path=%00", null).getMessage().contains("cache.path"));
+            assertTrue(fails(URL + "?config.file=%00", null).getMessage().contains("config.file"));
+        }
+
+        @Test
+        void aMalformedPropertiesFileFailsAsConfiguration() throws Exception {
+            Path f = file("sasl.jaas.config=\\uXXXX\n");
+            assertTrue(fails(URL, props("config.file", f.toString())).getMessage().contains("isn't a valid properties file"));
+        }
+
+        @Test
+        void homeDirectoryIsExpanded() throws SQLException {
             assertEquals(Path.of(System.getProperty("user.home"), "x", "y.db"), DriverConfig.path("k", "~/x/y.db"));
             assertEquals(Path.of(System.getProperty("user.home")), DriverConfig.path("k", "~"));
             assertEquals(Path.of("/abs/c.db"), DriverConfig.path("k", "/abs/c.db"));
@@ -335,7 +347,8 @@ class DriverConfigTest {
                 "topic.t.mode,stream", "topic.t.key.format,xml", "topic.t.value.format,AVRO",
                 "topic.t.append.default.window,0m", "topic.t.append.default.window.max.records,0",
                 "topic.t.delete.retention.ms,-1", "topic.t.colour,red", "topic.mode,append",
-                "topic..mode,append", "topic.bad name.mode,append", "topic.bad/name.mode,append"})
+                "topic..mode,append", "topic.bad name.mode,append", "topic.bad/name.mode,append",
+                "topic...mode,append", "topic....mode,append"})
         void badSettings(String key, String value) {
             SQLException e = fails(URL, props(key, value));
             assertTrue(e.getMessage().contains(key), e.getMessage());

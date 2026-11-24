@@ -231,6 +231,224 @@ class CacheStoreTest {
         assertArrayEquals(textBytes, sha256(text));
     }
 
+    @Test
+    void aDamagedCacheIsRefusedAndLeftUntouched() throws Exception {
+        for (String damage : List.of("DELETE FROM \"$meta\" WHERE name = 'cluster_id'",
+                "UPDATE \"$meta\" SET value = '' WHERE name = 'cluster_id'", "DROP TABLE \"$subjects\"")) {
+            Path f = Files.createTempDirectory(dir, "damaged").resolve("c.db");
+            CacheStore.open(f, A).close();
+            try (Connection c = raw(f); Statement s = c.createStatement()) {
+                s.execute(damage);
+            }
+            byte[] bytes = sha256(f);
+            for (Optional<String> cluster : List.of(A, Optional.<String>empty())) {
+                SQLException e = assertThrows(SQLException.class, () -> CacheStore.open(f, cluster), damage);
+                assertTrue(e.getMessage().contains("is damaged"), e.getMessage());
+            }
+            assertArrayEquals(bytes, sha256(f), damage);
+        }
+    }
+
+    /** A process that stopped mid-way leaves committed data in the WAL; refusing that cache keeps it there. */
+    @Test
+    void refusingACacheLeftByACrashedProcessKeepsItsWal() throws Exception {
+        Path f = dir.resolve("crashed.db");
+        Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", System.getProperty("java.class.path"), CacheCrash.class.getName(), f.toString())
+                .redirectErrorStream(true).start();
+        assertTrue(child.waitFor(60, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(0, child.exitValue(), new String(child.getInputStream().readAllBytes()));
+        Path wal = Path.of(f + "-wal");
+        assertTrue(Files.size(wal) > 0, "the committed data is in the WAL");
+        byte[] main = sha256(f);
+        byte[] walBytes = sha256(wal);
+
+        SQLException e = assertThrows(SQLException.class, () -> CacheStore.open(f, B));
+        assertTrue(e.getMessage().contains("belongs to cluster cluster-A, not cluster-B")
+                || e.getMessage().contains("belongs to cluster A, not cluster-B"), e.getMessage());
+        assertArrayEquals(main, sha256(f), "main file unchanged");
+        assertArrayEquals(walBytes, sha256(wal), "WAL kept, unchanged");
+
+        try (CacheStore cache = CacheStore.open(f, Optional.of("A"))) {
+            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$subjects\""), "nothing lost");
+        }
+    }
+
+    /** SQLite resolves links; so does the cache, or it would check and restrict the wrong -wal and -shm files. */
+    @Test
+    void aPathThroughASymbolicLinkIsTheRealFile() throws Exception {
+        assumeTrue(posix());
+        Path real = dir.resolve("real.db");
+        CacheStore.open(real, A).close();
+        Files.setPosixFilePermissions(real, PosixFilePermissions.fromString("rw-r--r--"));
+        Path alias = Files.createSymbolicLink(dir.resolve("alias.db"), real);
+        try (CacheStore cache = CacheStore.open(alias, A); Statement s = cache.writer().createStatement()) {
+            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+            assertEquals(real.toRealPath(), cache.path());
+            for (Path p : List.of(real, Path.of(real + "-wal"), Path.of(real + "-shm"))) {
+                assertEquals("rw-------", perms(p), p.toString());
+            }
+            assertTrue(Files.notExists(Path.of(alias + "-wal")), "no -wal beside the link");
+        }
+    }
+
+    /** "link/../cache.db" is the cache.db beside the link's target, as the file system reads it. */
+    @Test
+    void aDotDotAfterALinkLeadsFromTheLinksTarget() throws Exception {
+        assumeTrue(posix());
+        Path target = Files.createDirectories(dir.resolve("actual/sub"));
+        Path link = Files.createSymbolicLink(dir.resolve("link"), target);
+        Path meant = dir.resolve("actual/cache.db");
+        try (CacheStore cache = CacheStore.open(meant, A); Statement s = cache.writer().createStatement()) {
+            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+        }
+        CacheStore.open(dir.resolve("cache.db"), A).close(); // what a lexical ".." would pick: same cluster, no rows
+        try (CacheStore cache = CacheStore.open(link.resolve("../cache.db"), A)) {
+            assertEquals(meant.toRealPath(), cache.path());
+            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$subjects\""));
+        }
+    }
+
+    @Test
+    void offlineThroughALinkReadsTheWalACrashedProcessLeft() throws Exception {
+        Path f = crash(dir.resolve("crashed-linked.db"));
+        Path alias = Files.createSymbolicLink(dir.resolve("crashed-alias.db"), f);
+        try (CacheStore cache = CacheStore.open(alias, Optional.empty())) {
+            assertEquals("A", cache.clusterId());
+            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$subjects\""));
+        }
+    }
+
+    /**
+     * The maintainer's decision: a refusal leaves the cache's data, the file and its WAL, as they were. Reading
+     * a WAL whose -shm file is gone makes SQLite create that coordination file, which is accepted.
+     */
+    @Test
+    void refusingACacheWhoseShmIsGoneKeepsItsData() throws Exception {
+        Path f = crash(dir.resolve("no-shm.db"));
+        Files.delete(Path.of(f + "-shm"));
+        Path wal = Path.of(f + "-wal");
+        byte[] main = sha256(f);
+        byte[] walBytes = sha256(wal);
+        SQLException e = assertThrows(SQLException.class, () -> CacheStore.open(f, B));
+        assertTrue(e.getMessage().contains("belongs to cluster A, not cluster-B"), e.getMessage());
+        assertArrayEquals(main, sha256(f));
+        assertArrayEquals(walBytes, sha256(wal));
+    }
+
+    /** A cache for cluster A whose last commit is still in the WAL, as a crashed process leaves it. */
+    private static Path crash(Path f) throws Exception {
+        Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp", System.getProperty("java.class.path"), CacheCrash.class.getName(), f.toString())
+                .redirectErrorStream(true).start();
+        assertTrue(child.waitFor(60, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(0, child.exitValue(), new String(child.getInputStream().readAllBytes()));
+        assertTrue(Files.size(Path.of(f + "-wal")) > 0, "the committed data is in the WAL");
+        return f;
+    }
+
+    @Test
+    void aPathSqliteWouldReadAsOptionsIsRefused() throws Exception {
+        Path f = dir.resolve("literal.db?journal_mode=MEMORY");
+        SQLException e = assertThrows(SQLException.class, () -> CacheStore.open(f, A));
+        assertTrue(e.getMessage().contains("contains '?'"), e.getMessage());
+        assertTrue(Files.notExists(f) && Files.notExists(dir.resolve("literal.db")), "nothing created");
+    }
+
+    @Test
+    void pathsWithOtherAwkwardCharactersWork() throws Exception {
+        Path f = Files.createDirectories(dir.resolve("a 100% #sure")).resolve("c.db");
+        try (CacheStore cache = CacheStore.open(f, A)) {
+            assertEquals(f.toRealPath().toString(),
+                    query(cache.writer(), "SELECT file FROM pragma_database_list WHERE name = 'main'").get(0));
+        }
+        try (CacheStore cache = CacheStore.open(f, Optional.empty())) {
+            assertEquals("cluster-A_1", cache.clusterId());
+        }
+    }
+
+    @Test
+    void anExistingFileOrItsWalGetOwnerOnlyPermissions() throws Exception {
+        assumeTrue(posix());
+        Path empty = Files.createFile(dir.resolve("empty-0644.db"));
+        Files.setPosixFilePermissions(empty, PosixFilePermissions.fromString("rw-r--r--"));
+        CacheStore.open(empty, A).close();
+        assertEquals("rw-------", perms(empty));
+
+        Path open = dir.resolve("loose.db");
+        try (CacheStore first = CacheStore.open(open, A); Statement s = first.writer().createStatement()) {
+            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+            for (Path p : List.of(open, Path.of(open + "-wal"), Path.of(open + "-shm"))) {
+                Files.setPosixFilePermissions(p, PosixFilePermissions.fromString("rw-rw-r--"));
+            }
+            try (CacheStore second = CacheStore.open(open, A)) {
+                assertEquals("cluster-A_1", second.clusterId());
+                for (Path p : List.of(open, Path.of(open + "-wal"), Path.of(open + "-shm"))) {
+                    assertEquals("rw-------", perms(p), p.toString());
+                }
+            }
+        }
+    }
+
+    @Test
+    void simultaneousFirstOpensInitialiseTheCacheOnce() throws Exception {
+        Path f = dir.resolve("race.db");
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        try {
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            List<java.util.concurrent.Future<String>> results = new ArrayList<>();
+            for (int i = 0; i < 8; i++) {
+                results.add(pool.submit(() -> {
+                    start.await();
+                    try (CacheStore c = CacheStore.open(f, A)) {
+                        return c.clusterId();
+                    }
+                }));
+            }
+            start.countDown();
+            for (java.util.concurrent.Future<String> r : results) {
+                assertEquals("cluster-A_1", r.get(60, java.util.concurrent.TimeUnit.SECONDS));
+            }
+        } finally {
+            pool.shutdown();
+        }
+        try (Connection c = raw(f)) {
+            assertEquals(List.of("1"), query(c, "SELECT count(*) FROM \"$meta\" WHERE name = 'cluster_id'"));
+        }
+    }
+
+    @Test
+    void simultaneousFirstOpensForTwoClustersLetOneWin() throws Exception {
+        Path f = dir.resolve("race2.db");
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        List<String> outcomes = new ArrayList<>();
+        try {
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            List<java.util.concurrent.Future<String>> results = new ArrayList<>();
+            for (int i = 0; i < 8; i++) {
+                Optional<String> cluster = i % 2 == 0 ? A : B;
+                results.add(pool.submit(() -> {
+                    start.await();
+                    try (CacheStore c = CacheStore.open(f, cluster)) {
+                        return "opened " + c.clusterId();
+                    } catch (SQLException e) {
+                        return e.getMessage().contains("belongs to cluster") ? "refused" : "error: " + e.getMessage();
+                    }
+                }));
+            }
+            start.countDown();
+            for (java.util.concurrent.Future<String> r : results) {
+                outcomes.add(r.get(60, java.util.concurrent.TimeUnit.SECONDS));
+            }
+        } finally {
+            pool.shutdown();
+        }
+        List<String> opened = outcomes.stream().filter(o -> o.startsWith("opened")).distinct().toList();
+        assertEquals(1, opened.size(), outcomes.toString());
+        assertEquals(4, outcomes.stream().filter(o -> o.equals(opened.get(0))).count(), outcomes.toString());
+        assertEquals(4, outcomes.stream().filter(o -> o.equals("refused")).count(), outcomes.toString());
+    }
+
     // ------------------------------------------------------------------ offline
 
     @Test

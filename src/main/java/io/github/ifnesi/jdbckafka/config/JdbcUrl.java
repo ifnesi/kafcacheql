@@ -21,6 +21,12 @@ public record JdbcUrl(List<String> servers, Map<String, String> params) {
     public static final String PREFIX = "jdbc:kafka:";
     static final String FORM = "jdbc:kafka://host:port[,host:port...][?key=value&...]";
 
+    /** Parameter values that hold credentials are hidden; the record's own toString would print them. */
+    @Override
+    public String toString() {
+        return "JdbcUrl[servers=" + servers + ", params=" + Secrets.masked(params) + "]";
+    }
+
     public static boolean accepts(String url) {
         return url != null && url.startsWith(PREFIX);
     }
@@ -71,35 +77,44 @@ public record JdbcUrl(List<String> servers, Map<String, String> params) {
 
     /** host:port, [ipv6]:port; hosts are letters, digits, '.', '-' and '_'. */
     private static String server(String server) throws SQLException {
+        if (server.contains("@")) {
+            throw ConfigErrors.malformedUrl("the host list can't hold credentials (user:password@host); "
+                    + "put them in sasl.jaas.config");
+        }
         String host;
         String port;
         if (server.startsWith("[")) {
             int close = server.indexOf("]:");
             if (close < 0) {
-                throw ConfigErrors.malformedUrl("host '" + server + "' needs a port: [address]:port");
+                throw ConfigErrors.malformedUrl("host " + shown(server) + " needs a port: [address]:port");
             }
             host = server.substring(1, close);
             port = server.substring(close + 2);
             if (host.isEmpty() || !host.matches("[0-9A-Fa-f:.]+")) {
-                throw ConfigErrors.malformedUrl("host '" + server + "' isn't an IPv6 address");
+                throw ConfigErrors.malformedUrl("host " + shown(server) + " isn't an IPv6 address");
             }
         } else {
             int colon = server.lastIndexOf(':');
             if (colon < 0) {
                 throw ConfigErrors.malformedUrl(server.isEmpty()
                         ? "the host list has an empty entry"
-                        : "host '" + server + "' needs a port: host:port");
+                        : "host " + shown(server) + " needs a port: host:port");
             }
             host = server.substring(0, colon);
             port = server.substring(colon + 1);
             if (host.isEmpty() || !host.matches("[A-Za-z0-9._-]+")) {
-                throw ConfigErrors.malformedUrl("host '" + server + "' isn't a host name or address");
+                throw ConfigErrors.malformedUrl("host " + shown(server) + " isn't a host name or address");
             }
         }
         if (!port.matches("[0-9]{1,5}") || Integer.parseInt(port) < 1 || Integer.parseInt(port) > 65535) {
-            throw ConfigErrors.malformedUrl("host '" + server + "' needs a port between 1 and 65535");
+            throw ConfigErrors.malformedUrl("host " + shown(server) + " needs a port between 1 and 65535");
         }
         return server;
+    }
+
+    /** A host entry as errors show it: quoted when made of host characters only, else not at all. */
+    private static String shown(String server) {
+        return server.matches("[A-Za-z0-9._:\\[\\]-]{1,255}") ? "'" + server + "'" : "(not shown)";
     }
 
     private static String decode(String s) throws SQLException {

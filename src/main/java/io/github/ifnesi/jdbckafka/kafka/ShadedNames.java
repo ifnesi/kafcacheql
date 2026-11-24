@@ -1,5 +1,6 @@
 package io.github.ifnesi.jdbckafka.kafka;
 
+import io.github.ifnesi.jdbckafka.config.DriverLoader;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -13,10 +14,10 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.config.ConfigDef;
 
 /**
- * Class names in user settings, rewritten to the shaded JAR's relocated packages. In the
- * shaded JAR, {@code org.apache.kafka.common.security.plain.PlainLoginModule} only exists under the
- * relocation prefix, so a sasl.jaas.config naming the original class can't log in. Unshaded (tests on the
- * plain class path) the prefix is empty and nothing changes.
+ * Class names in user settings, rewritten to the shaded JAR's relocated packages. In the shaded JAR,
+ * Kafka's and Confluent's classes only exist under the relocation prefix, so a setting naming the original
+ * class would fail. sasl.jaas.config is {@link JaasSettings}'s. Unshaded (tests on the plain class path) the
+ * prefix is empty and nothing changes.
  */
 final class ShadedNames {
 
@@ -26,8 +27,6 @@ final class ShadedNames {
 
     /** The relocation prefix, e.g. {@code io.github.ifnesi.jdbckafka.shaded.}; empty when unshaded. */
     static final String PREFIX = prefixOf(CommonClientConfigs.class.getName());
-
-    static final String JAAS = "sasl.jaas.config";
 
     /** Settings typed CLASS by Kafka or Confluent: one class name. */
     private static final Set<String> CLASS_KEYS = keysOfType(ConfigDef.Type.CLASS);
@@ -54,8 +53,8 @@ final class ShadedNames {
         if (prefix.isEmpty() || value == null) {
             return value;
         }
-        if (key.equals(JAAS)) {
-            return jaas(value, prefix);
+        if (key.equals(JaasSettings.KEY)) {
+            return value;
         }
         if (CLASS_KEYS.contains(key) || key.endsWith(".class")) {
             return className(value, prefix);
@@ -64,22 +63,6 @@ final class ShadedNames {
             return classList(value, prefix);
         }
         return value;
-    }
-
-    /** Only the login module's class name, at the start, changes; its options (credentials) don't. */
-    static String jaas(String value, String prefix) {
-        int start = 0;
-        while (start < value.length() && Character.isWhitespace(value.charAt(start))) {
-            start++;
-        }
-        int end = start;
-        while (end < value.length() && !Character.isWhitespace(value.charAt(end)) && value.charAt(end) != ';') {
-            end++;
-        }
-        String module = value.substring(start, end);
-        return relocatable(module)
-                ? value.substring(0, start) + prefix + module + value.substring(end)
-                : value;
     }
 
     static String className(String value, String prefix) {
@@ -99,7 +82,7 @@ final class ShadedNames {
         return String.join(",", parts);
     }
 
-    private static boolean relocatable(String name) {
+    static boolean relocatable(String name) {
         return name.startsWith(KAFKA) || name.startsWith(CONFLUENT);
     }
 
@@ -109,11 +92,11 @@ final class ShadedNames {
     }
 
     private static Set<String> keysOfType(ConfigDef.Type type) {
-        return Stream.of(ConsumerConfig.configDef(), AdminClientConfig.configDef(), ProducerConfig.configDef(),
-                        AbstractKafkaSchemaSerDeConfig.baseConfigDef())
+        return DriverLoader.call(() -> Stream.of(ConsumerConfig.configDef(), AdminClientConfig.configDef(),
+                        ProducerConfig.configDef(), AbstractKafkaSchemaSerDeConfig.baseConfigDef())
                 .flatMap(d -> d.configKeys().values().stream())
                 .filter(k -> k.type == type)
                 .map(k -> k.name)
-                .collect(Collectors.toUnmodifiableSet());
+                .collect(Collectors.toUnmodifiableSet()));
     }
 }

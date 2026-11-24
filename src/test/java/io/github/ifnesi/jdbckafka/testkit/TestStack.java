@@ -20,6 +20,8 @@ import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.ListOffsetsOptions;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.admin.NewPartitions;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.TopicDescription;
@@ -31,6 +33,7 @@ import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.ConfigResource;
@@ -45,6 +48,10 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
  * The Docker Compose test stack (docker-compose.yml) and helpers for
  * integration tests. Every test uses its own topics ({@link #uniqueTopic}), so the stack can stay
  * up between runs.
+ *
+ * <p>Timestamps: the stack checks retention every second, so a record whose timestamp is older than the
+ * topic's retention.ms (7 days by default) is deleted within a second or so of being written. Tests that
+ * choose timestamps use recent ones, such as {@link #recent}, unless they test retention.
  */
 public final class TestStack {
 
@@ -108,6 +115,13 @@ public final class TestStack {
     }
 
     // ------------------------------------------------------------------ topics
+
+    /** A timestamp a minute ago plus {@code millis}: recent enough that retention keeps the record. */
+    public static long recent(long millis) {
+        return BASE_TIME + millis;
+    }
+
+    private static final long BASE_TIME = System.currentTimeMillis() - 60_000L;
 
     /** A topic name no other test or run uses: {@code base-xxxxxxxx}. */
     public static String uniqueTopic(String base) {
@@ -222,10 +236,12 @@ public final class TestStack {
     }
 
     /**
-     * Runs {@code body} in a transaction of a new transactional producer, then commits or aborts it.
-     * The records are flushed first, so an aborted transaction's records are in the log too.
+     * Runs {@code body} in a transaction of a new transactional producer writing to {@code topic}, then
+     * commits or aborts it. The records are flushed first, so an aborted transaction's records are in the
+     * log too. Returns once the broker has written the transaction's markers: until then the last stable
+     * offset still holds read_committed readers back.
      */
-    public static void inTransaction(boolean commit, Consumer<Producer<byte[], byte[]>> body) {
+    public static void inTransaction(String topic, boolean commit, Consumer<Producer<byte[], byte[]>> body) {
         Map<String, Object> props = producerProps();
         props.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "jdbc-kafka-test-" + UUID.randomUUID());
         try (KafkaProducer<byte[], byte[]> tx = new KafkaProducer<>(props)) {
@@ -239,6 +255,24 @@ public final class TestStack {
                 tx.abortTransaction();
             }
         }
+        awaitTransactionsSettled(topic);
+    }
+
+    /** Waits until no transaction holds the topic's last stable offset below its high watermark. */
+    public static void awaitTransactionsSettled(String topic) {
+        await(() -> endOffsets(topic, IsolationLevel.READ_COMMITTED).equals(endOffsets(topic, IsolationLevel.READ_UNCOMMITTED)),
+                "the transaction markers of " + topic);
+    }
+
+    private static Map<Integer, Long> endOffsets(String topic, IsolationLevel isolation) {
+        Map<TopicPartition, OffsetSpec> query = new HashMap<>();
+        for (int p = 0; p < partitionCount(topic); p++) {
+            query.put(new TopicPartition(topic, p), OffsetSpec.latest());
+        }
+        Map<Integer, Long> out = new HashMap<>();
+        get(admin().listOffsets(query, new ListOffsetsOptions(isolation)).all())
+                .forEach((tp, info) -> out.put(tp.partition(), info.offset()));
+        return out;
     }
 
     /** A new transactional producer, transactions initialised; the caller begins, ends and closes. */
@@ -284,9 +318,15 @@ public final class TestStack {
 
     /**
      * Every record of the topic, from each partition's start to its end offset as of the call, read with
-     * {@code read_committed} or {@code read_uncommitted}.
+     * {@code read_committed} or {@code read_uncommitted}. Records appended after the end offsets were taken
+     * aren't returned.
      */
     public static List<ConsumerRecord<byte[], byte[]>> readAll(String topic, boolean readCommitted) {
+        return readAll(topic, readCommitted, () -> {});
+    }
+
+    /** As {@link #readAll(String, boolean)}, running {@code afterSnapshot} once the end offsets are taken. */
+    public static List<ConsumerRecord<byte[], byte[]>> readAll(String topic, boolean readCommitted, Runnable afterSnapshot) {
         Map<String, Object> props = new HashMap<>();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
@@ -300,12 +340,18 @@ public final class TestStack {
             consumer.assign(partitions);
             consumer.seekToBeginning(partitions);
             Map<TopicPartition, Long> end = consumer.endOffsets(partitions, TIMEOUT);
+            afterSnapshot.run();
             long deadline = System.nanoTime() + TIMEOUT.toNanos();
+            // Done by position, not by count: transaction markers and aborted records take offsets too.
             while (partitions.stream().anyMatch(tp -> consumer.position(tp, TIMEOUT) < end.get(tp))) {
                 if (System.nanoTime() > deadline) {
                     throw new IllegalStateException("timed out reading " + topic);
                 }
-                consumer.poll(Duration.ofMillis(200)).forEach(out::add);
+                for (ConsumerRecord<byte[], byte[]> r : consumer.poll(Duration.ofMillis(200))) {
+                    if (r.offset() < end.get(new TopicPartition(r.topic(), r.partition()))) {
+                        out.add(r);
+                    }
+                }
             }
         }
         return out;

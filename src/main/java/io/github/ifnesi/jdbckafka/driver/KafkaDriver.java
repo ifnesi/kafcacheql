@@ -1,6 +1,7 @@
 package io.github.ifnesi.jdbckafka.driver;
 
 import io.github.ifnesi.jdbckafka.config.DriverConfig;
+import io.github.ifnesi.jdbckafka.config.DriverLoader;
 import io.github.ifnesi.jdbckafka.config.DriverProperty;
 import io.github.ifnesi.jdbckafka.config.JdbcUrl;
 import io.github.ifnesi.jdbckafka.kafka.ClientSettings;
@@ -39,8 +40,9 @@ public final class KafkaDriver implements Driver {
         if (!acceptsURL(url)) {
             return null;
         }
-        DriverConfig config = DriverConfig.load(url, info);
-        ClientSettings.of(config);
+        // With the driver's class loader throughout (DriverLoader): tools often call from a thread whose
+        // context class loader can't see the driver's classes.
+        DriverLoader.call(() -> ClientSettings.of(DriverConfig.load(url, info)));
         throw new SQLFeatureNotSupportedException(
                 "jdbc-kafka connections are not built yet; the configuration is valid");
     }
