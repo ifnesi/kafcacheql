@@ -1,7 +1,7 @@
-import io.github.ifnesi.jdbckafka.config.DriverConfig;
-import io.github.ifnesi.jdbckafka.kafka.ClientSettings;
-import io.github.ifnesi.jdbckafka.kafka.KafkaClients;
-import io.github.ifnesi.jdbckafka.shaded.org.apache.kafka.clients.admin.Admin;
+import io.github.ifnesi.kafcacheql.config.DriverConfig;
+import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
+import io.github.ifnesi.kafcacheql.kafka.KafkaClients;
+import io.github.ifnesi.kafcacheql.shaded.org.apache.kafka.clients.admin.Admin;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;

@@ -1,4 +1,4 @@
-# Test environment for jdbc-kafka.
+# Test environment for KafCacheQL.
 # Modelled on https://github.com/ifnesi/kafka-db-replication/blob/main/docker-compose.yml:
 # broker (KRaft), Schema Registry, and Control Center with Prometheus and Alertmanager.
 #

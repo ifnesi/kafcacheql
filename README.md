@@ -1,4 +1,6 @@
-# jdbc-kafka
+# KafCacheQL
+
+*Kafka + Cache + Query Language*
 
 > **Work in progress.** This driver is in early development and **can't run queries yet**. Today it
 > loads in JDBC tools and checks your configuration; reading topics comes in the next stages (see
@@ -7,7 +9,7 @@
 **What if you could query Kafka topics from your database tool of choice? No Kafka client, just a JDBC
 driver. And best of all, whatever you query is cached locally, automatically.**
 
-jdbc-kafka is a read-only JDBC driver for Apache Kafka. Point DBeaver, DataGrip or any JVM application at a
+KafCacheQL is a read-only JDBC driver for Apache Kafka. Point DBeaver, DataGrip or any JVM application at a
 Kafka cluster and query topics with plain SQL:
 
 ```sql
@@ -68,7 +70,7 @@ deletions, or a topic was recreated, the topic is rebuilt.
 | Connections, statements, result sets, database metadata in tools | Later |
 | JSON Schema and Protobuf, offline mode | Later |
 
-Until connections are built, `connect()` checks the URL and every setting, then stops with *"jdbc-kafka
+Until connections are built, `connect()` checks the URL and every setting, then stops with *"KafCacheQL
 connections are not built yet; the configuration is valid"*.
 
 ## Trying it today
@@ -79,14 +81,14 @@ Requirements: Java 21 or newer, Maven 3.9 or newer.
 mvn package -DskipTests
 ```
 
-This builds `target/jdbc-kafka-0.1.0-SNAPSHOT.jar`, one self-contained JAR (about 50 MB) with Kafka's and
+This builds `target/kafcacheql-jdbc-0.1.0-SNAPSHOT.jar`, one self-contained JAR (about 50 MB) with Kafka's and
 Confluent's libraries relocated inside it, so it doesn't clash with other versions in the same application.
 
 ### In DBeaver
 
 1. Copy the JAR somewhere stable; `mvn clean` deletes `target/`.
 2. **Database → Driver Manager → New**. On *Libraries*, add the JAR and pick the class
-   `io.github.ifnesi.jdbckafka.driver.KafkaDriver`. On *Settings*: URL template `jdbc:kafka://{host}:{port}`,
+   `io.github.ifnesi.kafcacheql.driver.KafCacheQLDriver`. On *Settings*: URL template `jdbc:kafcacheql://{host}:{port}`,
    default port `9092`, "No authentication".
 3. Create a connection to your broker. The *Driver properties* tab lists the driver's settings with their
    defaults. *Test Connection* reports any setting that's wrong, or the "not built yet" message above.
@@ -96,7 +98,7 @@ After rebuilding the JAR, copy it again and restart DBeaver, which keeps the old
 ## Configuration
 
 ```
-jdbc:kafka://broker1:9092,broker2:9092?config.file=/path/to/client.properties
+jdbc:kafcacheql://broker1:9092,broker2:9092?config.file=/path/to/client.properties
 ```
 
 Settings are read in this order, later ones winning: built-in defaults, `config.file`, URL parameters,
@@ -111,7 +113,7 @@ The driver's own settings (accepted and checked today; most take effect as the s
 | Property | Default | Meaning |
 |---|---|---|
 | `config.file` | | Properties file loaded before URL parameters and the Properties object |
-| `cache.path` | `~/.jdbc-kafka/<cluster-id>.db` | The SQLite cache file; required when `offline=true` |
+| `cache.path` | `~/.kafcacheql/<cluster-id>.db` | The SQLite cache file; required when `offline=true` |
 | `append.default.window` | `1h` | Window for append-topic queries without an `_offset` or `_timestamp` bound: a duration (`500ms`, `90s`, `15m`, `1h`, `2d`) or `all` |
 | `append.default.window.max.records` | `10000` | Per-partition cap on the default window; whichever limit is smaller wins |
 | `timestamp.skew.ms` | `60000` | How far past a timestamp to read for `_timestamp < t` on CreateTime topics, for late records |
@@ -121,7 +123,7 @@ The driver's own settings (accepted and checked today; most take effect as the s
 | `topics.include` | `.*` | Regex of topics tools list |
 | `topics.exclude` | `__.*\|_confluent.*\|_schemas` | Regex of topics tools don't list; they stay queryable |
 | `metadata.show.internal` | `false` | List the cache's internal `$` tables too |
-| `client.id` | `jdbc-kafka` | Client ID; the admin client gets `<client.id>-admin` |
+| `client.id` | `kafcacheql` | Client ID; the admin client gets `<client.id>-admin` |
 | `sync.batch.records` | `5000` | Records written per SQLite transaction while syncing |
 
 Per topic, `topic.<name>.<setting>` overrides `mode` (`append` or `compacted`), `key.format`, `value.format`,
