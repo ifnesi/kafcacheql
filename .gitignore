@@ -1,0 +1,23 @@
+# Maven
+target/
+dependency-reduced-pom.xml
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Local caches written while trying the driver by hand
+*.db
+*.db-wal
+*.db-shm
+
+# Plan and kanban stay local
+docs/execution/
+
+# OS clutter and logs
+.DS_Store
+*.log
