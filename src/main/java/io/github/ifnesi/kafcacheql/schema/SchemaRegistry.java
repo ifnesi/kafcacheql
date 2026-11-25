@@ -1,16 +1,21 @@
 package io.github.ifnesi.kafcacheql.schema;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import io.confluent.kafka.schemaregistry.AbstractSchemaProvider;
 import io.confluent.kafka.schemaregistry.ParsedSchema;
 import io.confluent.kafka.schemaregistry.avro.AvroSchema;
+import io.confluent.kafka.schemaregistry.json.JsonSchema;
+import io.confluent.kafka.schemaregistry.client.rest.entities.SchemaReference;
 import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.rest.RestService;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
 import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
+import io.confluent.kafka.serializers.json.KafkaJsonSchemaDeserializer;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore.StoredSchema;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
@@ -19,6 +24,7 @@ import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -32,6 +38,7 @@ public final class SchemaRegistry implements AutoCloseable {
     private final Cache<String, ResolvedSchema> schemas;
 
     record ResolvedSchema(StoredSchema stored, ParsedSchema parsed) {}
+    private record JsonReferences(List<SchemaReference> references, Map<String, String> resolved) {}
 
     private SchemaRegistry(Map<String, Object> settings, AbstractKafkaSchemaSerDeConfig config, Connection reader) {
         this.settings = settings;
@@ -93,7 +100,7 @@ public final class SchemaRegistry implements AutoCloseable {
         });
     }
 
-    /** Parse the resolved schema returned by the ID/GUID endpoint, without subject lookups. */
+    /** Parse a schema and its already resolved references, without network access. */
     ResolvedSchema parse(ResolvedSchema schema) throws SQLException {
         if (schema.parsed() != null) {
             return schema;
@@ -101,7 +108,7 @@ public final class SchemaRegistry implements AutoCloseable {
         return DriverLoader.call(() -> {
             StoredSchema row = schema.stored();
             try {
-                ParsedSchema parsed = parseAvro(row);
+                ParsedSchema parsed = JsonSchema.TYPE.equals(row.type()) ? parseJson(row) : parseAvro(row);
                 ResolvedSchema resolved = new ResolvedSchema(row, parsed);
                 schemas.put(row.ref(), resolved);
                 return resolved;
@@ -118,12 +125,40 @@ public final class SchemaRegistry implements AutoCloseable {
         return new AvroSchema(schema.schemaText());
     }
 
+    public static JsonSchema parseJson(StoredSchema schema) {
+        try {
+            var refs = JacksonMapper.INSTANCE.readValue(schema.refs(), JsonReferences.class);
+            // Block remote URL resolution: every external body must come from the fixed references.
+            return new JsonSchema(schema.schemaText(), refs.references(), refs.resolved(), null, null, null, true);
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Reading cached JSON Schema references", e);
+        }
+    }
+
     KafkaAvroDeserializer avro(boolean key) throws SQLException {
         return DriverLoader.call(() -> {
             try {
                 return new KafkaAvroDeserializer(client, settings, key);
             } catch (RuntimeException e) {
                 throw failure("configuring Avro decoder", urls, e, settings);
+            }
+        });
+    }
+
+    KafkaJsonSchemaDeserializer<JsonNode> json(boolean key) throws SQLException {
+        return DriverLoader.call(() -> {
+            try {
+                var config = new HashMap<>(settings);
+                config.put(key ? "json.key.type" : "json.value.type", JsonNode.class);
+                // Subject associations and reader-schema selection are irrelevant to record IDs.
+                config.put(key ? "key.subject.name.strategy" : "value.subject.name.strategy",
+                        io.confluent.kafka.serializers.subject.TopicNameStrategy.class);
+                config.remove(AbstractKafkaSchemaSerDeConfig.USE_LATEST_WITH_METADATA);
+                var decoder = new KafkaJsonSchemaDeserializer<JsonNode>(client);
+                decoder.configure(config, key);
+                return decoder;
+            } catch (RuntimeException e) {
+                throw failure("configuring JSON Schema decoder", urls, e, settings);
             }
         });
     }
@@ -170,12 +205,23 @@ public final class SchemaRegistry implements AutoCloseable {
         }
 
         StoredSchema fetch(String ref) throws IOException, RestClientException {
-            // Resolve metadata before choosing a parser: phase-2 schema types are still cacheable.
+            // Avro's endpoint resolves references; JSON Schema needs Confluent's fixed-version resolver.
             var schema = ref.indexOf('-') >= 0 ? transport.getByGuid(ref, "resolved")
                     : transport.getId(RestService.DEFAULT_REQUEST_PROPERTIES, Integer.parseInt(ref), null, "resolved", null, false);
+            String refs = JacksonMapper.INSTANCE.writeValueAsString(schema.getReferences());
+            if (JsonSchema.TYPE.equals(schema.getSchemaType())) {
+                refs = JacksonMapper.INSTANCE.writeValueAsString(new JsonReferences(schema.getReferences(),
+                        AbstractSchemaProvider.resolveReferences(this, null, schema.getReferences(), false, true)));
+            }
             return new StoredSchema(ref, java.util.Objects.requireNonNullElse(schema.getSchemaType(), AvroSchema.TYPE),
-                    schema.getSchemaString(), JacksonMapper.INSTANCE.writeValueAsString(schema.getReferences()),
+                    schema.getSchemaString(), refs,
                     System.currentTimeMillis());
+        }
+
+        @Override
+        public io.confluent.kafka.schemaregistry.client.rest.entities.Schema getByVersion(String subject, int version, boolean deleted) {
+            if (version < 1) throw new IllegalArgumentException("Schema references must name a fixed positive version");
+            return super.getByVersion(subject, version, deleted);
         }
 
         private ParsedSchema required(String ref) throws RestClientException {

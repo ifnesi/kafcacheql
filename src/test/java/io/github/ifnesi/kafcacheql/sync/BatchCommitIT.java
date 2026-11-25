@@ -20,6 +20,7 @@ import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.kafka.clients.admin.AlterConfigOp;
@@ -33,6 +34,7 @@ import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.sqlite.ProgressHandler;
 
 /** Whole Kafka -> sync -> cache-file flows; the driver's JDBC statements belong to 0011b. */
 class BatchCommitIT {
@@ -96,10 +98,27 @@ class BatchCommitIT {
                             + "json_extract(_headers,'$[1].key'),json_extract(_headers,'$[1].value') FROM \"$t" + id + "\" WHERE _offset=0")));
             assertEquals(List.of("0|3"), cache.read(c -> values(c, "SELECT start_offset,end_offset FROM \"$ranges\"")));
             assertEquals(List.of(Long.toString(plan.ends().capturedAtMs())), cache.read(c -> values(c, "SELECT caught_up_at_ms FROM \"$partitions\"")));
+            // 0010b: a one-record batch must not scan all previously cached records to refresh its view.
+            // Both sides have schemas, so JSON inference is not part of this check. Count SQLite VM work,
+            // not wall time; the generous bound allows writes/index maintenance but not a 10K-row scan.
+            for (int n = 0; n < 10_000; n++) {
+                TestStack.sendAvroKeyed(topic, "key" + n, body, null, TestStack.SchemaIdIn.PREFIX);
+            }
+            cache.sync(cache.plan(topic, execution), execution, WRITER);
+            TestStack.sendAvroKeyed(topic, "delta", body, null, TestStack.SchemaIdIn.PREFIX);
+            var steps = new AtomicInteger();
+            cache.sync(cache.plan(topic, execution), execution, (c, b) -> {
+                ProgressHandler.setHandler(c, 100, new ProgressHandler() {
+                    @Override protected int progress() { steps.addAndGet(100); return 0; }
+                });
+                try { WRITER.write(c, b); }
+                finally { ProgressHandler.clearHandler(c); }
+            });
+            assertTrue(steps.get() < 10_000, "one-record batch SQLite VM steps: " + steps);
         }
         try (var reopened = CacheStore.open(file, java.util.Optional.empty()); var reader = reopened.newReader()) {
-            assertEquals(List.of("3"), values(reader, "SELECT count(*) FROM \"" + topic + "\""));
-            assertEquals(List.of("1"), values(reader, "SELECT count(*) FROM \"$schemas\""));
+            assertEquals(List.of("10004"), values(reader, "SELECT count(*) FROM \"" + topic + "\""));
+            assertEquals(List.of("2"), values(reader, "SELECT count(*) FROM \"$schemas\""));
         }
     }
 

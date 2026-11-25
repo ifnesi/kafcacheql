@@ -245,7 +245,7 @@ public final class SyncWorker implements AutoCloseable {
             if (partition.getValue().isEmpty()) {
                 long end = plan.ends().offsets().get(partition.getKey());
                 commit(new SyncBatch(plan, generation, partition.getKey(), end, end, true, List.of()), baseline, execution, writer);
-            } else if (missing.isEmpty() && plan.topic().mode() == Mode.COMPACTED) {
+            } else if (missing.isEmpty() && plan.checked() && plan.topic().mode() == Mode.COMPACTED) {
                 caughtUp(plan.topic().name(), generation, partition.getKey(), plan.ends().capturedAtMs());
             }
             if (missing.isEmpty()) continue;

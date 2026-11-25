@@ -33,6 +33,14 @@ public final class PipelineProcess {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 3 && args[2].equals("jdbc")) {
+            var p = new Properties(); p.setProperty("cache.path", args[0]); p.setProperty("schema.registry.url", TestStack.REGISTRY);
+            try (var c = java.sql.DriverManager.getConnection("jdbc:kafcacheql://" + TestStack.BOOTSTRAP, p);
+                 var s = c.createStatement(); var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(args[1]) + " WHERE _offset>=0")) {
+                while (r.next()) System.out.println("ROW " + r.getInt(1));
+            }
+            return;
+        }
         try (var cache = CacheContext.acquire(config(Path.of(args[0])));
              var execution = new Execution(Duration.ofSeconds(30))) {
             cache.hooks(new SyncWorker.Hooks() {

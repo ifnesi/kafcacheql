@@ -15,8 +15,11 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.stream.Collectors;
+import net.sf.jsqlparser.expression.AnalyticExpression;
+import net.sf.jsqlparser.expression.JsonAggregateFunction;
 import net.sf.jsqlparser.expression.BinaryExpression;
 import net.sf.jsqlparser.expression.CollateExpression;
 import net.sf.jsqlparser.expression.DoubleValue;
@@ -60,7 +63,11 @@ import net.sf.jsqlparser.statement.select.Select;
 
 /** Fetch hints for append references; compacted syncs still fetch the whole state. */
 public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long> offsets,
-                     ImmutableRangeSet<Long> timestamps, boolean hasWindowBound) {
+                     ImmutableRangeSet<Long> timestamps, boolean hasWindowBound, OptionalLong tailRecords) {
+    public Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long> offsets,
+                  ImmutableRangeSet<Long> timestamps, boolean hasWindowBound) {
+        this(partitions, offsets, timestamps, hasWindowBound, OptionalLong.empty());
+    }
     private enum Axis { PARTITION, OFFSET, TIMESTAMP }
     private enum Op { EQ, LT, LE, GT, GE }
     private static final ImmutableRangeSet<Long> ALL = ImmutableRangeSet.of(Range.all());
@@ -81,7 +88,12 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
             }
         }
         var extraction = new Extraction(sqlite, parameters);
-        for (var entry : selects.entrySet()) extraction.conditions(entry.getKey().getWhere(), entry.getValue());
+        for (var entry : selects.entrySet()) {
+            if (extraction.conditions(entry.getKey().getWhere(), entry.getValue()) && query.references().size() == 1) {
+                Builder builder = entry.getValue().getFirst();
+                builder.tailRecords = tail(query, builder, sqlite);
+            }
+        }
         var result = new LinkedHashMap<Query.Reference, Bounds>();
         builders.forEach((reference, builder) -> result.put(reference, builder.build()));
         return result;
@@ -93,6 +105,7 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
         final RangeSet<Long> offsets = TreeRangeSet.create(ALL);
         final RangeSet<Long> timestamps = TreeRangeSet.create(ALL);
         boolean windowBound;
+        OptionalLong tailRecords = OptionalLong.empty();
 
         Builder(Query.Reference reference) { this.reference = reference; }
 
@@ -108,7 +121,7 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
 
         Bounds build() {
             return new Bounds(ImmutableRangeSet.copyOf(partitions), ImmutableRangeSet.copyOf(offsets),
-                    ImmutableRangeSet.copyOf(timestamps), windowBound);
+                    ImmutableRangeSet.copyOf(timestamps), windowBound, tailRecords);
         }
     }
 
@@ -116,16 +129,16 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
     private record Scalar(Object value, Expression expression) {}
 
     private record Extraction(Connection sqlite, Map<Integer, ?> parameters) {
-        void conditions(Expression expression, List<Builder> sources) throws SQLException {
+        boolean conditions(Expression expression, List<Builder> sources) throws SQLException {
             expression = unwrap(expression);
+            if (expression == null) return true;
             if (expression instanceof AndExpression and) {
-                conditions(and.getLeftExpression(), sources);
-                conditions(and.getRightExpression(), sources);
+                return conditions(and.getLeftExpression(), sources) & conditions(and.getRightExpression(), sources);
             } else if (expression instanceof Between between && !between.isNot() && !between.isUsingSymmetric()) {
                 Target target = target(between.getLeftExpression(), sources);
-                if (target == null || target.axis() == Axis.PARTITION) return;
+                if (target == null || target.axis() == Axis.PARTITION) return false;
                 var values = evaluate(List.of(between.getBetweenExpressionStart(), between.getBetweenExpressionEnd()));
-                if (values == null) return;
+                if (values == null) return false;
                 target.builder().restrict(target.axis(), range(Op.GE, values.get(0).value()));
                 target.builder().restrict(target.axis(), range(Op.LE, values.get(1).value()));
                 between.setBetweenExpressionStart(values.get(0).expression());
@@ -133,9 +146,9 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
             } else if (expression instanceof InExpression in && !in.isNot()
                     && in.getRightExpression() instanceof ExpressionList<?> operands) {
                 Target target = target(in.getLeftExpression(), sources);
-                if (target == null || target.axis() == Axis.TIMESTAMP) return;
+                if (target == null || target.axis() == Axis.TIMESTAMP) return false;
                 var values = evaluate(operands);
-                if (values == null) return;
+                if (values == null) return false;
                 var allowed = TreeRangeSet.<Long>create();
                 var folded = new ArrayList<Expression>();
                 for (Scalar value : values) {
@@ -144,6 +157,7 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
                 }
                 target.builder().restrict(target.axis(), allowed);
                 in.setRightExpression(new ParenthesedExpressionList<>(folded));
+                return target.axis() == Axis.PARTITION;
             } else if (expression instanceof BinaryExpression comparison) {
                 Op op = switch (comparison) {
                     case EqualsTo ignored -> Op.EQ;
@@ -153,20 +167,22 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
                     case GreaterThanEquals ignored -> Op.GE;
                     default -> null;
                 };
-                if (op == null) return;
+                if (op == null) return false;
                 Target target = target(comparison.getLeftExpression(), sources);
                 boolean reversed = target == null;
                 if (reversed) {
                     target = target(comparison.getRightExpression(), sources);
                     op = switch (op) { case EQ -> Op.EQ; case LT -> Op.GT; case LE -> Op.GE; case GT -> Op.LT; case GE -> Op.LE; };
                 }
-                if (target == null || (target.axis() == Axis.PARTITION && op != Op.EQ)) return;
+                if (target == null || (target.axis() == Axis.PARTITION && op != Op.EQ)) return false;
                 var values = evaluate(List.of(reversed ? comparison.getLeftExpression() : comparison.getRightExpression()));
-                if (values == null) return;
+                if (values == null) return false;
                 Scalar value = values.getFirst();
                 target.builder().restrict(target.axis(), range(op, value.value()));
                 if (reversed) comparison.setLeftExpression(value.expression()); else comparison.setRightExpression(value.expression());
+                return target.axis() == Axis.PARTITION;
             }
+            return false;
         }
 
         private List<Scalar> evaluate(List<? extends Expression> operands) throws SQLException {
@@ -243,6 +259,53 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
             source = group.getFromItem();
         }
         return source;
+    }
+
+    /** Only the outer, row-preserving single-topic SELECT can replace its default window with a tail. */
+    private static OptionalLong tail(Query query, Builder source, Connection sqlite) throws SQLException {
+        PlainSelect select = source.reference.select();
+        if (query.select() != select || singleSource(select) != source.reference.table()
+                || select.getWithItemsList() != null || select.getDistinct() != null || select.getGroupBy() != null
+                || select.getHaving() != null || select.getQualify() != null || select.getWindowDefinitions() != null
+                || select.getOffset() != null || select.getFetch() != null || select.getLimitBy() != null) return OptionalLong.empty();
+        var limit = select.getLimit();
+        if (limit == null || limit.getOffset() != null || !(limit.getRowCount() instanceof LongValue n)
+                || n.getBigIntegerValue().signum() < 0 || n.getBigIntegerValue().bitLength() > 63) return OptionalLong.empty();
+        var ordering = select.getOrderByElements();
+        if (ordering == null || ordering.size() != 1 || ordering.getFirst().isAsc()) return OptionalLong.empty();
+        var order = ordering.getFirst().getExpression();
+        Target target = target(order, List.of(source));
+        if (target == null || target.axis() != Axis.OFFSET) return OptionalLong.empty();
+        // SQLite resolves an unqualified ORDER BY against output aliases before source columns.
+        if (((Column) unwrap(order)).getTable() == null && select.getSelectItems().stream().anyMatch(item ->
+                item.getAlias() != null && Ascii.equalsIgnoreCase(item.getAlias().getUnquotedName(), "_offset"))) return OptionalLong.empty();
+        var projection = new Projection();
+        for (var item : select.getSelectItems()) item.getExpression().accept(projection, null);
+        if (!projection.rowLocal) return OptionalLong.empty();
+        if (!projection.functions.isEmpty()) {
+            // SQLite knows its aggregate overloads, including application-registered functions.
+            try (var p = sqlite.prepareStatement("SELECT 1 FROM pragma_function_list WHERE name=? COLLATE NOCASE "
+                    + "AND type<>'s' AND (narg=? OR narg=-1) LIMIT 1")) {
+                for (Function function : projection.functions) {
+                    p.setString(1, new Column(function.getName()).getUnquotedColumnName());
+                    p.setInt(2, function.getParameters() == null ? 0 : function.getParameters().size());
+                    try (var rows = p.executeQuery()) { if (rows.next()) return OptionalLong.empty(); }
+                }
+            }
+        }
+        return OptionalLong.of(n.getValue());
+    }
+
+    private static final class Projection extends ExpressionVisitorAdapter<Void> {
+        boolean rowLocal = true;
+        final List<Function> functions = new ArrayList<>();
+        @Override public <S> Void visit(Function function, S context) {
+            functions.add(function); return super.visit(function, context);
+        }
+        @Override public <S> Void visit(AnalyticExpression expression, S context) { rowLocal = false; return null; }
+        @Override public <S> Void visit(JsonAggregateFunction expression, S context) { rowLocal = false; return null; }
+        @Override public <S> Void visit(Select expression, S context) { rowLocal = false; return null; }
+        @Override public <S> Void visit(ParenthesedSelect expression, S context) { rowLocal = false; return null; }
     }
 
     private static final class Constant extends ExpressionVisitorAdapter<Void> {

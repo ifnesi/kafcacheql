@@ -2,9 +2,12 @@ package io.github.ifnesi.kafcacheql.schema;
 
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.confluent.kafka.schemaregistry.avro.AvroSchema;
+import io.confluent.kafka.schemaregistry.json.JsonSchema;
 import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
+import io.confluent.kafka.serializers.json.KafkaJsonSchemaDeserializer;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore.StoredSchema;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.Format;
@@ -37,6 +40,8 @@ public final class RecordDecoder implements AutoCloseable {
     private SchemaRegistry registry;
     private KafkaAvroDeserializer keyAvro;
     private KafkaAvroDeserializer valueAvro;
+    private KafkaJsonSchemaDeserializer<JsonNode> keyJson;
+    private KafkaJsonSchemaDeserializer<JsonNode> valueJson;
 
     /** One decoder per worker, reused across topics and records; not thread-safe. Reader is borrowed. */
     public RecordDecoder(ClientSettings settings, Connection reader) {
@@ -62,7 +67,7 @@ public final class RecordDecoder implements AutoCloseable {
         }
         String ref = null;
         StoredSchema stored = null;
-        if (format == Format.AUTO || format == Format.AVRO) {
+        if (format == Format.AUTO || format == Format.AVRO || format == Format.JSON_SR) {
             var reference = SchemaReferences.inspect(headers, payload, key);
             if (reference.malformed()) {
                 return failed(payload, key, null, null, "Malformed schema header");
@@ -78,15 +83,26 @@ public final class RecordDecoder implements AutoCloseable {
                 var resolved = registry.resolve(reader, ref);
                 if (resolved.isPresent()) {
                     stored = resolved.get().stored();
-                    if (!AvroSchema.TYPE.equals(stored.type())) {
+                    boolean avro = AvroSchema.TYPE.equals(stored.type()), json = JsonSchema.TYPE.equals(stored.type());
+                    if (!avro && !json) {
                         return failed(payload, key, ref, stored, "Schema type " + stored.type() + " requires phase 2");
                     }
-                    AvroSchema schema = (AvroSchema) registry.parse(resolved.get()).parsed();
+                    if (format == Format.AVRO && !avro || format == Format.JSON_SR && !json) {
+                        return failed(payload, key, ref, stored, "Schema type " + stored.type() + " does not match format " + format.value());
+                    }
+                    var schema = registry.parse(resolved.get()).parsed();
                     // Configuration failures fail the operation; corrupt record data is caught below.
-                    KafkaAvroDeserializer deserializer = avro(key);
+                    var avroDecoder = avro ? avro(key) : null;
+                    var jsonDecoder = json ? json(key) : null;
                     try {
-                        Object datum = deserializer.deserialize(topic, headers, payload, schema.rawSchema());
-                        return new Part(AvroJsonConverter.convert(schema.rawSchema(), datum), ref, stored, null);
+                        String decoded;
+                        if (avro) {
+                            var raw = ((AvroSchema) schema).rawSchema();
+                            decoded = AvroJsonConverter.convert(raw, avroDecoder.deserialize(topic, headers, payload, raw));
+                        } else {
+                            decoded = JacksonMapper.INSTANCE.writeValueAsString(jsonDecoder.deserialize(topic, headers, payload));
+                        }
+                        return new Part(decoded, ref, stored, null);
                     } catch (RuntimeException | IOException e) {
                         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
                             if (cause instanceof SchemaRegistry.LookupFailure lookup) {
@@ -97,14 +113,14 @@ public final class RecordDecoder implements AutoCloseable {
                     }
                 }
             }
-            if (format == Format.AVRO) {
-                return failed(payload, key, ref, stored, ref == null ? "Missing Avro schema reference" : "Unknown schema " + ref);
+            if (format == Format.AVRO || format == Format.JSON_SR) {
+                return failed(payload, key, ref, stored, ref == null ? "Missing " + format.value() + " schema reference" : "Unknown schema " + ref);
             }
         }
         if (format == Format.BYTES) {
             return new Part(json(payload), null, null, null);
         }
-        if (format == Format.JSON_SR || format == Format.PROTOBUF) {
+        if (format == Format.PROTOBUF) {
             return failed(payload, key, ref, stored, "Format " + format.value() + " requires phase 2");
         }
         String text;
@@ -135,6 +151,15 @@ public final class RecordDecoder implements AutoCloseable {
             valueAvro = registry.avro(false);
         }
         return valueAvro;
+    }
+
+    private KafkaJsonSchemaDeserializer<JsonNode> json(boolean key) throws SQLException {
+        if (key) {
+            if (keyJson == null) keyJson = registry.json(true);
+            return keyJson;
+        }
+        if (valueJson == null) valueJson = registry.json(false);
+        return valueJson;
     }
 
     private Part failed(byte[] payload, boolean key, String ref, StoredSchema stored, String error) {
@@ -168,8 +193,10 @@ public final class RecordDecoder implements AutoCloseable {
         DriverLoader.call(() -> {
             try (SchemaRegistry schemas = registry;
                  KafkaAvroDeserializer value = valueAvro;
-                 KafkaAvroDeserializer key = keyAvro) {
-                // Close both deserializers before their shared client, preserving suppressed failures.
+                 KafkaAvroDeserializer key = keyAvro;
+                 KafkaJsonSchemaDeserializer<JsonNode> jsonValue = valueJson;
+                 KafkaJsonSchemaDeserializer<JsonNode> jsonKey = keyJson) {
+                // Close the deserializers before their shared client, preserving suppressed failures.
             } catch (SQLException | RuntimeException e) {
                 throw new SQLException(Secrets.redact("Closing decoder: " + e.getMessage(), properties),
                         "08001", Secrets.sanitize(e, properties));

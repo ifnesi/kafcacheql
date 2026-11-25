@@ -2,13 +2,10 @@ package io.github.ifnesi.kafcacheql.sql;
 
 import com.google.common.collect.RangeSet;
 import com.google.common.collect.TreeRangeSet;
-import io.github.ifnesi.kafcacheql.cache.RangeStore;
 import io.github.ifnesi.kafcacheql.cache.TypedViews;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
 import io.github.ifnesi.kafcacheql.sync.Execution;
-import io.github.ifnesi.kafcacheql.sync.StaleGeneration;
 import io.github.ifnesi.kafcacheql.sync.SyncPlan;
-import io.github.ifnesi.kafcacheql.sync.SyncWorker;
 import java.sql.Connection;
 import java.sql.JDBCType;
 import java.sql.PreparedStatement;
@@ -104,14 +101,26 @@ public final class QueryPipeline {
                     warnings.addAll(plan.warnings());
                 }
                 SyncPlan plan = base.withWindows(union);
-                synced.add(new Window(plan, cache.sync(plan, execution)));
+                var reference = topic.getValue().getFirst();
+                var tail = bounds.get(reference).tailRecords();
+                long generation;
+                while (true) {
+                    generation = cache.sync(plan, execution);
+                    if (tail.isEmpty()) break;
+                    SyncPlan expanded = planner.extendTail(plan, generation, tail.getAsLong());
+                    if (expanded == plan) break;
+                    plan = expanded;
+                    plans.put(reference, plan);
+                }
+                synced.add(new Window(plan, generation));
             }
             hooks.afterSync(List.copyOf(synced));
             var reader = cache.borrowReader(execution);
             try {
                 var layouts = new LinkedHashMap<String, TypedViews.Layout>();
                 for (var window : synced) {
-                    validate(reader.connection(), window);
+                    cache.validate(reader.connection(), window.plan(), window.generation());
+                    if (cache.config().offline()) warnings.add(cache.offlineWarning(reader.connection(), window.plan(), window.generation()));
                     String topic = window.plan().topic().name();
                     var layout = TypedViews.describe(reader.connection(), window.generation());
                     layouts.put(topic, layout);
@@ -204,13 +213,4 @@ public final class QueryPipeline {
         }
     }
 
-    private static void validate(Connection reader, Window window) throws SQLException {
-        String topic = window.plan().topic().name();
-        SyncWorker.requireGeneration(reader, topic, window.generation());
-        for (var partition : window.plan().windows().entrySet()) {
-            if (!RangeStore.missing(reader, window.generation(), partition.getKey(), partition.getValue()).isEmpty()) {
-                throw new StaleGeneration(topic);
-            }
-        }
-    }
 }

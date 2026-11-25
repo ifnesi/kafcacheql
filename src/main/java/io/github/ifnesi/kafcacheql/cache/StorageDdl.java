@@ -5,6 +5,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Optional;
 
 /** The fixed record layout; schema evolution changes views, never these storage tables. */
 public final class StorageDdl {
@@ -13,7 +14,7 @@ public final class StorageDdl {
 
     private StorageDdl() {}
 
-    static String tableName(long id) {
+    public static String tableName(long id) {
         return "$t" + id;
     }
 
@@ -49,6 +50,11 @@ public final class StorageDdl {
                     ) WITHOUT ROWID
                     """);
             s.execute("CREATE INDEX " + quote(name + "_ts") + " ON " + table + "(_timestamp)");
+            for (String side : List.of("key", "value")) {
+                String column = "_" + side + "_schema_id";
+                s.execute("CREATE INDEX " + quote(name + "_" + side + "_schema") + " ON " + table
+                        + "(" + column + ") WHERE " + column + " IS NOT NULL");
+            }
             if (mode == Mode.COMPACTED) {
                 s.execute("CREATE UNIQUE INDEX " + quote(name + "_key") + " ON " + table + "(_partition, _key_raw)");
             }
@@ -67,15 +73,21 @@ public final class StorageDdl {
     }
 
     private static String viewHeader(String view, String signature) {
-        // JSON escapes line breaks; a line comment safely records the exact ID set in the cache file.
+        // JSON escapes line breaks; the comment preserves schema IDs and inferred fields in the cache file.
         return "CREATE VIEW " + quote(view) + " -- schemas: " + signature + "\nAS SELECT ";
     }
 
-    static boolean viewMatches(Connection reader, long id, String signature) throws SQLException {
+    static Optional<String> viewSignature(Connection reader, long id) throws SQLException {
         String view = viewName(reader, id);
         try (var p = reader.prepareStatement("SELECT sql FROM sqlite_schema WHERE type='view' AND name=?")) {
             p.setString(1, view);
-            try (var rows = p.executeQuery()) { return rows.next() && rows.getString(1).startsWith(viewHeader(view, signature)); }
+            try (var rows = p.executeQuery()) {
+                if (!rows.next()) return Optional.empty();
+                String sql = rows.getString(1), prefix = "CREATE VIEW " + quote(view) + " -- schemas: ";
+                int end = sql.indexOf('\n', prefix.length());
+                if (!sql.startsWith(prefix) || end < 0) throw new SQLException("Missing layout signature for view " + view);
+                return Optional.of(sql.substring(prefix.length(), end));
+            }
         }
     }
 

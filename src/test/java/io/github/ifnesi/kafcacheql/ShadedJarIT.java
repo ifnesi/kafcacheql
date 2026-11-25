@@ -20,6 +20,8 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import org.junit.jupiter.api.BeforeAll;
@@ -36,7 +38,8 @@ class ShadedJarIT {
             "org/apache/kafka/", "io/confluent/", "org/apache/avro/", "com/fasterxml/jackson/",
             "net/sf/jsqlparser/", "com/google/", "org/apache/commons/", "org/apache/hc/",
             "org/yaml/snakeyaml/", "io/swagger/", "com/eclipsesource/json/",
-            "org/checkerframework/", "javax/annotation/");
+            "org/checkerframework/", "javax/annotation/",
+            "org/everit/", "org/json/", "com/damnhandy/", "com/github/erosb/", "com/sanctionco/", "org/joda/", "com/kjetland/", "javax/validation/", "io/github/classgraph/", "nonapi/io/github/classgraph/", "kotlin/", "org/intellij/", "org/jetbrains/");
 
     /**
      * Kept in place: the driver's own classes (the prefix is inside them), JNI libraries (native symbols name
@@ -126,6 +129,32 @@ class ShadedJarIT {
         }
     }
 
+    /** 0001c / PLAN §14: only Linux, macOS and Windows, x86-64 and ARM64 natives.
+     * Keep available musl builds too. This lz4-java version has no Windows ARM64 native.
+     */
+    @Test
+    void nativePlatformsAreExactlyTheSupportedSubset() throws IOException {
+        Set<String> expected = Set.of(
+                "org/sqlite/native/Linux/x86_64", "org/sqlite/native/Linux/aarch64",
+                "org/sqlite/native/Linux-Musl/x86_64", "org/sqlite/native/Linux-Musl/aarch64",
+                "org/sqlite/native/Mac/x86_64", "org/sqlite/native/Mac/aarch64",
+                "org/sqlite/native/Windows/x86_64", "org/sqlite/native/Windows/aarch64",
+                "linux/amd64", "linux/aarch64", "darwin/x86_64", "darwin/aarch64", "win/amd64", "win/aarch64",
+                "org/xerial/snappy/native/Linux/x86_64", "org/xerial/snappy/native/Linux/aarch64",
+                "org/xerial/snappy/native/Linux/x86_64-musl",
+                "org/xerial/snappy/native/Mac/x86_64", "org/xerial/snappy/native/Mac/aarch64",
+                "org/xerial/snappy/native/Windows/x86_64", "org/xerial/snappy/native/Windows/aarch64",
+                "net/jpountz/util/linux/amd64", "net/jpountz/util/linux/aarch64",
+                "net/jpountz/util/darwin/x86_64", "net/jpountz/util/darwin/aarch64", "net/jpountz/util/windows/amd64");
+        try (JarFile file = new JarFile(jar.toFile())) {
+            Set<String> platforms = file.stream().map(JarEntry::getName)
+                    .filter(n -> n.endsWith(".so") || n.endsWith(".dll") || n.endsWith(".dylib")
+                            || n.endsWith(".jnilib") || n.endsWith(".a"))
+                    .map(n -> n.substring(0, n.lastIndexOf('/'))).collect(Collectors.toSet());
+            assertEquals(expected, platforms);
+        }
+    }
+
     /** Loads the JAR on its own, without the test classpath, and runs each native library. */
     @Test
     void relocatedAndNativeLibrariesWorkFromTheJarAlone() throws Exception {
@@ -134,6 +163,14 @@ class ShadedJarIT {
             String shaded = PREFIX.replace('/', '.');
             Class.forName(shaded + "org.apache.kafka.clients.consumer.KafkaConsumer", true, loader);
             Class.forName(shaded + "io.confluent.kafka.serializers.KafkaAvroDeserializer", true, loader);
+            Class.forName(shaded + "io.confluent.kafka.serializers.json.KafkaJsonSchemaDeserializer", true, loader);
+            var jsonSchema = Class.forName(shaded + "io.confluent.kafka.schemaregistry.json.JsonSchema", true, loader);
+            // Exercise both bundled validators, including their resources, from the standalone JAR.
+            for (String dialect : List.of("http://json-schema.org/draft-07/schema#", "https://json-schema.org/draft/2020-12/schema")) {
+                Object schema = jsonSchema.getConstructor(String.class).newInstance("{\"$schema\":\"" + dialect
+                        + "\",\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}}}");
+                assertNotNull(jsonSchema.getMethod("rawSchema").invoke(schema));
+            }
 
             Driver sqlite = (Driver) Class.forName("org.sqlite.JDBC", true, loader)
                     .getDeclaredConstructor().newInstance();

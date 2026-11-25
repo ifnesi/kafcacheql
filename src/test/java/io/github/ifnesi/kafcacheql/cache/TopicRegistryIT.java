@@ -105,8 +105,8 @@ class TopicRegistryIT {
                         "_value_schema_id|TEXT|0|0", "_headers|TEXT|0|0", "_decode_error|TEXT|0|0"), query(r,
                         "SELECT name, type, \"notnull\", pk FROM pragma_table_info('" + table + "') ORDER BY cid"));
                 assertEquals(List.of("1"), query(r, "SELECT wr FROM pragma_table_list WHERE name = '" + table + "'"));
-                assertEquals(expected == Mode.COMPACTED ? List.of(table + "_key|1", table + "_ts|0")
-                                : List.of(table + "_ts|0"), query(r,
+                assertEquals(expected == Mode.COMPACTED ? List.of(table + "_key|1", table + "_key_schema|0", table + "_ts|0", table + "_value_schema|0")
+                                : List.of(table + "_key_schema|0", table + "_ts|0", table + "_value_schema|0"), query(r,
                         "SELECT name, \"unique\" FROM pragma_index_list('" + table + "') WHERE origin = 'c' ORDER BY name"));
                 assertEquals(List.of("_timestamp"), query(r, "SELECT name FROM pragma_index_info('" + table + "_ts')"));
                 if (expected == Mode.COMPACTED) {

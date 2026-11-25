@@ -28,7 +28,7 @@ next query only fetches what's new. Joins, aggregations and JSON functions are S
 - Ad hoc questions and joins across topics: reference data, configuration, the latest state of compacted
   topics.
 - Checking topic contents in tests and while developing.
-- Working with a topic's data offline, from the cache (offline mode is still to come).
+- Working with a topic's data offline, from the cache (`offline=true`).
 
 ## What it isn't
 
@@ -63,9 +63,10 @@ The broker listens on `localhost:9092` and Schema Registry on `http://localhost:
 mvn package -DskipTests
 ```
 
-This builds `target/kafcacheql-jdbc-0.1.0-SNAPSHOT.jar`, one self-contained JAR (about 50 MB) with Kafka's
+This builds `target/kafcacheql-jdbc-0.1.0-SNAPSHOT.jar`, one self-contained JAR (about 40 MB) with Kafka's
 and Confluent's libraries relocated inside it, so it doesn't clash with other versions in the same
-application. Copy it somewhere stable: `mvn clean` deletes `target/`.
+application. It carries native libraries for Linux, macOS and Windows on x86-64 and ARM64 only. Measured
+timings for large topics are in [docs/performance.md](docs/performance.md). Copy it somewhere stable: `mvn clean` deletes `target/`.
 
 ### 3. Create two sample topics
 
@@ -149,44 +150,15 @@ fetched.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    user(["You"])
-
-    subgraph app["DBeaver, DataGrip or your Java app (one process)"]
-        tool["SQL editor or app code"]
-        subgraph driver["KafCacheQL JDBC driver"]
-            query["Query side<br/>reads the SQL, works out<br/>which offsets it needs"]
-            worker["Sync worker<br/>Kafka consumer,<br/>the only writer"]
-            decoder["Decoder<br/>Schema Registry client,<br/>Avro to JSON"]
-            query -- "missing offsets" --> worker
-            worker -- "raw records" --> decoder
-            decoder -- "JSON" --> worker
-        end
-    end
-
-    user --> tool
-    tool -- "SQL over JDBC" --> query
-
-    cache[("SQLite cache file<br/>one file per cluster<br/>one view per topic")]
-    kafka[("Kafka<br/>topics")]
-    sr[("Schema Registry")]
-
-    worker -- "fetch new records" --> kafka
-    query -. "offset lookups" .-> kafka
-    decoder -- "schemas by ID, once" --> sr
-    worker -- "write batches" --> cache
-    query -- "run the SQL, read rows" --> cache
-    query -- "result set" --> tool
-```
+![KafCacheQL architecture: the driver runs inside your tool, syncs records from Kafka into a local SQLite cache, and runs your SQL there](docs/architecture.svg)
 
 1. A query names topics as tables: `"orders"`, `"payments.v1"`.
 2. For each topic, the driver works out which offsets the query needs. Compacted topics are read up to their
    end; append topics are read for the window the query's `WHERE` clause asks for on `_partition`, `_offset`
    or `_timestamp`, or a default window (the last hour, at most 10,000 records per partition) when it doesn't
    say.
-3. Only the offsets not yet cached are fetched, then decoded (Avro with Schema Registry, plain JSON, strings
-   and bytes first; JSON Schema and Protobuf later) and stored as JSON in SQLite, with each record's
+3. Only the offsets not yet cached are fetched, then decoded (Avro and JSON Schema with Schema Registry, plain
+   JSON, strings and bytes; Protobuf later) and stored as JSON in SQLite, with each record's
    `_partition`, `_offset`, `_timestamp`, `_key` and `_headers`.
 4. SQLite runs the query. Each topic's table is a view with a column per field of the schemas its cached
    records were written with.
@@ -209,7 +181,9 @@ Each topic is a view named after the topic (a topic starting with `sqlite_`, a p
 shows). Every view has the record's `_partition`, `_offset`,
 `_timestamp` (epoch milliseconds), `_key` and `_value` (decoded, as JSON), `_headers` (a JSON array of
 `{"key": …, "value": …}`, values in base64), `_key_schema_id` and `_value_schema_id` (the schema each record
-names) and `_decode_error`, plus a column per top-level field of the schemas in its cached records. A
+names) and `_decode_error`, plus a column per top-level field of the schemas in its cached records (for plain JSON without a schema,
+of the top-level keys in its newest 1,000 cached records; a key whose type varies becomes a text column, with
+a warning). A
 primitive key with a schema is also a `key` column; a key without one is in `_key` (`_key ->> '$'`). Nested values stay JSON; Avro decimals have numeric columns.
 
 ```sql
@@ -237,6 +211,9 @@ WHERE o._timestamp >= unixepoch('now', '-1 day') * 1000;
 -- Any field through JSON, even one without a column yet
 SELECT _value ->> '$.status' AS status, _key FROM "orders" WHERE _offset >= 0;
 
+-- The latest orders: a tail query fetches only the last 5 records of each partition, with no default window
+SELECT order_id, status, _partition, _offset FROM "orders" ORDER BY _offset DESC LIMIT 5;
+
 -- Syntax only: nested fields, and records carrying a given header
 SELECT o._value ->> '$.address.city' AS city
 FROM "shipments" AS o, json_each(o._headers) AS h
@@ -246,6 +223,65 @@ WHERE o._timestamp >= unixepoch('now', '-1 hour') * 1000
 -- Syntax only: topic names with dots or dashes are quoted
 SELECT count(*) FROM "payments.v1" WHERE _offset >= 0;
 ```
+
+### Plain JSON and JSON Schema topics
+
+Topics without Schema Registry get columns too, from the top-level keys of their newest 1,000 cached records.
+A plain JSON `events` topic:
+
+```sh
+docker compose exec broker kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+  --topic events --partitions 1
+printf '%s\n' '{"type":"click","page":"/home","ms":120}' '{"type":"view","page":"/cart","ms":80}' \
+  '{"type":"click","page":"/cart","ms":95}' |
+docker compose exec -T broker kafka-console-producer --bootstrap-server broker:29092 --topic events
+```
+
+```sql
+SELECT type, count(*) AS n, avg(ms) AS avg_ms FROM "events" WHERE _offset >= 0 GROUP BY type;
+```
+
+Topics with JSON Schema in Schema Registry work like Avro ones: a column per property of the schemas in the
+cached records. A `payments` topic:
+
+```sh
+docker compose exec broker kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+  --topic payments --partitions 1
+printf '%s\n' '{"payment_id":"p1","order_id":"o1","amount":12.5,"method":"card"}' \
+  '{"payment_id":"p2","order_id":"o3","amount":3.25,"method":"cash"}' |
+docker compose exec -T schema-registry kafka-json-schema-console-producer \
+  --bootstrap-server broker:29092 --topic payments \
+  --reader-property schema.registry.url=http://localhost:8081 \
+  --reader-property 'value.schema={"type":"object","properties":{"payment_id":{"type":"string"},"order_id":{"type":"string"},"amount":{"type":"number"},"method":{"type":"string"}}}'
+```
+
+```sql
+SELECT p.payment_id, p.method, p.amount, o.status
+FROM "payments" AS p JOIN "orders" AS o ON o.order_id = p.order_id
+WHERE p._offset >= 0 AND o._offset >= 0;
+```
+
+### Offline, and fewer Kafka checks
+
+With `offline=true` the driver never contacts Kafka or Schema Registry and answers from the cache file
+alone, so `cache.path` must name it. Add a second connection with its own settings file, for example
+`~/.kafcacheql/offline.properties`:
+
+```properties
+offline=true
+cache.path=~/.kafcacheql/local.db
+```
+
+and set `cache.path=~/.kafcacheql/local.db` in `local.properties` too, so both use the same file. Offline,
+the same queries answer from what's cached: the default window counts back from each partition's newest
+cached record, results carry a warning with the cache's as-of time, and a range that isn't cached fails,
+naming it. The navigator lists only cached topics.
+
+Online, `max.staleness.ms=60000` in a settings file skips the Kafka checks (topic description and offsets)
+for a topic checked in the last minute, so repeated queries answer straight from the cache; timestamp
+bounds still ask Kafka for their offsets.
+
+### Compacted topics and Kafka calls
 
 Compacted topics hold one row per key in each partition, as Kafka does. If partitions were added to a topic,
 a key can appear in more than one; pick the newest with `_timestamp`.
@@ -269,7 +305,10 @@ configuration once. During long syncs, progress is logged every five seconds per
 | Connections, statements, result sets, column types from the schema | Done |
 | Database metadata in tools (navigator, autocomplete) | Done |
 | Checked by hand in DBeaver and DataGrip | Next |
-| JSON Schema and Protobuf, offline mode | Later |
+| Offline mode and `max.staleness.ms` | Done |
+| Columns for plain JSON topics, inferred from cached records | Done |
+| JSON Schema with Schema Registry | Done |
+| Protobuf | Later |
 
 ## Configuration
 
@@ -326,8 +365,8 @@ The driver's own settings:
 | `cache.path` | `~/.kafcacheql/<cluster-id>.db` | The SQLite cache file; required when `offline=true` |
 | `append.default.window` | `1h` | Window for append-topic queries without an `_offset` or `_timestamp` bound: a duration (`500ms`, `90s`, `15m`, `1h`, `2d`) or `all` (the whole topic, with no record limit either) |
 | `append.default.window.max.records` | `10000` | Per-partition cap on the default window; whichever limit is smaller wins |
-| `max.staleness.ms` | `0` | Skip the Kafka offsets check when the topic was checked within this time; `0` checks on every query (accepted, not used yet) |
-| `offline` | `false` | Never contact Kafka or Schema Registry; answer from the cache only (still to come) |
+| `max.staleness.ms` | `0` | Skip the Kafka offsets check when the topic was checked within this time; `0` checks on every query. Timestamp bounds still ask Kafka for their offsets |
+| `offline` | `false` | Never contact Kafka or Schema Registry; answer from the cache only; requires `cache.path`. The default window counts back from each partition's newest cached record, a range that isn't cached fails naming it, and results carry a warning with the cache's as-of time |
 | `topics.include` | `.*` | Regex of topics tools list |
 | `topics.exclude` | `__.*\|_confluent.*\|_schemas` | Regex of topics tools don't list; they stay queryable |
 | `metadata.show.internal` | `false` | List the cache's internal `$` tables too |

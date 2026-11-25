@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import org.apache.avro.Conversions;
 import org.apache.avro.LogicalTypes;
 import org.apache.avro.Schema;
@@ -138,9 +139,9 @@ class TypedViewsIT {
 
     /** PLAN §6.6: "a primitive key becomes a single key column"; collisions get numeric suffixes;
      * "Topics with several record types ... only get the metadata and JSON columns".
-     * Schema-less inference is phase 2 (0015b), so those topics keep the metadata/JSON view here.
+     * Schema-less JSON objects now infer their top-level fields (0015b).
      */
-    @Test void primitiveKeysCollideSafelyAndSchemaLessOrMultipleRecordTypesKeepJsonViews() throws Exception {
+    @Test void primitiveKeysCollideSafelyJsonInfersFieldsAndMultipleRecordTypesKeepJsonViews() throws Exception {
         String primitive = topic("typed-primitive"), plain = topic("typed-plain"), mixed = topic("typed-mixed");
         Schema value = schema("""
                 {"type":"record","name":"PrimitiveValue","fields":[{"name":"key","type":"string"},{"name":"key_1","type":"int"}]}
@@ -156,12 +157,16 @@ class TypedViewsIT {
             for (String topic : List.of(primitive, plain, mixed)) cache.sync(cache.plan(topic, execution), execution);
             var expected = new ArrayList<>(METADATA); expected.addAll(List.of("key", "key_1", "key_1_1"));
             assertEquals(expected, cache.read(c -> columns(c, primitive)));
-            assertEquals(METADATA, cache.read(c -> columns(c, plain)));
+            var inferred = new ArrayList<>(METADATA); inferred.add("data");
+            assertEquals(inferred, cache.read(c -> columns(c, plain)));
             assertEquals(METADATA, cache.read(c -> columns(c, mixed)));
             cache.read(c -> {
                 try (var s = c.createStatement(); var rows = s.executeQuery("SELECT key, key_1, key_1_1 FROM " + q(primitive))) {
                     assertTrue(rows.next()); assertEquals("a", rows.getString(1));
                     assertEquals("payload", rows.getString(2)); assertEquals(5, rows.getInt(3));
+                }
+                try (var s = c.createStatement(); var rows = s.executeQuery("SELECT data FROM " + q(plain))) {
+                    assertTrue(rows.next()); assertEquals(1, rows.getLong(1)); assertFalse(rows.next());
                 }
                 for (String topic : List.of(plain, mixed)) {
                     try (var s = c.createStatement(); var rows = s.executeQuery("SELECT count(*), min(json_valid(_value)) FROM " + q(topic))) {
@@ -177,11 +182,12 @@ class TypedViewsIT {
      * read transaction" and "a statement prepared outside a transaction runs against whatever schema is current".
      */
     @Test void activeReaderKeepsItsRowsAndColumnsAcrossViewRegeneration() throws Exception {
-        String topic = topic("typed-snapshot");
-        Schema first = schema("{\"type\":\"record\",\"name\":\"SnapshotValue\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"}]}");
+        String topic = TestStack.uniqueTopic("typed-snapshot");
+        TestStack.createTopic(topic, 1, Map.of("cleanup.policy", "compact"));
+        Schema first = schema("{\"type\":\"record\",\"name\":\"SnapshotValue\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"},{\"name\":\"old_only\",\"type\":\"string\"}]}");
         Schema next = schema("{\"type\":\"record\",\"name\":\"SnapshotValue\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"},{\"name\":\"added\",\"type\":\"string\",\"default\":\"\"}]}");
-        TestStack.sendAvro(topic, "a", record(first, "n", 1), null, TestStack.SchemaIdIn.PREFIX);
-        TestStack.sendAvro(topic, "b", record(first, "n", 2), null, TestStack.SchemaIdIn.PREFIX);
+        TestStack.sendAvro(topic, "a", record(first, "n", 1, "old_only", "a"), null, TestStack.SchemaIdIn.PREFIX);
+        TestStack.sendAvro(topic, "b", record(first, "n", 2, "old_only", "b"), null, TestStack.SchemaIdIn.PREFIX);
         try (var reader = CacheContext.acquire(config()); var writer = CacheContext.acquire(config()); var execution = execution()) {
             reader.sync(reader.plan(topic, execution), execution);
             reader.read(c -> {
@@ -206,6 +212,30 @@ class TypedViewsIT {
                 }
                 return null;
             });
+            // 0010b / §6.6 and §10.1: another process's IDs survive this process's next batch;
+            // replacing/deleting the last record of a schema removes just that schema's columns.
+            Schema external = schema("{\"type\":\"record\",\"name\":\"SnapshotValue\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"},{\"name\":\"added\",\"type\":\"string\",\"default\":\"\"},{\"name\":\"external\",\"type\":\"string\",\"default\":\"\"}]}");
+            TestStack.sendAvro(topic, "d", record(external, "n", 4, "added", "new", "external", "child"), null, TestStack.SchemaIdIn.PREFIX);
+            Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+                    System.getProperty("java.class.path"), "io.github.ifnesi.kafcacheql.sql.PipelineProcess",
+                    reader.path().toString(), topic, "jdbc").redirectError(ProcessBuilder.Redirect.INHERIT).start();
+            try {
+                assertTrue(child.waitFor(30, TimeUnit.SECONDS));
+                String output = new String(child.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                assertEquals(0, child.exitValue(), output);
+            } finally { if (child.isAlive()) child.destroyForcibly(); }
+            TestStack.sendAvro(topic, "e", record(next, "n", 5, "added", "parent"), null, TestStack.SchemaIdIn.PREFIX);
+            reader.sync(reader.plan(topic, execution), execution);
+            assertTrue(reader.read(c -> columns(c, topic)).containsAll(List.of("old_only", "added", "external")));
+            for (String key : List.of("a", "b")) {
+                TestStack.sendAvro(topic, key, record(next, "n", 6, "added", "replacement"), null, TestStack.SchemaIdIn.PREFIX);
+            }
+            reader.sync(reader.plan(topic, execution), execution);
+            assertFalse(reader.read(c -> columns(c, topic)).contains("old_only"));
+            TestStack.sendTombstone(topic, "d", null);
+            reader.sync(reader.plan(topic, execution), execution);
+            assertFalse(reader.read(c -> columns(c, topic)).contains("external"));
+            assertTrue(reader.read(c -> columns(c, topic)).contains("added"));
         }
     }
 

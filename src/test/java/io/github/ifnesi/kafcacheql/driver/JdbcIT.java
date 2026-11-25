@@ -2,6 +2,13 @@ package io.github.ifnesi.kafcacheql.driver;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.confluent.kafka.schemaregistry.client.rest.RestService;
+import io.confluent.kafka.schemaregistry.client.rest.entities.SchemaReference;
+import io.confluent.kafka.schemaregistry.json.JsonSchema;
+import io.confluent.kafka.schemaregistry.json.JsonSchemaUtils;
+import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
+import io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import com.sun.net.httpserver.HttpServer;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
@@ -14,6 +21,7 @@ import io.github.ifnesi.kafcacheql.sync.Execution;
 import io.github.ifnesi.kafcacheql.sync.SyncBatch;
 import io.github.ifnesi.kafcacheql.sync.SyncWorker;
 import io.github.ifnesi.kafcacheql.testkit.TestStack;
+import io.github.ifnesi.kafcacheql.testkit.LogCapture;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -35,6 +43,7 @@ import org.apache.avro.Conversions;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -74,6 +83,539 @@ class JdbcIT {
         var result = new ArrayList<Integer>();
         while (rows.next()) result.add(rows.getInt(1));
         return result;
+    }
+
+    /** 0016d / PLAN §8.4: a simple offset-descending literal LIMIT replaces the default window,
+     * per selected partition. Other predicates keep the default; invisible offsets extend by the shortfall.
+     */
+    @Test void tailQueriesFetchOnlySelectedTailsAndExtendPastTransactionGaps() throws Exception {
+        String topic = TestStack.uniqueTopic("jdbc-tail"), table = StorageDdl.quote(topic);
+        TestStack.createTopic(topic, 3, Map.of("cleanup.policy", "delete"));
+        long old = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2);
+        int[] lengths = {5, 7, 6};
+        for (int partition = 0; partition < lengths.length; partition++) {
+            for (int n = 0; n < lengths[partition]; n++) TestStack.send(topic, partition, old,
+                    TestStack.utf8("key" + n), TestStack.utf8("value" + n), null);
+        }
+        var p = settings(); p.remove("schema.registry.url"); p.setProperty("append.default.window", "30s");
+        p.setProperty("append.default.window.max.records", "1");
+        for (boolean selected : List.of(false, true)) {
+            p.setProperty("cache.path", dir.resolve("tail-" + selected + ".db").toString());
+            var fetched = new ArrayList<String>();
+            try (var c = DriverManager.getConnection(URL, p); var cache = CacheContext.acquire(DriverConfig.load(URL, p));
+                 var statement = c.createStatement()) {
+                cache.hooks(new SyncWorker.Hooks() {
+                    @Override public void afterCommit(SyncBatch batch) {
+                        batch.records().forEach(r -> fetched.add(batch.partition() + ":" + r.offset()));
+                    }
+                });
+                String sql = "SELECT t._partition," + (selected ? "abs(t._offset)" : "t._offset") + " FROM " + table + " t"
+                        + (selected ? " WHERE t._partition IN (0,2)" : "")
+                        + " ORDER BY " + (selected ? "t._offset" : "_offset") + " DESC LIMIT 2";
+                try (var rows = statement.executeQuery(sql)) {
+                    var offsets = new ArrayList<Integer>();
+                    while (rows.next()) {
+                        if (selected) assertNotEquals(1, rows.getInt(1));
+                        offsets.add(rows.getInt(2));
+                    }
+                    assertEquals(selected ? List.of(5, 4) : List.of(6, 5), offsets);
+                }
+                assertNull(statement.getWarnings());
+                assertEquals(selected ? Set.of("0:3", "0:4", "2:4", "2:5")
+                        : Set.of("0:3", "0:4", "1:5", "1:6", "2:4", "2:5"), new HashSet<>(fetched));
+                assertEquals(selected ? 4 : 6, fetched.size());
+                fetched.clear();
+                // Already cached tails must not leak into the normal default window.
+                for (String fallback : List.of("SELECT _offset FROM " + table + " WHERE _key IS NOT NULL ORDER BY _offset DESC LIMIT 2",
+                        "SELECT _offset FROM " + table + " ORDER BY _offset ASC LIMIT 2",
+                        "SELECT _offset FROM " + table + " ORDER BY _offset DESC LIMIT 2 OFFSET 1",
+                        "SELECT _partition AS _offset FROM " + table + " ORDER BY _offset DESC LIMIT 2",
+                        "SELECT DISTINCT _partition FROM " + table + " ORDER BY _offset DESC LIMIT 2",
+                        "SELECT _partition FROM " + table + " GROUP BY _partition ORDER BY _offset DESC LIMIT 2",
+                        "SELECT row_number() OVER (ORDER BY _offset) FROM " + table + " ORDER BY _offset DESC LIMIT 2",
+                        "SELECT _offset FROM " + table + " ORDER BY _offset DESC,_partition LIMIT 2",
+                        "SELECT a._offset FROM " + table + " a JOIN " + table + " b ON a._offset=b._offset ORDER BY a._offset DESC LIMIT 2")) {
+                    try (var rows = statement.executeQuery(fallback)) { assertFalse(rows.next(), fallback); }
+                    assertTrue(warnings(statement).contains("default window applied"), fallback + ": " + warnings(statement));
+                }
+                try (var prepared = c.prepareStatement("SELECT _offset FROM " + table + " ORDER BY _offset DESC LIMIT ?")) {
+                    prepared.setInt(1, 2);
+                    try (var rows = prepared.executeQuery()) { assertFalse(rows.next()); }
+                    assertTrue(warnings(prepared).contains("default window applied"));
+                }
+                try (var rows = statement.executeQuery("SELECT count(*) FROM " + table + " ORDER BY _offset DESC LIMIT 2")) {
+                    assertTrue(rows.next()); assertEquals(0, rows.getLong(1)); assertFalse(rows.next());
+                }
+                assertTrue(warnings(statement).contains("default window applied"));
+                assertTrue(fetched.isEmpty(), fetched.toString());
+            }
+        }
+        String tx = topic("delete"), txTable = StorageDdl.quote(tx);
+        TestStack.inTransaction(tx, true, producer -> {
+            for (int n = 0; n < 3; n++) producer.send(new org.apache.kafka.clients.producer.ProducerRecord<>(
+                    tx, 0, old, TestStack.utf8("k" + n), TestStack.utf8("v" + n)));
+        });
+        for (boolean aborted : List.of(false, true)) {
+            if (aborted) TestStack.inTransaction(tx, false, producer -> {
+                for (int n = 0; n < 3; n++) producer.send(new org.apache.kafka.clients.producer.ProducerRecord<>(
+                        tx, 0, old, TestStack.utf8("aborted" + n), TestStack.utf8("invisible")));
+            });
+            p.setProperty("cache.path", dir.resolve("tail-tx-" + aborted + ".db").toString());
+            var fetched = new ArrayList<Long>(); var starts = new ArrayList<Long>();
+            try (var c = DriverManager.getConnection(URL, p); var cache = CacheContext.acquire(DriverConfig.load(URL, p));
+                 var statement = c.createStatement()) {
+                cache.hooks(new SyncWorker.Hooks() {
+                    @Override public void beforeFetch(io.github.ifnesi.kafcacheql.sync.SyncPlan plan) {
+                        starts.add(plan.windows().get(0).span().lowerEndpoint());
+                    }
+                    @Override public void afterCommit(SyncBatch batch) { batch.records().forEach(r -> fetched.add(r.offset())); }
+                });
+                try (var rows = statement.executeQuery("SELECT _offset FROM " + txTable + " ORDER BY _offset DESC LIMIT 2")) {
+                    assertEquals(List.of(2, 1), values(rows));
+                }
+                assertNull(statement.getWarnings()); assertEquals(List.of(2L, 1L), fetched);
+                assertEquals(aborted ? List.of(6L, 4L, 2L, 1L) : List.of(2L, 1L), starts);
+                fetched.clear();
+                try (var rows = statement.executeQuery("SELECT _offset FROM " + txTable + " ORDER BY _offset DESC LIMIT 10")) {
+                    assertEquals(List.of(2, 1, 0), values(rows));
+                }
+                assertEquals(List.of(0L), fetched); assertNull(statement.getWarnings());
+            }
+        }
+    }
+
+    /** 0015a / PLAN §7.1–7.3, §6.6: each prefix/header names its own JSON schema; fixed-version
+     * references survive reopening without Registry access, and cached schema evolution drives the view.
+     */
+    @Test void jsonSchemaRecordsUseTheirOwnSchemasAndCachedReferences() throws Exception {
+        String topic = topic("delete"), table = StorageDdl.quote(topic), subject = topic + "-child";
+        String child = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}";
+        String schemaText = """
+                {"type":"object","properties":{
+                  "n":{"type":"integer"},"ratio":{"type":"number"},"ok":{"type":"boolean"},
+                  "text":{"type":"string"},"state":{"type":"string","enum":["OPEN","CLOSED"]},
+                  "array":{"type":"array","items":{"type":"integer"}},
+                  "nested":{"$ref":"child.json"},"external":{"$ref":"child.json#/properties/id"},
+                  "nullable":{"type":["null","integer"]},"widen":{"type":"integer"},"mixed":{"type":"integer"}}}
+                """;
+        var references = List.of(new SchemaReference("child.json", subject, 1));
+        var first = new JsonSchema(schemaText, references, Map.of("child.json", child), null);
+        var second = new JsonSchema(schemaText.replace("\"widen\":{\"type\":\"integer\"}", "\"widen\":{\"type\":\"number\"}").replace("\"mixed\":{\"type\":\"integer\"}",
+                "\"mixed\":{\"type\":\"string\"},\"later\":{\"type\":\"string\"}"), references, Map.of("child.json", child), null);
+        try (var rest = new RestService(TestStack.REGISTRY)) {
+            rest.registerSchema(child, "JSON", List.of(), subject, false);
+            rest.updateCompatibility("NONE", topic + "-value");
+        }
+        var requests = new CopyOnWriteArrayList<String>(); var fail = new AtomicBoolean();
+        var http = HttpClient.newHttpClient(); var registry = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        registry.createContext("/", exchange -> {
+            requests.add(exchange.getRequestURI().getPath());
+            try {
+                if (fail.get()) { exchange.sendResponseHeaders(503, -1); return; }
+                var reply = http.send(HttpRequest.newBuilder(URI.create(TestStack.REGISTRY + exchange.getRequestURI())).build(),
+                        HttpResponse.BodyHandlers.ofByteArray());
+                exchange.sendResponseHeaders(reply.statusCode(), reply.body().length); exchange.getResponseBody().write(reply.body());
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new java.io.IOException(e); }
+            finally { exchange.close(); }
+        });
+        registry.start();
+        var p = settings(); p.setProperty("schema.registry.url", "http://localhost:" + registry.getAddress().getPort());
+        // Exercise auto on values and explicit json-sr on keys, independently.
+        p.setProperty("topic." + topic + ".key.format", "json-sr");
+        String data = "{\"n\":9000000000,\"ratio\":1.25,\"ok\":true,\"text\":\"hello\",\"state\":\"OPEN\","
+                + "\"array\":[1,2],\"nested\":{\"id\":7},\"external\":8,\"nullable\":null,\"widen\":1,\"mixed\":1}";
+        try {
+            for (var where : TestStack.SchemaIdIn.values()) sendJsonSchema(topic, first, data, where);
+            try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+                try (var rows = s.executeQuery("SELECT * FROM " + table + " ORDER BY _offset")) {
+                    for (String name : List.of("n", "external", "nullable", "mixed", "widen", "key")) assertType(rows, name, JDBCType.BIGINT);
+                    assertType(rows, "ratio", JDBCType.DOUBLE); assertType(rows, "ok", JDBCType.BOOLEAN);
+                    for (String name : List.of("text", "state", "array", "nested")) assertType(rows, name, JDBCType.VARCHAR);
+                    for (int i = 0; i < 2; i++) {
+                        assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                        assertEquals(9000000000L, rows.getObject("n")); assertEquals(5L, rows.getObject("key"));
+                        assertEquals(1.25, rows.getObject("ratio")); assertEquals(true, rows.getObject("ok"));
+                        assertEquals("hello", rows.getObject("text")); assertEquals("OPEN", rows.getObject("state"));
+                        assertEquals("[1,2]", rows.getObject("array")); assertEquals("{\"id\":7}", rows.getObject("nested"));
+                        assertEquals(8L, rows.getObject("external")); assertNull(rows.getObject("nullable"));
+                        assertEquals(i == 0, !rows.getString("_value_schema_id").contains("-"));
+                    }
+                    assertFalse(rows.next());
+                }
+                assertFalse(columnTypes(c, topic).containsKey("later"));
+                for (var where : TestStack.SchemaIdIn.values()) sendJsonSchema(topic, second,
+                        data.replace("\"widen\":1", "\"widen\":1.5").replace("\"mixed\":1", "\"mixed\":\"N/A\",\"later\":\"new\""), where);
+                // A registered version with no records must never supply view columns.
+                try (var rest = new RestService(TestStack.REGISTRY)) {
+                    rest.registerSchema("{\"type\":\"object\",\"properties\":{\"latestOnly\":{\"type\":\"string\"}}}", "JSON", List.of(), topic + "-value", false);
+                }
+                try (var logs = LogCapture.capture(); var rows = s.executeQuery("SELECT n,mixed,later,widen FROM " + table + " ORDER BY _offset")) {
+                    assertType(rows, "mixed", JDBCType.VARCHAR); assertType(rows, "widen", JDBCType.DOUBLE);
+                    for (int i = 0; i < 4; i++) {
+                        assertTrue(rows.next()); assertEquals(i < 2 ? "1" : "\"N/A\"", rows.getObject("mixed"));
+                        assertEquals(i < 2 ? null : "new", rows.getObject("later"));
+                        assertEquals(i < 2 ? 1.0 : 1.5, rows.getObject("widen"));
+                    }
+                    assertFalse(rows.next()); assertTrue(warnings(s).contains("mixed"));
+                    assertTrue(logs.lines().stream().anyMatch(l -> l.startsWith("WARN ") && l.contains("mixed")));
+                }
+                assertFalse(columnTypes(c, topic).containsKey("latestOnly"));
+            }
+            assertEquals(1, requests.stream().filter(path -> path.equals("/subjects/" + subject + "/versions/1")).count(), requests.toString());
+            assertTrue(requests.stream().allMatch(path -> path.startsWith("/schemas/ids/") || path.startsWith("/schemas/guids/")
+                    || path.equals("/subjects/" + subject + "/versions/1")), requests.toString());
+            int calls = requests.size(); fail.set(true);
+            // Fresh decoder, same cache: both schema identities and their reference bodies are on disk.
+            for (var where : TestStack.SchemaIdIn.values()) sendJsonSchema(topic, second,
+                    data.replace("\"widen\":1", "\"widen\":1.5").replace("\"mixed\":1", "\"mixed\":\"N/A\",\"later\":\"new\""), where);
+            try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+                 var rows = s.executeQuery("SELECT n,_decode_error FROM " + table + " ORDER BY _offset")) {
+                for (int i = 0; i < 6; i++) { assertTrue(rows.next()); assertEquals(9000000000L, rows.getObject(1)); assertNull(rows.getString(2)); }
+                assertFalse(rows.next());
+            }
+            assertEquals(calls, requests.size(), requests.toString());
+        } finally { registry.stop(0); }
+    }
+
+    private static void sendJsonSchema(String topic, JsonSchema schema,
+                                       String data, TestStack.SchemaIdIn where) throws Exception {
+        try (var value = new KafkaJsonSchemaSerializer<>();
+             var key = new KafkaJsonSchemaSerializer<>()) {
+            Map<String, Object> config = new HashMap<>(); config.put("schema.registry.url", TestStack.REGISTRY);
+            if (where == TestStack.SchemaIdIn.HEADER) {
+                config.put("key.schema.id.serializer", "io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer");
+                config.put("value.schema.id.serializer", "io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer");
+            }
+            key.configure(config, true); value.configure(config, false);
+            var mapper = JacksonMapper.INSTANCE;
+            var headers = new RecordHeaders();
+            byte[] k = key.serialize(topic, headers, JsonSchemaUtils.envelope(
+                    new JsonSchema("{\"type\":\"integer\"}"), mapper.readTree("5")));
+            byte[] v = value.serialize(topic, headers, JsonSchemaUtils.envelope(schema, mapper.readTree(data)));
+            TestStack.send(topic, 0, null, k, v, headers);
+        }
+    }
+
+    /** 0015b / PLAN §6.6, §7.2, §10.1: cached object fields become typed columns, numeric types widen,
+     * conflicts stay unconverted with a warning, and regeneration preserves an open reader's snapshot.
+     */
+    @Test void jsonColumnsEvolveWithTypedValuesWarningsAndReaderSnapshots() throws Exception {
+        for (String policy : List.of("delete", "compact")) {
+            String topic = topic(policy), table = StorageDdl.quote(topic);
+            TestStack.sendJson(topic, "{\"id\":7}", """
+                    {"n":7,"mixed":1,"widen":1,"flag":true,"text":"a","nested":{"x":1},"array":[1],
+                     "empty":null,"_offset":123,"it's.complicated":9}
+                    """, null);
+            var p = settings(); p.remove("schema.registry.url"); p.setProperty("cache.path", dir.resolve(policy + ".db").toString());
+            try (var c = DriverManager.getConnection(URL, p); var old = c.createStatement(); var next = c.createStatement();
+                 var before = old.executeQuery("SELECT * FROM " + table + " WHERE _offset>=0")) {
+                assertTrue(before.next()); var metadata = before.getMetaData(); int width = metadata.getColumnCount();
+                assertEquals(7L, before.getObject("n")); assertEquals(true, before.getObject("flag"));
+                assertEquals(Types.BIGINT, metadata.getColumnType(before.findColumn("widen")));
+                assertEquals("{\"x\":1}", before.getString("nested")); assertEquals("[1]", before.getString("array"));
+                assertNull(before.getObject("empty")); assertEquals(123L, before.getObject("_offset_1"));
+                assertEquals(9L, before.getObject("it's.complicated")); assertEquals(7L, before.getObject("key_id"));
+                TestStack.sendJson(topic, "second", """
+                        {"n":8,"mixed":"N/A","widen":1.25,"flag":false,"text":"b","nested":{"x":2},
+                         "array":[2],"later":"present","key_id":"payload"}
+                        """, null);
+                try (var logs = LogCapture.capture(); var rows = next.executeQuery("SELECT * FROM " + table + " WHERE _offset>=0 ORDER BY _offset")) {
+                    var types = rows.getMetaData();
+                    assertEquals(Types.DOUBLE, types.getColumnType(rows.findColumn("widen")));
+                    assertEquals("DOUBLE", types.getColumnTypeName(rows.findColumn("widen")));
+                    assertEquals(Types.VARCHAR, types.getColumnType(rows.findColumn("mixed")));
+                    assertEquals("VARCHAR", types.getColumnTypeName(rows.findColumn("mixed")));
+                    assertEquals(Types.BOOLEAN, types.getColumnType(rows.findColumn("flag")));
+                    assertEquals(Types.VARCHAR, types.getColumnType(rows.findColumn("nested")));
+                    assertTrue(rows.next()); assertEquals("1", rows.getObject("mixed")); assertEquals(1.0, rows.getObject("widen"));
+                    assertNull(rows.getObject("later")); assertNull(rows.getObject("key_id_1"));
+                    assertTrue(rows.next()); assertEquals("\"N/A\"", rows.getObject("mixed")); assertEquals(1.25, rows.getObject("widen"));
+                    assertEquals(false, rows.getObject("flag")); assertEquals("present", rows.getObject("later"));
+                    assertEquals("payload", rows.getObject("key_id_1")); assertNull(rows.getObject("key_id")); assertFalse(rows.next());
+                    assertTrue(warnings(next).contains("mixed"), warnings(next));
+                    assertTrue(logs.lines().stream().anyMatch(line -> line.startsWith("WARN ") && line.contains("mixed")), logs.lines().toString());
+                }
+                assertEquals(width, metadata.getColumnCount());
+                assertEquals(Types.BIGINT, metadata.getColumnType(before.findColumn("widen")));
+                for (int i = 1; i <= width; i++) assertNotEquals("later", metadata.getColumnName(i));
+                assertFalse(before.next());
+                var columns = columnTypes(c, topic);
+                assertEquals(Types.DOUBLE, columns.get("widen")); assertEquals(Types.VARCHAR, columns.get("mixed"));
+                assertEquals(Types.VARCHAR, columns.get("later")); assertFalse(columns.containsKey("x"));
+                try (var rows = next.executeQuery("SELECT n,mixed,later FROM " + table + " WHERE _offset>=0 ORDER BY _offset")) {
+                    assertEquals(List.of(7, 8), values(rows)); assertTrue(warnings(next).contains("mixed"));
+                }
+            }
+            p.setProperty("offline", "true");
+            try (var c = DriverManager.getConnection("jdbc:kafcacheql://localhost:1", p); var s = c.createStatement();
+                 var rows = s.executeQuery("SELECT n,mixed,later FROM " + table + " WHERE _offset>=0 ORDER BY _offset")) {
+                assertEquals(Types.BIGINT, rows.getMetaData().getColumnType(1));
+                assertEquals(Types.VARCHAR, rows.getMetaData().getColumnType(2)); assertEquals(List.of(7, 8), values(rows));
+                assertTrue(warnings(s).contains("mixed")); assertTrue(warnings(s).contains("offline"));
+                assertEquals(Types.DOUBLE, columnTypes(c, topic).get("widen"));
+            }
+        }
+    }
+
+    /** 0015b / PLAN §6.6 and the manager's sample rule: newest 1,000 cached records across the topic,
+     * including non-object records in that limit; plain strings, bytes and root arrays add no columns.
+     */
+    @Test void jsonSampleIsLimitedToTheNewestThousandCachedRecords() throws Exception {
+        String topic = TestStack.uniqueTopic("jdbc-json-sample"); TestStack.createTopic(topic, 2, Map.of());
+        String text = topic("delete"), bytes = topic("delete"), array = topic("delete");
+        long base = System.currentTimeMillis() - 60000;
+        TestStack.send(topic, 0, base + 5000, null, "{\"newest\":true,\"current\":0,\"number\":3,\"real\":3.5,\"flag\":true}".getBytes(java.nio.charset.StandardCharsets.UTF_8), null);
+        for (int n = 1; n <= 1000; n++) {
+            String json = n == 1 ? "{\"discarded\":true,\"number\":\"N/A\",\"real\":\"N/A\",\"flag\":\"unknown\"}" : n == 2
+                    ? "{\"boundary\":true,\"current\":2,\"number\":2}" : "{\"current\":" + n + ",\"number\":" + n + ",\"real\":" + (n + 0.5) + ",\"flag\":true}";
+            TestStack.send(topic, n % 2, base + n, null, json.getBytes(java.nio.charset.StandardCharsets.UTF_8), null);
+        }
+        TestStack.sendJson(text, "k", "{\"hidden\":1}", null); TestStack.sendJson(bytes, "k", "{\"hidden\":1}", null);
+        TestStack.sendJson(array, "k", "[{\"hidden\":1}]", null);
+        var p = settings(); p.remove("schema.registry.url"); p.setProperty("sync.batch.records", "1000"); p.setProperty("max.poll.records", "1000");
+        p.setProperty("topic." + text + ".value.format", "string"); p.setProperty("topic." + bytes + ".value.format", "bytes");
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var rows = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(topic))) { assertTrue(rows.next()); assertEquals(1001, rows.getInt(1)); }
+            var columns = columnTypes(c, topic);
+            assertEquals(Types.BIGINT, columns.get("number")); assertTrue(columns.containsKey("boundary"));
+            assertEquals(Types.DOUBLE, columns.get("real")); assertEquals(Types.BOOLEAN, columns.get("flag"));
+            assertEquals(Types.BOOLEAN, columns.get("newest")); assertFalse(columns.containsKey("discarded"));
+            assertFalse(warnings(s).contains("conflicting"), warnings(s));
+            TestStack.send(topic, 0, base + 6000, null, "\"scalar\"".getBytes(java.nio.charset.StandardCharsets.UTF_8), null);
+            try (var rows = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(topic))) { assertTrue(rows.next()); assertEquals(1002, rows.getInt(1)); }
+            columns = columnTypes(c, topic); assertFalse(columns.containsKey("boundary")); assertFalse(columns.containsKey("discarded"));
+            try (var rows = s.executeQuery("SELECT newest,\"number\",\"real\",flag FROM " + StorageDdl.quote(topic) + " WHERE _timestamp=" + (base + 5000))) {
+                assertEquals(Types.BOOLEAN, rows.getMetaData().getColumnType(1)); assertTrue(rows.next());
+                assertEquals(true, rows.getObject(1)); assertEquals(3L, rows.getObject(2));
+                assertEquals(3.5, rows.getObject(3)); assertEquals(true, rows.getObject(4));
+                for (int column = 1; column <= 4; column++) assertEquals(rows.getMetaData().getColumnClassName(column), rows.getObject(column).getClass().getName());
+                assertFalse(rows.next());
+            }
+            // S5-2 / §6.6: the sampled type must never silently coerce an older, incompatible value.
+            for (String field : List.of("number", "real", "flag")) {
+                Class<?> type = field.equals("flag") ? Boolean.class : field.equals("real") ? Double.class : Long.class;
+                List<org.junit.jupiter.api.function.ThrowingConsumer<ResultSet>> getters = List.of(
+                        r -> r.getObject(1), r -> r.getObject(field), r -> r.getObject(1, type), r -> r.getObject(field, type),
+                        r -> r.getByte(1), r -> r.getByte(field), r -> r.getShort(1), r -> r.getShort(field),
+                        r -> r.getInt(1), r -> r.getInt(field), r -> r.getLong(1), r -> r.getLong(field),
+                        r -> r.getFloat(1), r -> r.getFloat(field), r -> r.getDouble(1), r -> r.getDouble(field),
+                        r -> r.getBoolean(1), r -> r.getBoolean(field), r -> r.getBigDecimal(1), r -> r.getBigDecimal(field));
+                for (var getter : getters) {
+                    try (var rows = s.executeQuery("SELECT " + StorageDdl.quote(field) + " FROM " + StorageDdl.quote(topic)
+                            + " WHERE _partition=1 AND _offset=0")) {
+                        assertTrue(rows.next()); String textValue = field.equals("flag") ? "unknown" : "N/A";
+                        assertEquals(type.getName(), rows.getMetaData().getColumnClassName(1));
+                        assertEquals(textValue, rows.getString(1)); assertEquals(textValue, rows.getString(field));
+                        SQLException invalid = assertThrows(SQLException.class, () -> getter.accept(rows));
+                        assertEquals("22018", invalid.getSQLState());
+                        assertTrue(invalid.getMessage().contains(field), invalid.getMessage());
+                        assertTrue(invalid.getMessage().contains(textValue), invalid.getMessage());
+                    }
+                }
+            }
+            for (String plain : List.of(text, bytes, array)) {
+                try (var rows = s.executeQuery("SELECT * FROM " + StorageDdl.quote(plain))) {
+                    assertEquals(9, rows.getMetaData().getColumnCount()); assertTrue(rows.next()); assertFalse(rows.next());
+                }
+            }
+        }
+    }
+
+    private static Map<String, Integer> columnTypes(Connection connection, String topic) throws SQLException {
+        var types = new LinkedHashMap<String, Integer>();
+        try (var columns = connection.getMetaData().getColumns(null, null, topic, null)) {
+            while (columns.next()) types.put(columns.getString("COLUMN_NAME"), columns.getInt("DATA_TYPE"));
+        }
+        return types;
+    }
+
+    /** 0015c / PLAN §6.3, §8.3, §10.1, §11: recent freshness checks belong to the context and current
+     * generation; online timestamp bounds still use Kafka, without syncing outside their window.
+     * Skipped freshness checks never advance caught_up_at_ms or write an unchanged cache.
+     */
+    @Test void stalenessReusesChecksUntilAnotherJvmChangesTheGeneration() throws Exception {
+        for (String policy : List.of("delete", "compact")) {
+            String topic = topic(policy), table = StorageDdl.quote(topic);
+            long now = System.currentTimeMillis();
+            send(topic, 1, now - TimeUnit.HOURS.toMillis(3)); send(topic, 2, now - TimeUnit.HOURS.toMillis(2)); send(topic, 3, now);
+            var p = settings(); p.setProperty("cache.path", dir.resolve(policy + ".db").toString()); p.setProperty("max.staleness.ms", "600000");
+            var config = DriverConfig.load(URL, p);
+            try (var c = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(config); var clients = KafkaClients.acquire(config)) {
+                Field admin = KafkaClients.class.getDeclaredField("admin"); admin.setAccessible(true);
+                Admin original = (Admin) admin.get(clients.clients()); var calls = new ArrayList<String>();
+                var timestampLookups = new AtomicInteger();
+                admin.set(clients.clients(), Proxy.newProxyInstance(Admin.class.getClassLoader(), new Class<?>[] {Admin.class}, (self, method, args) -> {
+                    if (method.getName().equals("listOffsets")) {
+                        Object spec = ((Map<?, ?>) args[0]).values().iterator().next();
+                        if (spec instanceof OffsetSpec.TimestampSpec) timestampLookups.incrementAndGet();
+                        else calls.add(spec instanceof OffsetSpec.EarliestSpec ? "logStartOffsets" : "endOffsets");
+                    } else calls.add(method.getName());
+                    try { return method.invoke(original, args); }
+                    catch (InvocationTargetException e) { throw e.getCause(); }
+                }));
+                var fetched = new AtomicInteger();
+                control.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) { fetched.addAndGet(batch.records().size()); } });
+                try (var statement = c.createStatement()) {
+                    String sql = "SELECT n FROM " + table + " WHERE _offset>=0 ORDER BY _offset";
+                    try (var rows = statement.executeQuery("SELECT n FROM " + table + " WHERE _offset<1")) { assertEquals(List.of(1), values(rows)); }
+                    assertEquals(2, Collections.frequency(calls, "describeTopics"), "initial registration and planning");
+                    assertEquals(1, Collections.frequency(calls, "logStartOffsets")); assertEquals(1, Collections.frequency(calls, "endOffsets"));
+                    assertEquals(1, Collections.frequency(calls, "describeConfigs"));
+                    var firstCalls = List.copyOf(calls); var before = partitionState(control);
+                    try (var rows = statement.executeQuery("SELECT n FROM " + table + " WHERE _offset<1")) { assertEquals(List.of(1), values(rows)); }
+                    assertEquals(firstCalls, calls, "the repeated offset query makes no freshness calls");
+                    assertEquals(0, timestampLookups.get());
+                    // Offset 1 is uncached and outside this timestamp window on the append topic.
+                    try (var rows = statement.executeQuery("SELECT n FROM " + table + " WHERE _timestamp>=" + (now - TimeUnit.HOURS.toMillis(1)))) {
+                        assertEquals(List.of(3), values(rows));
+                    }
+                    assertEquals("delete".equals(policy) ? 2 : 3, fetched.get(), "the timestamp query syncs only its window");
+                    assertEquals("delete".equals(policy) ? 1 : 0, timestampLookups.get());
+                    assertEquals(firstCalls, calls, "timestamp resolution adds no freshness calls");
+                    assertEquals(before, partitionState(control));
+                    // Another connection reuses the context's freshness check, but resolves its default time through Kafka.
+                    var recent = new Properties(); recent.putAll(p); recent.setProperty("append.default.window", "1h");
+                    try (var other = DriverManager.getConnection(URL, recent); var s2 = other.createStatement();
+                         var rows = s2.executeQuery("SELECT n FROM " + table + " ORDER BY _offset")) {
+                        assertEquals("delete".equals(policy) ? List.of(3) : List.of(1, 2, 3), values(rows));
+                    }
+                    assertEquals("delete".equals(policy) ? 2 : 0, timestampLookups.get());
+                    assertEquals("delete".equals(policy) ? 2 : 3, fetched.get());
+                    try (var rows = statement.executeQuery(sql)) { assertEquals(List.of(1, 2, 3), values(rows)); }
+                    assertEquals(3, fetched.get()); assertEquals(before, partitionState(control));
+                    assertEquals(firstCalls, calls);
+                    // S5-3 / §10.1: a same-Kafka-ID rebuild cannot be caught by the topic-ID safeguard.
+                    for (boolean recreate : policy.equals("compact") ? List.of(false, true) : List.of(true)) {
+                        long generation = control.read(r -> io.github.ifnesi.kafcacheql.cache.TopicRegistry.generation(r, topic).orElseThrow());
+                        String kafkaId = control.read(r -> {
+                            try (var q = r.createStatement(); var rows = q.executeQuery("SELECT topic_uuid FROM \"$topics\"")) { rows.next(); return rows.getString(1); }
+                        });
+                        if (recreate) TestStack.recreateTopic(topic, 1, Map.of("cleanup.policy", policy));
+                        else try (var execution = new Execution(java.time.Duration.ofSeconds(5))) {
+                            control.write(topic, generation, execution, writer -> {
+                                try (var q = writer.prepareStatement("UPDATE \"$partitions\" SET caught_up_at_ms=0 WHERE topic_ref=?")) {
+                                    q.setLong(1, generation); q.executeUpdate();
+                                }
+                                return null;
+                            });
+                        }
+                        send(topic, 9, null);
+                        Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+                                System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sql.PipelineProcess.class.getName(),
+                                control.path().toString(), topic, "jdbc").redirectError(ProcessBuilder.Redirect.INHERIT).start();
+                        try {
+                            assertTrue(child.waitFor(20, TimeUnit.SECONDS)); assertEquals(0, child.exitValue());
+                            assertEquals(recreate ? "ROW 9" : "ROW 1\nROW 2\nROW 3\nROW 9",
+                                    new String(child.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim());
+                        } finally { child.destroyForcibly(); }
+                        assertTrue(control.read(r -> io.github.ifnesi.kafcacheql.cache.TopicRegistry.generation(r, topic).orElseThrow()) > generation);
+                        assertEquals(recreate, control.read(r -> {
+                            try (var q = r.createStatement(); var rows = q.executeQuery("SELECT topic_uuid FROM \"$topics\"")) { rows.next(); return !kafkaId.equals(rows.getString(1)); }
+                        }));
+                        calls.clear();
+                        try (var rows = statement.executeQuery(sql)) { assertEquals(recreate ? List.of(9) : List.of(1, 2, 3, 9), values(rows)); }
+                        assertEquals(1, Collections.frequency(calls, "describeTopics"));
+                        assertEquals(1, Collections.frequency(calls, "logStartOffsets")); assertEquals(1, Collections.frequency(calls, "endOffsets"));
+                        assertEquals(recreate ? 1 : 0, Collections.frequency(calls, "describeConfigs")); assertEquals(3, fetched.get(), "the child filled the replacement cache");
+                    }
+                } finally { admin.set(clients.clients(), original); }
+            }
+        }
+    }
+
+    /** 0015c / PLAN §8.4, §10.1, §11: offline uses each partition's newest cached timestamp and end;
+     * cached views and metadata work without services, while missing or lost ranges fail explicitly.
+     */
+    @Test void offlineUsesCachedWindowsSchemasAndMetadataWithoutContactingServices() throws Exception {
+        String topic = TestStack.uniqueTopic("jdbc-offline"); TestStack.createTopic(topic, 2, Map.of());
+        String compact = topic("compact"), uncached = topic("delete"); send(compact, 8, null);
+        long hour = TimeUnit.HOURS.toMillis(1), base = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(7);
+        for (int partition = 0; partition < 2; partition++) for (int n = 0; n < 5; n++) {
+            var record = new GenericData.Record(VALUE); record.put("n", partition * 10 + n); record.put("ok", true);
+            var headers = new RecordHeaders();
+            byte[] bytes = TestStack.serializeAvro(topic, headers, record, TestStack.SchemaIdIn.PREFIX, false);
+            TestStack.send(topic, partition, base + partition * TimeUnit.DAYS.toMillis(2) + n * hour, null, bytes, headers);
+        }
+        var p = settings(); String table = StorageDdl.quote(topic);
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            for (String bound : List.of("_offset<2", "_offset>=3")) {
+                try (var rows = s.executeQuery("SELECT n FROM " + table + " WHERE " + bound)) { while (rows.next()) {} }
+            }
+            try (var rows = s.executeQuery("SELECT n FROM " + StorageDdl.quote(compact))) { assertEquals(List.of(8), values(rows)); }
+        }
+        var requests = new AtomicInteger(); var registry = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        registry.createContext("/", exchange -> { requests.incrementAndGet(); exchange.sendResponseHeaders(500, -1); exchange.close(); }); registry.start();
+        p.setProperty("offline", "true"); p.setProperty("schema.registry.url", "http://localhost:" + registry.getAddress().getPort());
+        p.setProperty("append.default.window", "1h"); p.setProperty("append.default.window.max.records", "2");
+        String url = "jdbc:kafcacheql://localhost:1";
+        var config = DriverConfig.load(url, p);
+        try (var c = DriverManager.getConnection(url, p); var control = CacheContext.acquire(config); var s = c.createStatement()) {
+            s.setQueryTimeout(3); var before = partitionState(control);
+            try (var rows = s.executeQuery("SELECT n FROM " + table + " ORDER BY _partition,_offset")) { assertEquals(List.of(3, 4, 13, 14), values(rows)); }
+            String warnings = warnings(s); assertTrue(warnings.contains("offline"), warnings); assertTrue(warnings.contains("as of"), warnings);
+            assertTrue(warnings.contains("partition 0") && warnings.contains("partition 1"), warnings);
+            for (String state : before.subList(0, 2)) {
+                String[] fields = state.split(":");
+                assertTrue(warnings.contains(java.time.Instant.ofEpochMilli(Long.parseLong(fields[2])).toString()), warnings);
+            }
+            String cached = "SELECT n FROM " + table + " WHERE _offset>=0 AND _offset<2 ORDER BY _partition,_offset";
+            try (var rows = s.executeQuery(cached)) { assertEquals(List.of(0, 1, 10, 11), values(rows)); }
+            try (var rows = s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=3 AND _timestamp>=" + (base + 4 * hour) + " AND _partition=0")) { assertEquals(List.of(4), values(rows)); }
+            try (var rows = s.executeQuery("SELECT n FROM " + table + " WHERE _offset<2 AND _timestamp>=" + (base + hour) + " AND _partition=0")) { assertEquals(List.of(1), values(rows)); }
+            // S5-1 / §8.4, §11: cached timestamps cannot prove that missing offsets contain no matches.
+            for (String bound : List.of("_timestamp>=" + (base + 2 * hour), "_timestamp=" + (base + 2 * hour),
+                    "_timestamp>=" + (base + 100 * hour), "_timestamp>=" + (base + 4 * hour) + " AND _partition=0")) {
+                assertMissing(assertThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE " + bound)), topic, "[2..3)");
+            }
+            assertMissing(assertThrows(SQLException.class, () -> s.executeQuery("SELECT a.n FROM " + table + " a JOIN " + table
+                    + " b ON a._partition=b._partition WHERE a._offset>=3 AND a._timestamp>=" + (base + 4 * hour)
+                    + " AND b._timestamp>=" + (base + 4 * hour))), topic, "[2..3)");
+            var wide = new Properties(); wide.putAll(p); wide.setProperty("append.default.window.max.records", "4");
+            try (var other = DriverManager.getConnection(url, wide); var query = other.createStatement()) {
+                assertMissing(assertThrows(SQLException.class, () -> query.executeQuery("SELECT n FROM " + table)), topic, "[2..3)");
+            }
+            try (var rows = s.executeQuery("SELECT n FROM " + StorageDdl.quote(compact))) { assertEquals(List.of(8), values(rows)); }
+            try (var tables = c.getMetaData().getTables(null, null, "%", null)) {
+                var names = new HashSet<String>(); while (tables.next()) names.add(tables.getString("TABLE_NAME")); assertEquals(Set.of(topic, compact), names);
+            }
+            try (var columns = c.getMetaData().getColumns(null, null, topic, "n")) { assertEquals(List.of("n"), columnNames(columns)); }
+            try (var columns = c.getMetaData().getColumns(null, null, uncached, null)) { assertFalse(columns.next()); }
+            SQLException missing = assertThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=1 AND _offset<4"));
+            assertMissing(missing, topic, "[2..3)");
+            SQLException beyond = assertThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=4 AND _offset<7"));
+            assertMissing(beyond, topic, "[5..7)");
+            assertEquals(before, partitionState(control), "offline queries never advance caught_up_at_ms");
+            long generation = control.read(r -> io.github.ifnesi.kafcacheql.cache.TopicRegistry.generation(r, topic).orElseThrow());
+            try (var execution = new Execution(java.time.Duration.ofSeconds(5))) {
+                control.write(topic, generation, execution, writer -> {
+                    io.github.ifnesi.kafcacheql.cache.PartitionStore.raiseFloors(writer, generation, Map.of(0, 1L));
+                    io.github.ifnesi.kafcacheql.cache.PartitionStore.deleteChunk(writer, generation, 0, 100); return null;
+                });
+            }
+            assertMissing(assertThrows(SQLException.class, () -> s.executeQuery(cached)), topic, "[0..1)");
+            assertEquals(0, requests.get()); assertNull(field(control, "clients"));
+            assertNull(field(field(field(control, "context"), "worker"), "consumer"));
+        } finally { registry.stop(0); }
+        p.setProperty("append.default.window.max.records", "1");
+        try (var c = DriverManager.getConnection(url, p); var s = c.createStatement(); var rows = s.executeQuery("SELECT n FROM " + table + " ORDER BY _partition")) {
+            assertEquals(List.of(4, 14), values(rows));
+        }
+    }
+
+    private static void assertMissing(SQLException failure, String topic, String range) {
+        assertEquals("40001", failure.getSQLState());
+        assertTrue(failure.getMessage().contains("missing ranges"), failure.getMessage());
+        assertTrue(failure.getMessage().contains(topic), failure.getMessage());
+        assertTrue(failure.getMessage().contains(range), failure.getMessage());
+    }
+    private static String warnings(Statement statement) throws SQLException {
+        var text = new StringBuilder(); for (var warning = statement.getWarnings(); warning != null; warning = warning.getNextWarning()) text.append(warning.getMessage()).append('\n');
+        return text.toString();
+    }
+    private static List<String> partitionState(CacheContext.Lease cache) throws SQLException {
+        return cache.read(r -> { var state = new ArrayList<String>(); try (var s = r.createStatement(); var rows = s.executeQuery("SELECT topic_ref,partition_no,caught_up_at_ms FROM \"$partitions\" ORDER BY topic_ref,partition_no")) {
+            while (rows.next()) state.add(rows.getLong(1) + ":" + rows.getInt(2) + ":" + rows.getObject(3));
+        } return state; });
     }
 
     /** PLAN §12.3: read-only, Spring transaction compatibility, SELECT only, warnings, SQLite bindings;

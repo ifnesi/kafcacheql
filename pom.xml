@@ -75,6 +75,21 @@
       </dependency>
       <!-- Convergence pins: the highest version any path asks for. -->
       <dependency>
+        <groupId>com.google.guava</groupId>
+        <artifactId>guava</artifactId>
+        <version>${guava.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.jetbrains.kotlin</groupId>
+        <artifactId>kotlin-stdlib</artifactId>
+        <version>2.3.10</version>
+      </dependency>
+      <dependency>
+        <groupId>joda-time</groupId>
+        <artifactId>joda-time</artifactId>
+        <version>2.12.7</version>
+      </dependency>
+      <dependency>
         <groupId>org.slf4j</groupId>
         <artifactId>slf4j-api</artifactId>
         <version>${slf4j.version}</version>
@@ -112,6 +127,11 @@
     <dependency>
       <groupId>io.confluent</groupId>
       <artifactId>kafka-avro-serializer</artifactId>
+      <version>${confluent.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.confluent</groupId>
+      <artifactId>kafka-json-schema-serializer</artifactId>
       <version>${confluent.version}</version>
     </dependency>
     <dependency>
@@ -330,14 +350,71 @@
                     <!-- Shade doesn't relocate multi-release copies; the relocated base classes run on Java 21. -->
                     <exclude>META-INF/versions/*/com/fasterxml/**</exclude>
                     <exclude>META-INF/versions/*/org/yaml/**</exclude>
+                    <exclude>META-INF/versions/*/kotlin/**</exclude>
                   </excludes>
                 </filter>
                 <!-- The driver opens SQLite directly; only KafCacheQL registers with DriverManager. -->
                 <filter>
                   <artifact>org.xerial:sqlite-jdbc</artifact>
+                  <includes>
+                    <include>**/*.class</include>
+                    <include>META-INF/**</include>
+                    <include>sqlite-jdbc.properties</include>
+                    <include>org/sqlite/native/Linux/x86_64/**</include>
+                    <include>org/sqlite/native/Linux/aarch64/**</include>
+                    <include>org/sqlite/native/Linux-Musl/x86_64/**</include>
+                    <include>org/sqlite/native/Linux-Musl/aarch64/**</include>
+                    <include>org/sqlite/native/Mac/x86_64/**</include>
+                    <include>org/sqlite/native/Mac/aarch64/**</include>
+                    <include>org/sqlite/native/Windows/x86_64/**</include>
+                    <include>org/sqlite/native/Windows/aarch64/**</include>
+                  </includes>
                   <excludes>
                     <exclude>META-INF/services/java.sql.Driver</exclude>
                   </excludes>
+                </filter>
+                <!-- Keep all classes/metadata and only Linux, macOS and Windows x86-64/ARM64 natives.
+                     Available Linux musl builds are included; lz4-java has no Windows ARM64 native. -->
+                <filter>
+                  <artifact>com.github.luben:zstd-jni</artifact>
+                  <includes>
+                    <include>**/*.class</include>
+                    <include>META-INF/**</include>
+                    <include>linux/amd64/**</include>
+                    <include>linux/aarch64/**</include>
+                    <include>darwin/x86_64/**</include>
+                    <include>darwin/aarch64/**</include>
+                    <include>win/amd64/**</include>
+                    <include>win/aarch64/**</include>
+                  </includes>
+                </filter>
+                <filter>
+                  <artifact>org.xerial.snappy:snappy-java</artifact>
+                  <includes>
+                    <include>**/*.class</include>
+                    <include>META-INF/**</include>
+                    <include>org/xerial/snappy/VERSION</include>
+                    <include>org/xerial/snappy/native/README</include>
+                    <include>org/xerial/snappy/native/Linux/x86_64/**</include>
+                    <include>org/xerial/snappy/native/Linux/aarch64/**</include>
+                    <include>org/xerial/snappy/native/Linux/x86_64-musl/**</include>
+                    <include>org/xerial/snappy/native/Mac/x86_64/**</include>
+                    <include>org/xerial/snappy/native/Mac/aarch64/**</include>
+                    <include>org/xerial/snappy/native/Windows/x86_64/**</include>
+                    <include>org/xerial/snappy/native/Windows/aarch64/**</include>
+                  </includes>
+                </filter>
+                <filter>
+                  <artifact>at.yawk.lz4:lz4-java</artifact>
+                  <includes>
+                    <include>**/*.class</include>
+                    <include>META-INF/**</include>
+                    <include>net/jpountz/util/linux/amd64/**</include>
+                    <include>net/jpountz/util/linux/aarch64/**</include>
+                    <include>net/jpountz/util/darwin/x86_64/**</include>
+                    <include>net/jpountz/util/darwin/aarch64/**</include>
+                    <include>net/jpountz/util/windows/amd64/**</include>
+                  </includes>
                 </filter>
               </filters>
               <relocations>
@@ -392,6 +469,58 @@
                 <relocation>
                   <pattern>javax.annotation</pattern>
                   <shadedPattern>${shade.prefix}.javax.annotation</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.everit</pattern>
+                  <shadedPattern>${shade.prefix}.org.everit</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.json</pattern>
+                  <shadedPattern>${shade.prefix}.org.json</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.damnhandy</pattern>
+                  <shadedPattern>${shade.prefix}.com.damnhandy</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.github.erosb</pattern>
+                  <shadedPattern>${shade.prefix}.com.github.erosb</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.sanctionco</pattern>
+                  <shadedPattern>${shade.prefix}.com.sanctionco</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.joda</pattern>
+                  <shadedPattern>${shade.prefix}.org.joda</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.kjetland</pattern>
+                  <shadedPattern>${shade.prefix}.com.kjetland</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>javax.validation</pattern>
+                  <shadedPattern>${shade.prefix}.javax.validation</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>io.github.classgraph</pattern>
+                  <shadedPattern>${shade.prefix}.io.github.classgraph</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>nonapi.io.github.classgraph</pattern>
+                  <shadedPattern>${shade.prefix}.nonapi.io.github.classgraph</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>kotlin</pattern>
+                  <shadedPattern>${shade.prefix}.kotlin</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.intellij</pattern>
+                  <shadedPattern>${shade.prefix}.org.intellij</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.jetbrains</pattern>
+                  <shadedPattern>${shade.prefix}.org.jetbrains</shadedPattern>
                 </relocation>
               </relocations>
               <transformers>

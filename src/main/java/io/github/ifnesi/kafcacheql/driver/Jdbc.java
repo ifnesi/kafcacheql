@@ -25,7 +25,7 @@ import javax.sql.rowset.RowSetMetaDataImpl;
 import javax.sql.rowset.CachedRowSet;
 import javax.sql.rowset.RowSetProvider;
 
-/** JDBC wrappers: unsupported operations are explicit, and SQLite owns binding and value conversion. */
+/** JDBC wrappers: unsupported operations are explicit; schema-derived values are checked before conversion. */
 final class Jdbc {
     private Jdbc() {}
 
@@ -534,6 +534,8 @@ final class Jdbc {
     }
 
     private static final class ResultHandler extends Handler {
+        private static final Set<String> TYPED_GETTERS = Set.of("getObject", "getBoolean", "getByte", "getShort",
+                "getInt", "getLong", "getFloat", "getDouble", "getBigDecimal");
         final StatementHandler owner;
         final QueryPipeline.Cursor cursor;
         final Execution execution;
@@ -592,28 +594,10 @@ final class Jdbc {
                         try {
                             execution.check();
                             Object value;
-                            if (name.equals("getDouble") || name.equals("getFloat") || name.equals("getObject")
-                                    && args.length == 2 && (args[1] == Double.class || args[1] == Float.class)) {
-                                int column = column(args[0]);
-                                if (cursor.types().get(column) == JDBCType.DOUBLE) {
-                                    double number = floating(column);
-                                    if (name.equals("getObject") && cursor.rows().wasNull()) value = null;
-                                    else if (name.equals("getFloat") || args.length == 2 && args[1] == Float.class) value = (float) number;
-                                    else value = number;
-                                } else value = call(method, cursor.rows(), args);
-                            } else if (name.equals("getObject") && args.length == 1) {
+                            if (TYPED_GETTERS.contains(name)) {
                                 int column = column(args[0]);
                                 var type = cursor.types().get(column);
-                                value = type == null ? cursor.rows().getObject(column) : switch (type) {
-                                    case BOOLEAN -> cursor.rows().getBoolean(column);
-                                    case INTEGER -> cursor.rows().getInt(column);
-                                    case BIGINT -> cursor.rows().getLong(column);
-                                    case DOUBLE -> floating(column);
-                                    case NUMERIC -> cursor.rows().getBigDecimal(column);
-                                    case VARCHAR -> cursor.rows().getString(column);
-                                    default -> throw new IllegalArgumentException("Unsupported view type " + type);
-                                };
-                                if (cursor.rows().wasNull()) value = null;
+                                value = type == null ? call(method, cursor.rows(), args) : typedGetter(method, args, column, type);
                             } else value = call(method, cursor.rows(), args);
                             execution.check();
                             yield value;
@@ -625,13 +609,54 @@ final class Jdbc {
         int column(Object reference) throws SQLException {
             return reference instanceof Integer index ? index : cursor.rows().findColumn((String) reference);
         }
-        double floating(int column) throws SQLException {
+        Object typedGetter(Method method, Object[] args, int column, JDBCType type) throws SQLException {
+            Object value = typedValue(column, type);
+            Number number = value instanceof Number n ? n : value instanceof Boolean b ? (b ? 1 : 0) : null;
+            return switch (method.getName()) {
+                case "getObject" -> {
+                    if (args.length == 1 || args[1] instanceof Class<?> target && (value == null || target.isInstance(value))) yield value;
+                    if (number != null && args[1] == Double.class) yield number.doubleValue();
+                    if (number != null && args[1] == Float.class) yield number.floatValue();
+                    yield call(method, cursor.rows(), args);
+                }
+                case "getBoolean" -> type == JDBCType.BOOLEAN ? value != null && (Boolean) value : call(method, cursor.rows(), args);
+                case "getByte" -> value == null ? (byte) 0 : number == null ? call(method, cursor.rows(), args) : number.byteValue();
+                case "getShort" -> value == null ? (short) 0 : number == null ? call(method, cursor.rows(), args) : number.shortValue();
+                case "getInt" -> value == null ? 0 : number == null ? call(method, cursor.rows(), args) : number.intValue();
+                case "getLong" -> value == null ? 0L : number == null ? call(method, cursor.rows(), args) : number.longValue();
+                case "getFloat" -> value == null ? 0F : number == null ? call(method, cursor.rows(), args) : number.floatValue();
+                case "getDouble" -> value == null ? 0D : number == null ? call(method, cursor.rows(), args) : number.doubleValue();
+                case "getBigDecimal" -> type == JDBCType.NUMERIC && args.length == 1 ? value : call(method, cursor.rows(), args);
+                default -> call(method, cursor.rows(), args);
+            };
+        }
+        Object typedValue(int column, JDBCType type) throws SQLException {
+            if (type == JDBCType.VARCHAR) return cursor.rows().getString(column);
             Object value = cursor.rows().getObject(column);
-            if (value == null) return 0;
-            if (value instanceof Number number) return number.doubleValue();
-            // JSON stores non-finite Avro numbers as strings; SQLite's numeric getters turn them into zero.
-            try { return Double.parseDouble((String) value); }
-            catch (NumberFormatException e) { throw new SQLException("Invalid DOUBLE value in column " + column, "22018", e); }
+            if (value == null) return null;
+            try {
+                return switch (type) {
+                    case BIGINT -> integral(value);
+                    case INTEGER -> Math.toIntExact(integral(value));
+                    // JSON stores non-finite numbers as strings; preserve NaN and the infinities too.
+                    case DOUBLE -> value instanceof Number n ? n.doubleValue() : Double.parseDouble(value.toString());
+                    case BOOLEAN -> {
+                        if (value instanceof Number n && (n.doubleValue() == 0 || n.doubleValue() == 1)) yield n.doubleValue() == 1;
+                        String text = value.toString();
+                        if (text.equalsIgnoreCase("true") || text.equals("1")) yield true;
+                        if (text.equalsIgnoreCase("false") || text.equals("0")) yield false;
+                        throw new NumberFormatException("Not a boolean");
+                    }
+                    case NUMERIC -> new java.math.BigDecimal(value.toString());
+                    default -> throw new IllegalArgumentException("Unsupported view type " + type);
+                };
+            } catch (NumberFormatException | ArithmeticException e) {
+                throw new SQLException("Invalid " + type + " value '" + value + "' in column " + metadata.getColumnLabel(column), "22018", e);
+            }
+        }
+        private static long integral(Object value) {
+            if (value instanceof Integer || value instanceof Long) return ((Number) value).longValue();
+            return new java.math.BigDecimal(value.toString()).longValueExact();
         }
         void fail(SQLException failure) {
             try { close(); } catch (SQLException close) { failure.addSuppressed(close); }

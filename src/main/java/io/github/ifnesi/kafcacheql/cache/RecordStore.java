@@ -14,6 +14,8 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.HashSet;
+import java.util.Set;
 import org.apache.kafka.common.header.Headers;
 
 /** The real BatchWriter handoff: no network calls, transaction ownership, or retained batch state. */
@@ -28,6 +30,7 @@ public final class RecordStore {
         boolean compacted = batch.plan().topic().mode() == Mode.COMPACTED;
         String table = StorageDdl.quote(StorageDdl.tableName(batch.generation()));
         Map<String, SchemaStore.StoredSchema> schemas = new HashMap<>();
+        Set<String> keyIds = new HashSet<>(), valueIds = new HashSet<>();
         if (!eligible.isEmpty()) {
             String insert = "INSERT " + (compacted ? "" : "OR IGNORE ") + "INTO " + table + """
                      (_partition,_offset,_timestamp,_key_raw,_key,_key_schema_id,_value,_value_schema_id,_headers,_decode_error)
@@ -58,7 +61,7 @@ public final class RecordStore {
                         // Compact updates/deletes must keep Kafka order, including repeated keys within this batch.
                         if (compacted) put.executeUpdate(); else put.addBatch();
                     }
-                    schema(schemas, decoded.key()); schema(schemas, decoded.value());
+                    schema(schemas, keyIds, decoded.key()); schema(schemas, valueIds, decoded.value());
                 }
                 if (!compacted) put.executeBatch();
             }
@@ -66,14 +69,15 @@ public final class RecordStore {
                 RangeStore.add(writer, batch.generation(), batch.partition(), range.lowerEndpoint(), range.upperEndpoint());
             }
             for (var schema : schemas.values()) SchemaStore.store(writer, schema);
-            TypedViews.refresh(writer, batch.generation());
+            TypedViews.refresh(writer, batch.generation(), keyIds, valueIds);
         }
-        if (batch.reachedEnd()) {
+        if (batch.reachedEnd() && batch.plan().checked()) {
             PartitionStore.caughtUp(writer, batch.generation(), batch.partition(), batch.plan().ends().capturedAtMs());
         }
     }
 
-    private static void schema(Map<String, SchemaStore.StoredSchema> schemas, RecordDecoder.Part part) {
+    private static void schema(Map<String, SchemaStore.StoredSchema> schemas, Set<String> ids, RecordDecoder.Part part) {
+        if (part.schemaRef() != null) ids.add(part.schemaRef());
         if (part.schema() != null) schemas.putIfAbsent(part.schema().ref(), part.schema());
     }
 

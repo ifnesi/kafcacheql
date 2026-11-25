@@ -107,23 +107,26 @@ class RecordDecoderIT {
         TestStack.sendAvroKeyed(topic, body, body, null, TestStack.SchemaIdIn.HEADER);
         expected.add(new Expected(json, keySchema.getGuid(), json, valueSchema.getGuid(), null));
 
-        // PLAN §7.1 L455 / S2-4: known phase-2 data is an error row, then sync continues.
-        int unsupportedId;
+        // PLAN §7.1 / 0015a: JSON Schema now decodes; malformed JSON is still an error row and sync continues.
+        int jsonId;
         try (var registry = new io.confluent.kafka.schemaregistry.client.rest.RestService(TestStack.REGISTRY)) {
-            unsupportedId = registry.registerSchema("{\"type\":\"object\"}", "JSON", List.of(),
-                    topic + "-unsupported", false).getId();
+            jsonId = registry.registerSchema("{\"type\":\"object\"}", "JSON", List.of(),
+                    topic + "-json", false).getId();
         }
-        byte[] unsupported = ByteBuffer.allocate(7).put((byte) 0).putInt(unsupportedId).put(TestStack.utf8("{}")).array();
-        TestStack.sendBytes(topic, TestStack.utf8("unsupported"), unsupported, null);
-        expected.add(new Expected("\"unsupported\"", null, base64(unsupported), Integer.toString(unsupportedId), "value"));
-        TestStack.sendString(topic, "after-unsupported", "still here", null);
-        expected.add(plain("\"after-unsupported\"", "\"still here\""));
+        byte[] framedJson = ByteBuffer.allocate(7).put((byte) 0).putInt(jsonId).put(TestStack.utf8("{}")).array();
+        TestStack.sendBytes(topic, TestStack.utf8("json-sr"), framedJson, null);
+        expected.add(new Expected("\"json-sr\"", null, "{}", Integer.toString(jsonId), null));
+        byte[] corruptJson = Arrays.copyOf(framedJson, 6);
+        TestStack.sendBytes(topic, null, corruptJson, null);
+        expected.add(new Expected(null, null, base64(corruptJson), Integer.toString(jsonId), "value"));
+        TestStack.sendString(topic, "after-json", "still here", null);
+        expected.add(plain("\"after-json\"", "\"still here\""));
 
         verifyFlow(topic, Format.AUTO, Format.AUTO, expected);
         try (var cache = CacheStore.open(dir.resolve(topic + ".db"), Optional.empty()); var reader = cache.newReader()) {
-            var unsupportedSchema = SchemaStore.find(reader, Integer.toString(unsupportedId)).orElseThrow();
-            assertEquals("JSON", unsupportedSchema.type());
-            assertEquals("{\"type\":\"object\"}", unsupportedSchema.schemaText());
+            var jsonSchema = SchemaStore.find(reader, Integer.toString(jsonId)).orElseThrow();
+            assertEquals("JSON", jsonSchema.type());
+            assertEquals("{\"type\":\"object\"}", jsonSchema.schemaText());
         }
     }
 
