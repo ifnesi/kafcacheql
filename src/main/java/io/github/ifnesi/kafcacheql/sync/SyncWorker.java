@@ -4,7 +4,6 @@ import com.google.common.collect.Range;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
 import io.github.ifnesi.kafcacheql.cache.PartitionStore;
 import io.github.ifnesi.kafcacheql.cache.RangeStore;
-import io.github.ifnesi.kafcacheql.cache.SchemaStore;
 import io.github.ifnesi.kafcacheql.cache.TopicRegistry;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
@@ -46,9 +45,11 @@ import org.sqlite.SQLiteConnection;
 public final class SyncWorker implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(SyncWorker.class);
     private static final Duration POLL = Duration.ofMillis(100);
+    private static final long PROGRESS_INTERVAL_NANOS = Duration.ofSeconds(5).toNanos();
 
     /** Deterministic interleavings for integration tests; hooks run outside write transactions. */
     public interface Hooks {
+        default long nanoTime() { return System.nanoTime(); }
         default void beforePrepare(SyncPlan plan) throws SQLException {}
         default void beforeFetch(SyncPlan plan) throws SQLException {}
         default void beforeCommit(SyncBatch batch) throws SQLException {}
@@ -76,22 +77,7 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    private sealed interface Background permits SchemaCopy, SubjectCopy, CaughtUp {
-        Object key();
-        long version();
-        void write(Connection writer) throws SQLException;
-    }
-    private record SchemaCopy(SchemaStore.StoredSchema schema) implements Background {
-        public Object key() { return List.of("schema", schema.ref()); }
-        public long version() { return schema.fetchedMs(); }
-        public void write(Connection writer) throws SQLException { SchemaStore.store(writer, schema); }
-    }
-    private record SubjectCopy(SchemaStore.SubjectSchema subject) implements Background {
-        public Object key() { return List.of("subject", subject.subject()); }
-        public long version() { return subject.version(); }
-        public void write(Connection writer) throws SQLException { SchemaStore.store(writer, subject); }
-    }
-    private record CaughtUp(String topic, long generation, int partition, long capturedAt) implements Background {
+    private record CaughtUp(String topic, long generation, int partition, long capturedAt) {
         public Object key() { return List.of("caught-up", generation, partition); }
         public long version() { return capturedAt; }
         public void write(Connection writer) throws SQLException {
@@ -103,7 +89,7 @@ public final class SyncWorker implements AutoCloseable {
     }
 
     private final BlockingQueue<Runnable> queue = new LinkedBlockingQueue<>();
-    private final Map<Object, Background> background = new LinkedHashMap<>();
+    private final Map<Object, CaughtUp> background = new LinkedHashMap<>();
     private final Set<Job<?>> pending = new HashSet<>();
     private final Runnable backgroundTurn = this::backgroundTurn;
     private final Thread thread;
@@ -249,7 +235,7 @@ public final class SyncWorker implements AutoCloseable {
             baselines = PartitionStore.safetyBaselines(cache.writer(), generation);
             requireGeneration(cache.writer(), plan.topic().name(), generation);
         }
-        if (config.cachePruneExpired() && plan.topic().mode() == Mode.APPEND
+        if (plan.topic().mode() == Mode.APPEND
                 && plan.logStarts().values().stream().anyMatch(start -> start > 0)) {
             prune(plan, generation, execution, batchSize);
         }
@@ -262,16 +248,19 @@ public final class SyncWorker implements AutoCloseable {
             } else if (missing.isEmpty() && plan.topic().mode() == Mode.COMPACTED) {
                 caughtUp(plan.topic().name(), generation, partition.getKey(), plan.ends().capturedAtMs());
             }
+            if (missing.isEmpty()) continue;
+            var progress = new PartitionProgress(plan.topic().name(), partition.getKey(), missing.asRanges().stream()
+                    .mapToLong(r -> r.upperEndpoint() - r.lowerEndpoint()).sum());
             for (Range<Long> range : missing.asRanges()) {
                 hooks.beforeFetch(plan);
-                fetchRange(plan, generation, partition.getKey(), range, baseline, execution, writer, batchSize);
+                fetchRange(plan, generation, partition.getKey(), range, baseline, execution, writer, batchSize, progress);
             }
         }
         return generation;
     }
 
     private void fetchRange(SyncPlan plan, long generation, int partition, Range<Long> range,
-                            long baseline, Execution execution, BatchWriter writer, int batchSize) throws SQLException {
+                            long baseline, Execution execution, BatchWriter writer, int batchSize, PartitionProgress progress) throws SQLException {
         ensureConsumer();
         execution.check();
         TopicPartition tp = new TopicPartition(plan.topic().name(), partition);
@@ -281,7 +270,7 @@ public final class SyncWorker implements AutoCloseable {
         consumer.seek(tp, range.lowerEndpoint());
         long start = range.lowerEndpoint();
         long end = range.upperEndpoint();
-        long fetched = 0;
+        long previousPosition = start;
         List<SyncBatch.Record> batch = new ArrayList<>(Math.min(batchSize, 5000));
         try {
             while (start < end) {
@@ -291,6 +280,9 @@ public final class SyncWorker implements AutoCloseable {
                 long position = Math.min(end, position(tp, execution));
                 var decoded = records.isEmpty() ? List.<SyncBatch.Record>of()
                         : decoder.decode(tp.topic(), records, end, key, value, execution);
+                progress.fetched += decoded.size();
+                progress.remaining -= position - previousPosition;
+                previousPosition = position;
                 for (var record : decoded) {
                     execution.check();
                     if (batch.size() == batchSize) {
@@ -298,22 +290,42 @@ public final class SyncWorker implements AutoCloseable {
                         commit(new SyncBatch(plan, generation, partition, start, batchEnd, false, batch), baseline, execution, writer);
                         start = batchEnd;
                         batch.clear();
+                        progress.report();
                     }
                     batch.add(record);
-                    fetched++;
                 }
                 if (position >= end) {
                     if (start < end) commit(new SyncBatch(plan, generation, partition, start, end,
                             end == plan.ends().offsets().get(partition), batch), baseline, execution, writer);
                     start = end;
                 }
-                log.debug("{} partition {}: {} records fetched, {} offsets remaining", tp.topic(), partition, fetched, end - position);
+                progress.report();
             }
         } catch (OffsetOutOfRangeException | org.apache.kafka.common.errors.UnknownTopicOrPartitionException expired) {
             // The read-side validity planner owns §9's append-prune/compacted-rebuild decision.
             throw new StaleGeneration(tp.topic());
         } catch (RuntimeException failure) {
             throw failure("Fetching topic " + tp.topic(), failure);
+        }
+    }
+
+    /** One report cadence across every missing range in this partition; no timer thread or per-record clock read. */
+    private final class PartitionProgress {
+        private final String topic;
+        private final int partition;
+        private long lastReport = hooks.nanoTime();
+        private long fetched;
+        private long remaining;
+
+        PartitionProgress(String topic, int partition, long remaining) {
+            this.topic = topic; this.partition = partition; this.remaining = remaining;
+        }
+
+        void report() {
+            long now = hooks.nanoTime();
+            if (now - lastReport < PROGRESS_INTERVAL_NANOS) return;
+            lastReport = now;
+            log.info("{} partition {}: {} records fetched, {} offsets remaining", topic, partition, fetched, remaining);
         }
     }
 
@@ -430,16 +442,14 @@ public final class SyncWorker implements AutoCloseable {
         if (current.isEmpty() || current.get().id() != generation || current.get().deleted()) throw new StaleGeneration(topic);
     }
 
-    void schema(SchemaStore.StoredSchema schema) { background(new SchemaCopy(schema)); }
-    void subject(SchemaStore.SubjectSchema subject) { background(new SubjectCopy(subject)); }
     void caughtUp(String topic, long generation, int partition, long capturedAt) {
         background(new CaughtUp(topic, generation, partition, capturedAt));
     }
 
-    private synchronized void background(Background write) {
+    private synchronized void background(CaughtUp write) {
         if (closing) return;
         Object key = write.key();
-        Background pending = background.get(key);
+        CaughtUp pending = background.get(key);
         if (pending != null && pending.version() >= write.version()) return;
         if (pending == null && background.size() >= 1000) return;
         boolean empty = background.isEmpty();
@@ -451,7 +461,7 @@ public final class SyncWorker implements AutoCloseable {
     synchronized int queuedRequests() { return pending.size() - (active == null ? 0 : 1); }
 
     private void backgroundTurn() {
-        Background write;
+        CaughtUp write;
         synchronized (this) {
             if (background.isEmpty() || closing) return;
             var iterator = background.values().iterator();

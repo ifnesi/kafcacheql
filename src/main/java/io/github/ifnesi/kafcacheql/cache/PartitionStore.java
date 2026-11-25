@@ -90,7 +90,9 @@ public final class PartitionStore {
                 """.formatted(table, table))) {
             p.setInt(1, partition); p.setInt(2, partition); p.setLong(3, generation);
             p.setInt(4, partition); p.setInt(5, size);
-            return p.executeUpdate();
+            int deleted = p.executeUpdate();
+            if (deleted != 0) TypedViews.refresh(writer, generation);
+            return deleted;
         }
     }
 }

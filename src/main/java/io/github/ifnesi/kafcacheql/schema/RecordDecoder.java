@@ -69,6 +69,9 @@ public final class RecordDecoder implements AutoCloseable {
             }
             ref = reference.ref().orElse(null);
             if (ref != null) {
+                if (!properties.containsKey("schema.registry.url") || properties.get("schema.registry.url").toString().isBlank()) {
+                    return failed(payload, key, ref, null, "schema.registry.url is needed to decode schema " + ref);
+                }
                 if (registry == null) {
                     registry = SchemaRegistry.open(settings, reader);
                 }

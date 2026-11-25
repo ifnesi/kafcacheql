@@ -38,7 +38,6 @@ public record DriverConfig(
         long appendDefaultWindowMaxRecords,
         long maxStalenessMs,
         boolean offline,
-        boolean cachePruneExpired,
         Pattern topicsInclude,
         Pattern topicsExclude,
         boolean metadataShowInternal,
@@ -74,7 +73,7 @@ public record DriverConfig(
                 + ", appendDefaultWindow=" + appendDefaultWindow
                 + ", appendDefaultWindowMaxRecords=" + appendDefaultWindowMaxRecords
                 + ", maxStalenessMs=" + maxStalenessMs
-                + ", offline=" + offline + ", cachePruneExpired=" + cachePruneExpired
+                + ", offline=" + offline
                 + ", topicsInclude=" + topicsInclude + ", topicsExclude=" + topicsExclude
                 + ", metadataShowInternal=" + metadataShowInternal + ", clientId=" + clientId
                 + ", syncBatchRecords=" + syncBatchRecords + ", topics=" + topics
@@ -148,7 +147,6 @@ public record DriverConfig(
                         own.get(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS), 1, Long.MAX_VALUE),
                 atLeast(DriverProperty.MAX_STALENESS_MS.key(), own.get(DriverProperty.MAX_STALENESS_MS), 0, Long.MAX_VALUE),
                 offline,
-                bool(own, DriverProperty.CACHE_PRUNE_EXPIRED),
                 regex(own, DriverProperty.TOPICS_INCLUDE),
                 regex(own, DriverProperty.TOPICS_EXCLUDE),
                 bool(own, DriverProperty.METADATA_SHOW_INTERNAL),

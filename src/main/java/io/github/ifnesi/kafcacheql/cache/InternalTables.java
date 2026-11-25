@@ -8,7 +8,7 @@ final class InternalTables {
     static final String META = "$meta";
 
     // sqlite_sequence is created by SQLite for $topics' AUTOINCREMENT and is part of a complete cache.
-    static final List<String> NAMES = List.of("$meta", "$topics", "$partitions", "$ranges", "$schemas", "$subjects",
+    static final List<String> NAMES = List.of("$meta", "$topics", "$partitions", "$ranges", "$schemas",
             "sqlite_sequence");
 
     static final List<String> DDL = List.of(
@@ -56,13 +56,6 @@ final class InternalTables {
               schema_text TEXT NOT NULL,
               refs        TEXT,
               fetched_ms  INTEGER NOT NULL
-            )""",
-            """
-            CREATE TABLE "$subjects" (
-              subject    TEXT PRIMARY KEY,
-              version    INTEGER NOT NULL,
-              schema_ref TEXT NOT NULL,
-              fetched_ms INTEGER NOT NULL
             )""");
 
     private InternalTables() {}

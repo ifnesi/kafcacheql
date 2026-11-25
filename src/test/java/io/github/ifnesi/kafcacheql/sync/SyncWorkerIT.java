@@ -9,11 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ifnesi.kafcacheql.cache.RecordStore;
-import io.github.ifnesi.kafcacheql.cache.SchemaStore.StoredSchema;
-import io.github.ifnesi.kafcacheql.cache.SchemaStore.SubjectSchema;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
-import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
-import io.github.ifnesi.kafcacheql.schema.SchemaRegistry;
 import io.github.ifnesi.kafcacheql.testkit.TestStack;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -124,9 +120,8 @@ class SyncWorkerIT {
                     "PLAN L576: a partial sync does not advance the captured time");
             var queued = CompletableFuture.supplyAsync(() -> sync(second, queuedPlan, queueToken, writer));
             TestStack.await(() -> second.queuedRequests() == 1, "request queued behind the held sync");
-            // A cached read finishes while the worker cannot leave the hook, with schema work waiting.
-            for (int i = 0; i < 1001; i++) first.storeSchema(new StoredSchema("test-" + i, "AVRO", "\"string\"", "[]", i));
-            first.storeSubject(new SubjectSchema("dropped-value", 1, new StoredSchema("dropped", "AVRO", "\"int\"", "[]", 1)));
+            // A cached read finishes while the worker cannot leave the hook, with timestamp work waiting.
+            for (int i = 0; i < 1001; i++) first.caughtUp(topic, 1_000_000L + i, 0, i);
             assertEquals(1000, first.pendingBackground());
             long hotId = CompletableFuture.supplyAsync(() -> sync(second, hot, next, writer)).get(2, TimeUnit.SECONDS);
             assertEquals(List.of("\"cached\""), second.read(c -> values(c, "SELECT _value FROM \"$t" + hotId + "\"")));
@@ -202,7 +197,7 @@ class SyncWorkerIT {
                         Map.entry("topic." + topic + ".value.format", "string"),
                         Map.entry("topic." + topic + ".key.format", "json"),
                         Map.entry("topic." + topic + ".mode", "compacted"),
-                        Map.entry("cache.prune.expired", "false"), Map.entry("fetch.min.bytes", "2"))) {
+                        Map.entry("fetch.min.bytes", "2"))) {
                     SQLException e = assertThrows(SQLException.class, () -> CacheContext.acquire(config(mismatch.getKey(), mismatch.getValue())));
                     assertTrue(e.getMessage().contains(mismatch.getKey().equals("fetch.min.bytes") ? "client settings" : mismatch.getKey()), e.getMessage());
                 }
@@ -227,70 +222,70 @@ class SyncWorkerIT {
         assertArrayEquals(before, Files.readAllBytes(file));
     }
 
-    /** PLAN §10.1 background writes: "Only the newest pending value per key is kept"; generations
-     * no longer current are dropped; "Schema rows belong to no topic generation"; pending copies
-     * "are dropped when the context closes"; "a failed one is logged and dropped".
+    /** PLAN §10.1: "Only the newest pending value per key is kept"; updates for old generations
+     * are dropped; pending writes "are dropped when the context closes"; failures are logged and dropped.
      */
-    @Test void backgroundRegistryCopiesCoalesceAndAdvanceIndependentlyOfTopicGenerations() throws Exception {
+    @Test void backgroundTimestampsCoalesceAndRespectGenerationsFailuresAndClose() throws Exception {
         String topic = TestStack.uniqueTopic("background"), blocking = TestStack.uniqueTopic("background-block");
         TestStack.createTopic(topic, 1, Map.of("cleanup.policy", "compact"));
         TestStack.createTopic(blocking, 1, Map.of());
-        var avro = new org.apache.avro.Schema.Parser().parse("{\"type\":\"record\",\"name\":\"Background\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"}]}");
-        var row = new org.apache.avro.generic.GenericData.Record(avro); row.put("n", 1);
-        TestStack.sendAvro(topic, "a", row, null, TestStack.SchemaIdIn.PREFIX);
-        DriverConfig config = config("schema.registry.url", TestStack.REGISTRY);
+        TestStack.sendString(topic, "a", "first", null);
+        TestStack.sendString(blocking, "k", "block", null);
         CountDownLatch held = new CountDownLatch(1), release = new CountDownLatch(1);
-        CacheContext.Lease cache = CacheContext.acquire(config);
-        try (var execution = new Execution(Duration.ofSeconds(30)); var registry = SchemaRegistry.open(ClientSettings.of(config))) {
-            SubjectSchema older = registry.latest(topic, false).orElseThrow();
-            avro = new org.apache.avro.Schema.Parser().parse("{\"type\":\"record\",\"name\":\"Background\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"},{\"name\":\"s\",\"type\":[\"null\",\"string\"],\"default\":null}]}");
-            row = new org.apache.avro.generic.GenericData.Record(avro); row.put("n", 2);
-            TestStack.sendAvro(topic, "b", row, null, TestStack.SchemaIdIn.PREFIX);
-            SubjectSchema newer = registry.latest(topic, false).orElseThrow();
-            long id = cache.sync(cache.plan(topic, execution), execution, RecordStore::write);
-            SyncPlan checked = cache.plan(topic, execution);
-            TestStack.sendAvro(blocking, "k", row, null, TestStack.SchemaIdIn.PREFIX);
-            SubjectSchema copy = registry.latest(blocking, false).orElseThrow();
+        CacheContext.Lease cache = CacheContext.acquire(config());
+        long replacement = 0;
+        String caughtUp = null;
+        try (var execution = new Execution(Duration.ofSeconds(30))) {
+            long id = cache.sync(cache.plan(topic, execution), execution);
             cache.hooks(new SyncWorker.Hooks() {
-                @Override public void afterCommit(SyncBatch b) throws SQLException { if (held.getCount() != 0) pause(held, release); }
+                @Override public void afterCommit(SyncBatch b) throws SQLException {
+                    if (held.getCount() != 0) pause(held, release);
+                }
             });
             SyncPlan blockPlan = cache.plan(blocking, execution);
             var sync = CompletableFuture.supplyAsync(() -> sync(cache, blockPlan, execution, RecordStore::write));
             assertTrue(held.await(10, TimeUnit.SECONDS));
-            cache.storeSubject(older); cache.storeSubject(newer); cache.storeSubject(older);
-            cache.sync(checked, execution, RecordStore::write);
-            assertEquals(2, cache.pendingBackground(), "one subject-with-schema and one generation/partition entry");
+            long observedAt = System.currentTimeMillis();
+            cache.caughtUp(topic, id, 0, observedAt);
+            cache.caughtUp(topic, id, 0, observedAt + 1);
+            cache.caughtUp(topic, id, 0, observedAt);
+            assertEquals(1, cache.pendingBackground(), "one generation/partition entry");
             Process process = child("replace", cache.path(), topic);
-            long replacement;
             try {
                 String result = line(process); assertTrue(result.startsWith("REPLACED "), result);
                 replacement = Long.parseLong(result.substring(9));
                 assertTrue(process.waitFor(10, TimeUnit.SECONDS)); assertEquals(0, process.exitValue());
             } finally { process.destroyForcibly(); }
-            String caughtUp = cache.read(c -> values(c, "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + replacement)).getFirst();
+            final long current = replacement;
+            caughtUp = cache.read(c -> values(c, "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)).getFirst();
             release.countDown(); sync.get(10, TimeUnit.SECONDS);
             TestStack.await(() -> cache.pendingBackground() == 0, "background queue drained");
             cache.write(topic, replacement, execution, c -> null);
             assertNotEquals(id, replacement);
-            assertEquals(List.of(Integer.toString(newer.version())), cache.read(c -> values(c,
-                    "SELECT version FROM \"$subjects\" WHERE subject='" + newer.subject() + "'")));
-            assertTrue((boolean) cache.read(c -> io.github.ifnesi.kafcacheql.cache.SchemaStore.find(c, newer.schema().ref()).isPresent()));
-            assertEquals(List.of(caughtUp), cache.read(c -> values(c, "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + replacement)));
-            // Once an entry failed under a real competing writer, it is dropped, not replayed later.
+            assertEquals(List.of(caughtUp), cache.read(c -> values(c,
+                    "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)));
+            // A current generation's newest pending value wins, and a later stale write cannot regress it.
+            cache.caughtUp(topic, replacement, 0, observedAt + 1000);
+            cache.caughtUp(topic, replacement, 0, observedAt + 999);
+            cache.write(topic, replacement, execution, c -> null);
+            caughtUp = Long.toString(observedAt + 1000);
+            assertEquals(List.of(caughtUp), cache.read(c -> values(c,
+                    "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)));
             try (var logs = io.github.ifnesi.kafcacheql.testkit.LogCapture.capture()) {
                 Process holder = child("lock", cache.path(), topic);
                 try {
                     assertEquals("LOCKED", line(holder));
-                    cache.storeSubject(copy);
-                    TestStack.await(() -> cache.pendingBackground() == 0, "failed copy taken");
+                    cache.caughtUp(topic, replacement, 0, observedAt + 2000);
+                    TestStack.await(() -> cache.pendingBackground() == 0, "failed update taken");
                     var barrier = CompletableFuture.supplyAsync(() -> {
-                        try { return cache.write(topic, replacement, execution, c -> null); }
+                        try { return cache.write(topic, current, execution, c -> null); }
                         catch (SQLException e) { throw new java.util.concurrent.CompletionException(e); }
                     });
                     assertThrows(java.util.concurrent.TimeoutException.class, () -> barrier.get(250, TimeUnit.MILLISECONDS));
                     unlock(holder); barrier.get(5, TimeUnit.SECONDS);
                     assertTrue(logs.lines().stream().anyMatch(l -> l.contains("Dropped background cache write")));
-                    assertEquals(List.of("0"), cache.read(c -> values(c, "SELECT count(*) FROM \"$subjects\" WHERE subject='" + blocking + "-value'")));
+                    assertEquals(List.of(caughtUp), cache.read(c -> values(c,
+                            "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)));
                 } finally { holder.destroyForcibly(); }
             }
             CountDownLatch closingHold = new CountDownLatch(1), closingRelease = new CountDownLatch(1);
@@ -302,15 +297,19 @@ class SyncWorkerIT {
             var pendingSync = CompletableFuture.supplyAsync(() -> sync(cache, pending, execution, RecordStore::write));
             try {
                 assertTrue(closingHold.await(10, TimeUnit.SECONDS));
-                cache.storeSubject(copy);
-                var close = CompletableFuture.runAsync(() -> { try { cache.close(); } catch (SQLException e) { throw new java.util.concurrent.CompletionException(e); } });
-                TestStack.await(() -> cache.pendingBackground() == 0, "close drops pending copies");
+                cache.caughtUp(topic, replacement, 0, observedAt + 3000);
+                var close = CompletableFuture.runAsync(() -> {
+                    try { cache.close(); } catch (SQLException e) { throw new java.util.concurrent.CompletionException(e); }
+                });
+                TestStack.await(() -> cache.pendingBackground() == 0, "close drops pending updates");
                 closingRelease.countDown(); close.get(10, TimeUnit.SECONDS);
                 assertThrows(java.util.concurrent.ExecutionException.class, () -> pendingSync.get(2, TimeUnit.SECONDS));
             } finally { closingRelease.countDown(); }
         } finally { release.countDown(); cache.close(); }
-        try (var reopened = io.github.ifnesi.kafcacheql.cache.CacheStore.open(dir.resolve("cache.db"), java.util.Optional.empty()); var reader = reopened.newReader()) {
-            assertEquals(List.of("0"), values(reader, "SELECT count(*) FROM \"$subjects\" WHERE subject='" + blocking + "-value'"));
+        try (var reopened = io.github.ifnesi.kafcacheql.cache.CacheStore.open(dir.resolve("cache.db"), java.util.Optional.empty());
+             var reader = reopened.newReader()) {
+            assertEquals(List.of(caughtUp), values(reader,
+                    "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + replacement));
         }
     }
 

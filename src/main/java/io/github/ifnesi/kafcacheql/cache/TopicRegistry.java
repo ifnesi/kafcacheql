@@ -10,7 +10,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -92,7 +96,14 @@ public final class TopicRegistry {
 
     public static Optional<Registration> register(CacheStore cache, OptionalLong observedGeneration,
             TopicInfo topic, TopicSettings settings, int decoderVersion, CacheStore.Check check) throws SQLException {
-        return prepare(cache, observedGeneration, true, topic, settings, decoderVersion, null, check);
+        return register(cache, observedGeneration, topic, settings, decoderVersion, check, List.of(topic.name()));
+    }
+
+    /** Discovery and registration allocate from the same topic set, under the writer lock at registration. */
+    public static Optional<Registration> register(CacheStore cache, OptionalLong observedGeneration,
+            TopicInfo topic, TopicSettings settings, int decoderVersion, CacheStore.Check check,
+            Collection<String> knownTopics) throws SQLException {
+        return prepare(cache, observedGeneration, true, topic, settings, decoderVersion, null, check, knownTopics);
     }
 
     /** Register or replace using the same policy the caller checked on its read snapshot. */
@@ -100,12 +111,12 @@ public final class TopicRegistry {
             TopicInfo topic, TopicSettings settings, Map<Integer, Long> logStarts,
             CacheStore.Check check) throws SQLException {
         return prepare(cache, observedGeneration, observedDeleted, topic, settings, AvroJsonConverter.VERSION,
-                logStarts, check);
+                logStarts, check, List.of(topic.name()));
     }
 
     private static Optional<Registration> prepare(CacheStore cache, OptionalLong observedGeneration, boolean observedDeleted,
             TopicInfo topic, TopicSettings settings, int decoderVersion, Map<Integer, Long> logStarts,
-            CacheStore.Check check) throws SQLException {
+            CacheStore.Check check, Collection<String> knownTopics) throws SQLException {
         Connection writer = cache.writer();
         Optional<Change> committed = CacheStore.writeTransaction(writer, check, () -> {
             Optional<Row> current = find(writer, topic.name());
@@ -131,7 +142,7 @@ public final class TopicRegistry {
                     p.setLong(1, row.id()); p.executeUpdate();
                 }
             } else if (observedGeneration.isPresent()) return Optional.empty();
-            String view = viewName(writer, topic.name());
+            String view = current.isPresent() ? current.get().viewName() : viewNames(writer, knownTopics).get(topic.name());
             long id = insert(writer, topic, settings, decoderVersion, view);
             StorageDdl.create(writer, id, topic.mode(), view);
             insertPartitions(writer, id, 0, topic.partitions());
@@ -265,21 +276,24 @@ public final class TopicRegistry {
         }
     }
 
-    private static String viewName(Connection writer, String topic) throws SQLException {
-        String base = baseViewName(topic);
-        try (PreparedStatement p = writer.prepareStatement(
-                "SELECT 1 FROM \"$topics\" WHERE view_name = ? COLLATE NOCASE")) {
-            String candidate = base;
-            for (int suffix = 2; ; suffix++) {
-                p.setString(1, candidate);
-                try (ResultSet rs = p.executeQuery()) {
-                    if (!rs.next()) {
-                        return candidate;
-                    }
-                }
-                candidate = base + "$" + suffix;
-            }
+    /** Predict names without DDL, preserving every registered name (including deleted generations). */
+    public static Map<String, String> viewNames(Connection reader, Collection<String> topics) throws SQLException {
+        var registered = new HashMap<String, String>();
+        var used = new TreeSet<String>(String.CASE_INSENSITIVE_ORDER);
+        try (var s = reader.createStatement(); var rows = s.executeQuery("SELECT topic, view_name FROM \"$topics\"")) {
+            while (rows.next()) { registered.put(rows.getString(1), rows.getString(2)); used.add(rows.getString(2)); }
         }
+        var names = new HashMap<String, String>();
+        for (String topic : new TreeSet<>(topics)) {
+            String view = registered.get(topic);
+            if (view == null) {
+                String base = baseViewName(topic);
+                view = base;
+                for (int suffix = 2; !used.add(view); suffix++) view = base + "$" + suffix;
+            }
+            names.put(topic, view);
+        }
+        return Map.copyOf(names);
     }
 
     public static String baseViewName(String topic) {

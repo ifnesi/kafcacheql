@@ -14,13 +14,13 @@ import java.util.OptionalLong;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.admin.Admin;
-import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.ListOffsetsOptions;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
@@ -28,7 +28,9 @@ import org.apache.kafka.clients.admin.ListTopicsOptions;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.common.IsolationLevel;
+import org.apache.kafka.common.KafkaFuture;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.AuthorizationException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
@@ -205,6 +207,10 @@ public final class KafkaClients {
         return clusterId;
     }
 
+    public boolean isValid(Execution execution) throws SQLException {
+        return clusterId.equals(get(admin.describeCluster().clusterId(), "Checking the Kafka cluster", settingsForErrors, execution));
+    }
+
     /** The client.id base this pair reserved; its admin client's client.id is this plus {@code -admin}. */
     public String clientId() {
         return clientId;
@@ -231,37 +237,65 @@ public final class KafkaClients {
     }
 
     public Optional<TopicInfo> describeTopic(String topic, DriverConfig config, Execution execution) throws SQLException {
-        TopicDescription description;
-        try {
-            description = await(admin.describeTopics(List.of(topic)).allTopicNames(), execution).get(topic);
-        } catch (ExecutionException e) {
-            if (e.getCause() instanceof UnknownTopicOrPartitionException) {
-                return Optional.empty();
+        return topics(config).describe(topic, execution);
+    }
+
+    /** A connection's config cache, by topic ID. Descriptions remain live; callers use their own deadlines. */
+    public Topics topics(DriverConfig config) { return new Topics(config); }
+
+    public final class Topics {
+        private final DriverConfig config;
+        private final Map<Uuid, KafkaFuture<Map<String, String>>> configs = new ConcurrentHashMap<>();
+
+        private Topics(DriverConfig config) { this.config = config; }
+
+        public Optional<TopicInfo> describe(String topic, Execution execution) throws SQLException {
+            Optional<TopicDescription> found = description(topic, execution);
+            if (found.isEmpty()) return Optional.empty();
+            TopicDescription description = found.get();
+            Optional<Map<String, String>> values;
+            try {
+                var lookup = configs.computeIfAbsent(description.topicId(), ignored -> topicConfig(topic));
+                var future = lookup;
+                // Share an in-flight lookup, but retain only successful results (even if its caller gave up).
+                if (!lookup.isDone() || lookup.isCompletedExceptionally()) {
+                    future = lookup.whenComplete((ignored, failure) -> {
+                        if (failure != null) configs.remove(description.topicId(), lookup);
+                    });
+                }
+                values = Optional.of(await(future, execution));
+            } catch (ExecutionException e) {
+                if (!(e.getCause() instanceof AuthorizationException)) {
+                    throw sql("Reading the configs of topic " + topic, e.getCause(), settingsForErrors);
+                }
+                values = Optional.empty(); // TopicInfo.resolve's configured fallbacks.
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
+            } catch (RuntimeException e) {
+                throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
             }
+            return Optional.of(TopicInfo.resolve(topic, description.topicId(), description.partitions().size(), values, config));
+        }
+    }
+
+    private Optional<TopicDescription> description(String topic, Execution execution) throws SQLException {
+        try {
+            return Optional.of(await(admin.describeTopics(List.of(topic)).allTopicNames(), execution).get(topic));
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof UnknownTopicOrPartitionException) return Optional.empty();
             throw sql("Describing topic " + topic, e.getCause(), settingsForErrors);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw sql("Describing topic " + topic, e, settingsForErrors);
         }
+    }
 
+    private KafkaFuture<Map<String, String>> topicConfig(String topic) {
         ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
-        Optional<Map<String, String>> configs;
-        try {
-            Config topicConfig = await(admin.describeConfigs(List.of(resource)).all(), execution).get(resource);
-            configs = Optional.of(topicConfig.entries().stream()
-                    .filter(e -> e.value() != null)
-                    .collect(Collectors.toMap(ConfigEntry::name, ConfigEntry::value)));
-        } catch (ExecutionException e) {
-            if (!(e.getCause() instanceof AuthorizationException)) {
-                throw sql("Reading the configs of topic " + topic, e.getCause(), settingsForErrors);
-            }
-            configs = Optional.empty(); // TopicInfo.resolve's fallbacks
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
-        }
-        return Optional.of(TopicInfo.resolve(topic, description.topicId(), description.partitions().size(),
-                configs, config));
+        return admin.describeConfigs(List.of(resource)).values().get(resource).thenApply(config ->
+                config.entries().stream().filter(e -> e.value() != null)
+                        .collect(Collectors.toUnmodifiableMap(ConfigEntry::name, ConfigEntry::value)));
     }
 
     // ------------------------------------------------------------------ offsets

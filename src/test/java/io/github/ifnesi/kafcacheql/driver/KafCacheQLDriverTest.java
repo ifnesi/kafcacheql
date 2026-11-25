@@ -64,9 +64,16 @@ class KafCacheQLDriverTest {
     }
 
     @Test
-    void validConfigurationReachesTheConnectionStep() {
-        // Until connections are built.
-        assertThrows(SQLFeatureNotSupportedException.class, () -> driver.connect("jdbc:kafcacheql://h:1", null));
+    void validConfigurationReachesTheConnectionStep() throws Exception {
+        var file = java.nio.file.Files.createTempDirectory("driver-connect").resolve("cache.db");
+        try (var cache = io.github.ifnesi.kafcacheql.cache.CacheStore.open(file, java.util.Optional.of("unit-cluster"))) {
+            assertEquals("unit-cluster", cache.clusterId());
+        }
+        Properties p = new Properties();
+        p.setProperty("offline", "true"); p.setProperty("cache.path", file.toString());
+        try (var c = driver.connect("jdbc:kafcacheql://", p); var s = c.createStatement(); var rows = s.executeQuery("SELECT 1")) {
+            assertTrue(rows.next()); assertEquals(1, rows.getInt(1)); assertFalse(rows.next());
+        }
     }
 
     @Test

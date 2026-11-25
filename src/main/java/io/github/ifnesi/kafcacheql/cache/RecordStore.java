@@ -66,8 +66,7 @@ public final class RecordStore {
                 RangeStore.add(writer, batch.generation(), batch.partition(), range.lowerEndpoint(), range.upperEndpoint());
             }
             for (var schema : schemas.values()) SchemaStore.store(writer, schema);
-            // Until 0010a, the fixed metadata/JSON view made by StorageDdl has no schema-derived columns.
-            // Its projection is independent of schema IDs; storing a new schema cannot change that view.
+            TypedViews.refresh(writer, batch.generation());
         }
         if (batch.reachedEnd()) {
             PartitionStore.caughtUp(writer, batch.generation(), batch.partition(), batch.plan().ends().capturedAtMs());

@@ -4,7 +4,7 @@ import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.DriverProperty;
 import io.github.ifnesi.kafcacheql.config.JdbcUrl;
-import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
+import io.github.ifnesi.kafcacheql.sync.CacheContext;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
@@ -42,9 +42,7 @@ public final class KafCacheQLDriver implements Driver {
         }
         // With the driver's class loader throughout (DriverLoader): tools often call from a thread whose
         // context class loader can't see the driver's classes.
-        DriverLoader.call(() -> ClientSettings.of(DriverConfig.load(url, info)));
-        throw new SQLFeatureNotSupportedException(
-                "KafCacheQL connections are not built yet; the configuration is valid");
+        return DriverLoader.call(() -> Jdbc.connection(CacheContext.acquire(DriverConfig.load(url, info)), url));
     }
 
     @Override

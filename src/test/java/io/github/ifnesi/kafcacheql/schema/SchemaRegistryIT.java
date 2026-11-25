@@ -14,7 +14,6 @@ import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore.StoredSchema;
-import io.github.ifnesi.kafcacheql.cache.SchemaStore.SubjectSchema;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
@@ -173,48 +172,6 @@ class SchemaRegistryIT {
         }
     }
 
-    /** 0005a acceptance, line 15: "a subject refresh picks up a new version".
-     * PLAN §7.3: "Subjects follow TopicNameStrategy: <topic>-key and <topic>-value";
-     * §10.1: "$subjects keeps the newest version".
-     */
-    @Test
-    void subjectRefreshSeesNewVersionsAndStaleWritesCannotRegressThem() throws Exception {
-        String topic = TestStack.uniqueTopic("refresh-schema");
-        Schema evolved = new Schema.Parser().parse("""
-                {"type":"record","name":"SchemaLookupOrder","fields":[{"name":"id","type":"string"},
-                 {"name":"status","type":"string","default":"new"}]}
-                """);
-        try (var writer = new CachedSchemaRegistryClient(TestStack.REGISTRY, 10);
-             CacheStore cache = cache(); Connection reader = cache.newReader();
-             SchemaRegistry registry = registry(TestStack.REGISTRY)) {
-            for (boolean key : List.of(true, false)) {
-                String subject = topic + (key ? "-key" : "-value");
-                writer.register(subject, new AvroSchema(ORDER));
-                SubjectSchema first = registry.latest(topic, key).orElseThrow();
-                assertEquals(subject, first.subject());
-                assertEquals(1, first.version());
-                persist(cache, first);
-                int newId = writer.register(subject, new AvroSchema(evolved));
-                SubjectSchema next = registry.latest(topic, key).orElseThrow();
-                assertEquals(2, next.version());
-                assertEquals(Integer.toString(newId), next.schema().ref());
-                assertEquals(json(evolved.toString()), json(next.schema().schemaText()));
-                persist(cache, next);
-                persist(cache, first); // an older observation arriving after a newer write
-                try (var p = reader.prepareStatement("SELECT version, schema_ref, fetched_ms FROM \"$subjects\" WHERE subject = ?")) {
-                    p.setString(1, subject);
-                    try (ResultSet rs = p.executeQuery()) {
-                        assertTrue(rs.next());
-                        assertEquals(2, rs.getInt(1));
-                        assertEquals(Integer.toString(newId), rs.getString(2));
-                        assertEquals(next.schema().fetchedMs(), rs.getLong(3));
-                    }
-                }
-                assertTrue(SchemaStore.find(reader, first.schema().ref()).isPresent(), "old schemas stay cached");
-            }
-        }
-    }
-
     /** 0005a acceptance, line 16: "an unreachable registry fails with an SQLException naming the URL".
      * PLAN §4.5: settings reach the clients unchanged; "Errors, and the causes they carry, are redacted";
      * §4.7: "Never log them"; §13: "Credentials never go in URLs, logs or the cache."
@@ -239,9 +196,6 @@ class SchemaRegistryIT {
                 assertTrue(e.getMessage().contains(url), e.getMessage());
                 e.printStackTrace(new PrintWriter(trace));
             }
-            SQLException e = assertThrows(SQLException.class, () -> registry.latest("unreachable", false));
-            assertTrue(e.getMessage().contains(url), e.getMessage());
-            e.printStackTrace(new PrintWriter(trace));
         } finally {
             trace.append(String.join("\n", LogCapture.stop()));
         }
@@ -321,13 +275,6 @@ class SchemaRegistryIT {
     private static void persist(CacheStore cache, StoredSchema schema) throws SQLException {
         CacheStore.writeTransaction(cache.writer(), () -> {
             SchemaStore.store(cache.writer(), schema);
-            return null;
-        });
-    }
-
-    private static void persist(CacheStore cache, SubjectSchema subject) throws SQLException {
-        CacheStore.writeTransaction(cache.writer(), () -> {
-            SchemaStore.store(cache.writer(), subject);
             return null;
         });
     }

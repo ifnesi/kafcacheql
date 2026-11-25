@@ -4,9 +4,13 @@ import io.github.ifnesi.kafcacheql.config.Mode;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.List;
 
 /** The fixed record layout; schema evolution changes views, never these storage tables. */
 public final class StorageDdl {
+    static final List<String> METADATA = List.of("_partition", "_offset", "_timestamp", "_key", "_value", "_headers",
+            "_key_schema_id", "_value_schema_id", "_decode_error");
+
     private StorageDdl() {}
 
     static String tableName(long id) {
@@ -48,10 +52,40 @@ public final class StorageDdl {
             if (mode == Mode.COMPACTED) {
                 s.execute("CREATE UNIQUE INDEX " + quote(name + "_key") + " ON " + table + "(_partition, _key_raw)");
             }
-            // Before any decoding/schema work, the topic exposes just its metadata and JSON columns.
-            s.execute("CREATE VIEW " + quote(viewName) + " AS SELECT "
-                    + "_partition, _offset, _timestamp, _key, _value, _headers, "
-                    + "_key_schema_id, _value_schema_id, _decode_error FROM " + table);
+        }
+        TypedViews.refresh(writer, id);
+    }
+
+    private static String viewName(Connection reader, long id) throws SQLException {
+        try (var p = reader.prepareStatement("SELECT view_name FROM \"$topics\" WHERE id=?")) {
+            p.setLong(1, id);
+            try (var rows = p.executeQuery()) {
+                if (!rows.next()) throw new SQLException("Missing topic generation " + id);
+                return rows.getString(1);
+            }
+        }
+    }
+
+    private static String viewHeader(String view, String signature) {
+        // JSON escapes line breaks; a line comment safely records the exact ID set in the cache file.
+        return "CREATE VIEW " + quote(view) + " -- schemas: " + signature + "\nAS SELECT ";
+    }
+
+    static boolean viewMatches(Connection reader, long id, String signature) throws SQLException {
+        String view = viewName(reader, id);
+        try (var p = reader.prepareStatement("SELECT sql FROM sqlite_schema WHERE type='view' AND name=?")) {
+            p.setString(1, view);
+            try (var rows = p.executeQuery()) { return rows.next() && rows.getString(1).startsWith(viewHeader(view, signature)); }
+        }
+    }
+
+    static void view(Connection writer, long id, List<String> columns, String signature) throws SQLException {
+        String view = viewName(writer, id);
+        String projection = String.join(", ", METADATA);
+        if (!columns.isEmpty()) projection += ", " + String.join(", ", columns);
+        try (var s = writer.createStatement()) {
+            s.execute("DROP VIEW IF EXISTS " + quote(view));
+            s.execute(viewHeader(view, signature) + projection + " FROM " + quote(tableName(id)));
         }
     }
 }

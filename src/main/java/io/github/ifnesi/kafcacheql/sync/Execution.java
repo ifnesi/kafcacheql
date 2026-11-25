@@ -67,6 +67,15 @@ public final class Execution implements AutoCloseable {
         }
     }
 
+    /** Native calls may report an interrupt before their caller can check the execution token. */
+    public SQLException failure(SQLException failure) {
+        try { check(); return failure; }
+        catch (SQLException stopped) {
+            if (stopped != failure) stopped.addSuppressed(failure);
+            return stopped;
+        }
+    }
+
     /** Also useful for Kafka APIs accepting a Duration; never extends this execution's deadline. */
     public synchronized Duration remaining(Duration maximum) throws SQLException {
         check();
@@ -118,6 +127,7 @@ public final class Execution implements AutoCloseable {
                 if (offline || replanned) throw new SQLException("Cached window changed for topic " + stale.topic(), "40001", stale);
                 replanned = true;
             }
+            catch (SQLException failure) { throw failure(failure); }
         }
     }
 

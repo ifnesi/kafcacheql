@@ -139,7 +139,7 @@ class CacheStoreTest {
                     query(cache.writer(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"));
             Map<String, String> meta = meta(cache.writer());
             assertEquals("cluster-A_1", meta.get("cluster_id"));
-            assertEquals("3", meta.get("cache_format_version"));
+            assertEquals("4", meta.get("cache_format_version"));
             assertTrue(Long.parseLong(meta.get("created_ms")) >= before);
             assertEquals(List.of("wal"), query(cache.writer(), "PRAGMA journal_mode"));
             assertEquals(List.of("1"), query(cache.writer(), "PRAGMA foreign_keys"));
@@ -154,7 +154,7 @@ class CacheStoreTest {
                 PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
         Path f = existing.resolve(".kafcacheql/sub/cache.db");
         try (CacheStore cache = CacheStore.open(f, A); Statement s = cache.writer().createStatement()) {
-            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)"); // makes the -wal and -shm files
+            s.execute("INSERT INTO \"$schemas\" VALUES ('1', 'AVRO', '\"string\"', '[]', 0)"); // makes the -wal and -shm files
             assertEquals("rw-------", perms(f));
             assertEquals("rw-------", perms(Path.of(f + "-wal")));
             assertEquals("rw-------", perms(Path.of(f + "-shm")));
@@ -193,10 +193,10 @@ class CacheStoreTest {
             Connection w = cache.writer();
             w.setAutoCommit(false);
             try (Statement s = w.createStatement()) {
-                s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+                s.execute("INSERT INTO \"$schemas\" VALUES ('1', 'AVRO', '\"string\"', '[]', 0)");
 
                 long start = System.nanoTime();
-                assertEquals(List.of("0"), query(r, "SELECT count(*) FROM \"$subjects\""), "the last committed state");
+                assertEquals(List.of("0"), query(r, "SELECT count(*) FROM \"$schemas\""), "the last committed state");
                 long millis = (System.nanoTime() - start) / 1_000_000;
                 assertTrue(millis < CacheStore.BUSY_TIMEOUT_MS / 5, "answered in " + millis + " ms, not waiting");
 
@@ -205,7 +205,7 @@ class CacheStoreTest {
                 w.setAutoCommit(true);
             }
             try (Connection fresh = cache.newReader()) {
-                assertEquals(List.of("1"), query(fresh, "SELECT count(*) FROM \"$subjects\""));
+                assertEquals(List.of("1"), query(fresh, "SELECT count(*) FROM \"$schemas\""));
             }
         }
     }
@@ -277,7 +277,7 @@ class CacheStoreTest {
     @Test
     void aDamagedCacheIsRefusedAndLeftUntouched() throws Exception {
         for (String damage : List.of("DELETE FROM \"$meta\" WHERE name = 'cluster_id'",
-                "UPDATE \"$meta\" SET value = '' WHERE name = 'cluster_id'", "DROP TABLE \"$subjects\"")) {
+                "UPDATE \"$meta\" SET value = '' WHERE name = 'cluster_id'", "DROP TABLE \"$schemas\"")) {
             Path f = Files.createTempDirectory(dir, "damaged").resolve("c.db");
             CacheStore.open(f, A).close();
             try (Connection c = raw(f); Statement s = c.createStatement()) {
@@ -313,7 +313,7 @@ class CacheStoreTest {
         assertArrayEquals(walBytes, sha256(wal), "WAL kept, unchanged");
 
         try (CacheStore cache = CacheStore.open(f, Optional.of("A"))) {
-            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$subjects\""), "nothing lost");
+            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$schemas\""), "nothing lost");
         }
     }
 
@@ -326,7 +326,7 @@ class CacheStoreTest {
         Files.setPosixFilePermissions(real, PosixFilePermissions.fromString("rw-r--r--"));
         Path alias = Files.createSymbolicLink(dir.resolve("alias.db"), real);
         try (CacheStore cache = CacheStore.open(alias, A); Statement s = cache.writer().createStatement()) {
-            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+            s.execute("INSERT INTO \"$schemas\" VALUES ('1', 'AVRO', '\"string\"', '[]', 0)");
             assertEquals(real.toRealPath(), cache.path());
             for (Path p : List.of(real, Path.of(real + "-wal"), Path.of(real + "-shm"))) {
                 assertEquals("rw-------", perms(p), p.toString());
@@ -343,12 +343,12 @@ class CacheStoreTest {
         Path link = Files.createSymbolicLink(dir.resolve("link"), target);
         Path meant = dir.resolve("actual/cache.db");
         try (CacheStore cache = CacheStore.open(meant, A); Statement s = cache.writer().createStatement()) {
-            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+            s.execute("INSERT INTO \"$schemas\" VALUES ('1', 'AVRO', '\"string\"', '[]', 0)");
         }
         CacheStore.open(dir.resolve("cache.db"), A).close(); // what a lexical ".." would pick: same cluster, no rows
         try (CacheStore cache = CacheStore.open(link.resolve("../cache.db"), A)) {
             assertEquals(meant.toRealPath(), cache.path());
-            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$subjects\""));
+            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$schemas\""));
         }
     }
 
@@ -358,7 +358,7 @@ class CacheStoreTest {
         Path alias = Files.createSymbolicLink(dir.resolve("crashed-alias.db"), f);
         try (CacheStore cache = CacheStore.open(alias, Optional.empty())) {
             assertEquals("A", cache.clusterId());
-            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$subjects\""));
+            assertEquals(List.of("1"), query(cache.writer(), "SELECT count(*) FROM \"$schemas\""));
         }
     }
 
@@ -420,7 +420,7 @@ class CacheStoreTest {
 
         Path open = dir.resolve("loose.db");
         try (CacheStore first = CacheStore.open(open, A); Statement s = first.writer().createStatement()) {
-            s.execute("INSERT INTO \"$subjects\" VALUES ('t-value', 1, '1', 0)");
+            s.execute("INSERT INTO \"$schemas\" VALUES ('1', 'AVRO', '\"string\"', '[]', 0)");
             for (Path p : List.of(open, Path.of(open + "-wal"), Path.of(open + "-shm"))) {
                 Files.setPosixFilePermissions(p, PosixFilePermissions.fromString("rw-rw-r--"));
             }

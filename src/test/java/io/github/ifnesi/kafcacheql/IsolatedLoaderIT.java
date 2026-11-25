@@ -2,7 +2,6 @@ package io.github.ifnesi.kafcacheql;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ifnesi.kafcacheql.testkit.TestStack;
@@ -42,13 +41,14 @@ class IsolatedLoaderIT {
             Driver driver = (Driver) jar.loadClass("io.github.ifnesi.kafcacheql.driver.KafCacheQLDriver")
                     .getDeclaredConstructor().newInstance();
             Properties p = new Properties();
+            p.setProperty("cache.path", dir.resolve("validate.db").toString());
             p.setProperty("sasl.oauthbearer.jwt.retriever.class",
                     "org.apache.kafka.common.security.oauthbearer.DefaultJwtRetriever");
             withContext(BLIND, () -> {
                 for (int i = 0; i < 2; i++) {
-                    SQLException e = assertThrows(SQLException.class,
-                            () -> driver.connect("jdbc:kafcacheql://" + TestStack.BOOTSTRAP, p));
-                    assertTrue(e.getMessage().contains("not built yet"), e.toString());
+                    try (var connection = driver.connect("jdbc:kafcacheql://" + TestStack.BOOTSTRAP, p)) {
+                        assertTrue(connection.isValid(5));
+                    }
                     assertSame(BLIND, Thread.currentThread().getContextClassLoader(), "the caller's is put back");
                 }
             });

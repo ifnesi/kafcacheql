@@ -20,8 +20,6 @@ public enum DriverProperty {
             "Skip the Kafka offsets check if the topic was checked within this time; 0 checks on every query."),
     OFFLINE("offline", "false",
             "Never contact Kafka or the Schema Registry; answer from the cache only.", "true", "false"),
-    CACHE_PRUNE_EXPIRED("cache.prune.expired", "true",
-            "Delete cached append-topic data below Kafka's log start offset.", "true", "false"),
     TOPICS_INCLUDE("topics.include", ".*",
             "Regex of topics listed by getTables()."),
     TOPICS_EXCLUDE("topics.exclude", "__.*|_confluent.*|_schemas",

@@ -3,12 +3,16 @@ package io.github.ifnesi.kafcacheql.sql;
 import com.google.common.collect.RangeSet;
 import com.google.common.collect.TreeRangeSet;
 import io.github.ifnesi.kafcacheql.cache.RangeStore;
+import io.github.ifnesi.kafcacheql.cache.TypedViews;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
 import io.github.ifnesi.kafcacheql.sync.Execution;
 import io.github.ifnesi.kafcacheql.sync.StaleGeneration;
 import io.github.ifnesi.kafcacheql.sync.SyncPlan;
 import io.github.ifnesi.kafcacheql.sync.SyncWorker;
 import java.sql.Connection;
+import java.sql.JDBCType;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
 import java.util.ArrayList;
@@ -16,9 +20,10 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 
-/** Parse, plan, sync and read one execution. JDBC statement/result wrappers will sit above this entry. */
+/** Parse, plan, sync and open a checked read snapshot for one execution. */
 public final class QueryPipeline {
     private QueryPipeline() {}
 
@@ -36,10 +41,49 @@ public final class QueryPipeline {
 
     static Result execute(CacheContext.Lease cache, String sql, Map<Integer, ?> parameters, Execution execution, Hooks hooks)
             throws SQLException {
+        try (var cursor = open(cache, sql, parameters, execution, 0, 0, objects(parameters), hooks)) {
+            var metadata = cursor.rows().getMetaData();
+            var columns = new ArrayList<String>(metadata.getColumnCount());
+            for (int i = 1; i <= metadata.getColumnCount(); i++) columns.add(metadata.getColumnLabel(i));
+            var result = new ArrayList<List<Object>>();
+            while (cursor.next()) {
+                var row = new ArrayList<Object>(columns.size());
+                for (int i = 1; i <= columns.size(); i++) row.add(cursor.rows().getObject(i));
+                result.add(Collections.unmodifiableList(row));
+            }
+            return new Result(List.copyOf(columns), List.copyOf(result), cursor.warnings());
+        }
+    }
+
+    @FunctionalInterface public interface Bindings {
+        void bind(PreparedStatement statement) throws SQLException;
+        default void validate(Set<Integer> parameters) throws SQLException {}
+    }
+
+    private static Bindings objects(Map<Integer, ?> parameters) {
+        return statement -> {
+            int count = statement.getParameterMetaData().getParameterCount();
+            for (var parameter : parameters.entrySet()) {
+                if (parameter.getKey() <= count) statement.setObject(parameter.getKey(), parameter.getValue());
+            }
+        };
+    }
+
+    public static Cursor open(CacheContext.Lease cache, String sql, Map<Integer, ?> parameters, Execution execution,
+                              int fetchSize, long maxRows, Bindings bindings) throws SQLException {
+        return open(cache, sql, parameters, execution, fetchSize, maxRows, bindings, new Hooks() {});
+    }
+
+    private static Cursor open(CacheContext.Lease cache, String sql, Map<Integer, ?> parameters, Execution execution,
+                               int fetchSize, long maxRows, Bindings bindings, Hooks hooks) throws SQLException {
         long startedAt = System.currentTimeMillis();
         return execution.run(cache.config().offline(), () -> {
             Query query = Query.parseAndResolve(sql, name -> cache.resolveTable(name, execution));
-            var bounds = cache.read(c -> Bounds.extract(query, c, parameters));
+            for (int index : query.parameters()) {
+                if (!parameters.containsKey(index)) throw new SQLException("Parameter " + index + " is not bound", "07001");
+            }
+            bindings.validate(query.parameters());
+            var bounds = cache.read(execution, c -> Bounds.extract(query, c, parameters));
             var topics = new LinkedHashMap<String, List<Query.Reference>>();
             var warnings = new ArrayList<SQLWarning>();
             for (var reference : query.references()) {
@@ -62,33 +106,102 @@ public final class QueryPipeline {
                 SyncPlan plan = base.withWindows(union);
                 synced.add(new Window(plan, cache.sync(plan, execution)));
             }
-            String rewritten = QueryRewrite.rewrite(query, plans);
             hooks.afterSync(List.copyOf(synced));
-            return cache.read(reader -> {
-                for (var window : synced) validate(reader, window);
-                hooks.afterCheck(reader);
-                execution.check();
-                try (var statement = reader.prepareStatement(rewritten)) {
-                    int count = statement.getParameterMetaData().getParameterCount();
-                    for (var parameter : parameters.entrySet()) {
-                        if (parameter.getKey() <= count) statement.setObject(parameter.getKey(), parameter.getValue());
-                    }
-                    try (var rows = statement.executeQuery()) {
-                        var metadata = rows.getMetaData();
-                        var columns = new ArrayList<String>(metadata.getColumnCount());
-                        for (int i = 1; i <= metadata.getColumnCount(); i++) columns.add(metadata.getColumnLabel(i));
-                        var result = new ArrayList<List<Object>>();
-                        while (rows.next()) {
-                            execution.check();
-                            var row = new ArrayList<Object>(columns.size());
-                            for (int i = 1; i <= columns.size(); i++) row.add(rows.getObject(i));
-                            result.add(Collections.unmodifiableList(row));
-                        }
-                        return new Result(List.copyOf(columns), List.copyOf(result), List.copyOf(warnings));
-                    }
+            var reader = cache.borrowReader(execution);
+            try {
+                var layouts = new LinkedHashMap<String, TypedViews.Layout>();
+                for (var window : synced) {
+                    validate(reader.connection(), window);
+                    String topic = window.plan().topic().name();
+                    var layout = TypedViews.describe(reader.connection(), window.generation());
+                    layouts.put(topic, layout);
+                    warnings.addAll(TypedViews.warnings(layout, topic));
                 }
-            });
+                hooks.afterCheck(reader.connection());
+                var types = ResultTypes.describe(query, reader.connection(), layouts);
+                String rewritten = QueryRewrite.rewrite(query, plans);
+                execution.check();
+                PreparedStatement statement;
+                try { statement = reader.prepare(rewritten); }
+                catch (SQLException e) { throw preparationFailure(e, reader.connection(), query, synced, layouts); }
+                statement.setFetchSize(fetchSize);
+                statement.setLargeMaxRows(maxRows);
+                bindings.bind(statement);
+                ResultSet rows = reader.executeQuery();
+                execution.check();
+                return new Cursor(reader, rows, execution, List.copyOf(warnings), types);
+            } catch (SQLException | RuntimeException | Error e) {
+                try { reader.close(); } catch (SQLException close) { e.addSuppressed(close); }
+                throw e;
+            }
         });
+    }
+
+    private static SQLException preparationFailure(SQLException failure, Connection reader, Query query,
+            List<Window> windows, Map<String, TypedViews.Layout> layouts) throws SQLException {
+        // SQLite has no missing-column result code: it reports SQLITE_ERROR and names the column in the message.
+        if (!(failure instanceof org.sqlite.SQLiteException sqlite)
+                || sqlite.getResultCode() != org.sqlite.SQLiteErrorCode.SQLITE_ERROR) return failure;
+        var missing = java.util.regex.Pattern.compile("\\(no such column: ([^)]+)\\)$").matcher(failure.getMessage());
+        if (!missing.find()) return failure;
+        String column = missing.group(1);
+        int dot = column.lastIndexOf('.');
+        String field = column.substring(dot + 1);
+        var candidates = new java.util.HashSet<String>();
+        for (var reference : query.references()) {
+            String qualifier = reference.table().getAlias() == null ? reference.table().getUnquotedName()
+                    : reference.table().getAlias().getUnquotedName();
+            if (dot < 0 || com.google.common.base.Ascii.equalsIgnoreCase(qualifier, column.substring(0, dot))) {
+                reference.target().topic().ifPresent(candidates::add);
+            }
+        }
+        var topics = new ArrayList<String>();
+        for (var window : windows) {
+            String topic = window.plan().topic().name();
+            if (candidates.contains(topic) && layouts.get(topic).columns().isEmpty()
+                    && !TypedViews.hasSchemas(reader, window.generation())) topics.add(topic);
+        }
+        if (topics.isEmpty()) return failure;
+        return new SQLException(failure.getMessage() + "; column " + column + " isn't known yet for topic(s) " + topics
+                + " because no records with a schema are cached; use _value ->> '$." + field + "' to read the JSON value",
+                "42S22", failure.getErrorCode(), failure);
+    }
+
+    /** Owns the live reader until exhaustion, an error, or explicit close. Execution belongs to its caller. */
+    public static final class Cursor implements AutoCloseable {
+        private final CacheContext.Reader reader;
+        private final ResultSet rows;
+        private final Execution execution;
+        private final List<SQLWarning> warnings;
+        private final Map<Integer, JDBCType> types;
+        private boolean ended;
+
+        private Cursor(CacheContext.Reader reader, ResultSet rows, Execution execution, List<SQLWarning> warnings,
+                       Map<Integer, JDBCType> types) {
+            this.reader = reader; this.rows = rows; this.execution = execution; this.warnings = warnings; this.types = types;
+        }
+        public ResultSet rows() { return rows; }
+        public List<SQLWarning> warnings() { return warnings; }
+        public Map<Integer, JDBCType> types() { return types; }
+        public boolean ended() { return ended; }
+        public boolean next() throws SQLException {
+            if (ended) return false;
+            try {
+                execution.check();
+                boolean next = rows.next();
+                execution.check();
+                if (!next) close();
+                return next;
+            } catch (SQLException e) {
+                try { close(); } catch (SQLException close) { e.addSuppressed(close); }
+                throw execution.failure(e);
+            }
+        }
+        @Override public void close() throws SQLException {
+            if (ended) return;
+            ended = true;
+            reader.close();
+        }
     }
 
     private static void validate(Connection reader, Window window) throws SQLException {

@@ -6,7 +6,6 @@ import io.github.ifnesi.kafcacheql.cache.CacheStore;
 import io.github.ifnesi.kafcacheql.cache.PartitionStore;
 import io.github.ifnesi.kafcacheql.cache.RangeStore;
 import io.github.ifnesi.kafcacheql.cache.RecordStore;
-import io.github.ifnesi.kafcacheql.cache.SchemaStore;
 import io.github.ifnesi.kafcacheql.cache.TopicRegistry;
 import io.github.ifnesi.kafcacheql.config.ConfigErrors;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
@@ -19,6 +18,8 @@ import io.github.ifnesi.kafcacheql.kafka.TopicInfo;
 import io.github.ifnesi.kafcacheql.schema.AvroJsonConverter;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayDeque;
@@ -59,10 +60,12 @@ public final class CacheContext {
         private final CacheContext context;
         private final DriverConfig config;
         private final KafkaClients.Lease clients;
+        private final KafkaClients.Topics topics;
         private boolean closed;
 
         private Lease(CacheContext context, DriverConfig config, KafkaClients.Lease clients) {
             this.context = context; this.config = config; this.clients = clients;
+            topics = clients == null ? null : clients.clients().topics(config);
         }
 
         public Path path() { return context.path; }
@@ -71,6 +74,35 @@ public final class CacheContext {
             ensureOpen();
             return context.read(work);
         }
+        public synchronized Reader borrowReader(Execution execution) throws SQLException {
+            ensureOpen();
+            return context.borrowReader(execution);
+        }
+        public <T> T read(Execution execution, SqlWork<T> work) throws SQLException {
+            try (var reader = borrowReader(execution)) { return work.run(reader.connection()); }
+        }
+        public boolean isValid(Execution execution) throws SQLException {
+            ensureOpen();
+            return clients == null || clients.clients().isValid(execution);
+        }
+
+        /** Metadata discovery only: no registration, sync, or cache writes. The JDBC caller caches the list. */
+        public Set<String> listTopics() throws SQLException {
+            ensureOpen();
+            if (clients != null) return clients.clients().listTopics();
+            return read(reader -> {
+                var names = new HashSet<String>();
+                try (var s = reader.createStatement(); var r = s.executeQuery("SELECT topic FROM \"$topics\" WHERE deleted_ms IS NULL")) {
+                    while (r.next()) names.add(r.getString(1));
+                }
+                return Set.copyOf(names);
+            });
+        }
+
+        public Optional<TopicInfo> describeTopic(String topic) throws SQLException {
+            ensureOpen();
+            return clients == null ? Optional.empty() : topics.describe(topic, null);
+        }
 
         /** Resolve SQL names without fetching records. Include/exclude patterns affect metadata only. */
         public TopicRegistry.ResolvedTable resolveTable(String name, Execution execution) throws SQLException {
@@ -78,14 +110,14 @@ public final class CacheContext {
             var cached = read(c -> TopicRegistry.resolve(c, name));
             if (cached.isPresent()) return cached.get();
             if (config.offline() || name.startsWith("$")) throw unknownTable(name);
-            String topic = clients.clients().listTopics(execution).stream()
-                    .filter(t -> Ascii.equalsIgnoreCase(TopicRegistry.baseViewName(t), name))
-                    .sorted(java.util.Comparator.comparing((String t) -> !t.equals(name)).thenComparing(t -> t))
-                    .findFirst().orElseThrow(() -> unknownTable(name));
+            var knownTopics = clients.clients().listTopics(execution);
+            var names = read(c -> TopicRegistry.viewNames(c, knownTopics));
+            String topic = names.entrySet().stream().filter(e -> Ascii.equalsIgnoreCase(e.getValue(), name))
+                    .map(Map.Entry::getKey).findFirst().orElseThrow(() -> unknownTable(name));
             var observed = read(c -> TopicRegistry.generation(c, topic));
-            var info = clients.clients().describeTopic(topic, config, execution).orElseThrow(() -> unknownTable(name));
+            var info = topics.describe(topic, execution).orElseThrow(() -> unknownTable(name));
             var registered = context.worker.submit(execution, () -> TopicRegistry.register(context.cache, observed, info,
-                    config.topic(topic), AvroJsonConverter.VERSION, execution::check)
+                    config.topic(topic), AvroJsonConverter.VERSION, execution::check, knownTopics)
                     .orElseThrow(() -> new StaleGeneration(topic)));
             return new TopicRegistry.ResolvedTable(registered.viewName(), Optional.of(topic), registered.warning());
         }
@@ -104,7 +136,7 @@ public final class CacheContext {
             boolean deleted = observed.isPresent() && observed.get().deleted();
             if (config.offline()) throw new SQLException("Offline planning needs cached windows for topic " + topic);
             var kafka = clients.clients();
-            var found = kafka.describeTopic(topic, config, execution);
+            var found = topics.describe(topic, execution);
             if (found.isEmpty()) {
                 context.worker.delete(topic, generation, execution);
                 throw new SQLException("Unknown topic " + topic, "42S02");
@@ -139,7 +171,7 @@ public final class CacheContext {
                 if (TopicRegistry.rebuildReason(c, current.get().id(), plan.topic(), config.topic(plan.topic().name()),
                         plan.logStarts()).isPresent()) return false;
                 if (current.get().partitions() < plan.topic().partitions()) return false;
-                if (config.cachePruneExpired() && plan.topic().mode() == Mode.APPEND
+                if (plan.topic().mode() == Mode.APPEND
                         && PartitionStore.needsPruning(c, current.get().id(), plan.logStarts())) return false;
                 for (var entry : plan.windows().entrySet()) {
                     if (!RangeStore.missing(c, plan.generation().getAsLong(), entry.getKey(), entry.getValue()).isEmpty()) return false;
@@ -150,7 +182,7 @@ public final class CacheContext {
                 long id = plan.generation().getAsLong();
                 if (!config.offline() && plan.topic().mode() == Mode.COMPACTED) {
                     for (var entry : plan.ends().offsets().entrySet()) {
-                        context.worker.caughtUp(plan.topic().name(), id, entry.getKey(), plan.ends().capturedAtMs());
+                        caughtUp(plan.topic().name(), id, entry.getKey(), plan.ends().capturedAtMs());
                     }
                 }
                 return id;
@@ -159,8 +191,10 @@ public final class CacheContext {
             return context.worker.sync(plan, execution, writer, config.syncBatchRecords());
         }
 
-        public void storeSchema(SchemaStore.StoredSchema schema) throws SQLException { ensureOpen(); context.worker.schema(schema); }
-        public void storeSubject(SchemaStore.SubjectSchema subject) throws SQLException { ensureOpen(); context.worker.subject(subject); }
+        void caughtUp(String topic, long generation, int partition, long capturedAt) throws SQLException {
+            ensureOpen();
+            context.worker.caughtUp(topic, generation, partition, capturedAt);
+        }
         /** Registration's specialised path is in sync; rebuild/prune/view work can use this guarded handoff. */
         public <T> T write(String topic, long generation, Execution execution, SqlWork<T> work) throws SQLException {
             ensureOpen();
@@ -250,7 +284,6 @@ public final class CacheContext {
                 || !settings.admin().equals(clients.admin()) || !settings.schemaRegistry().equals(clients.schemaRegistry())) {
             throw ConfigErrors.problem("The open cache " + path + " has different client settings");
         }
-        if (config.cachePruneExpired() != other.cachePruneExpired()) different("cache.prune.expired");
         Set<String> topics = new HashSet<>(config.topics().keySet());
         topics.addAll(other.topics().keySet());
         for (String topic : topics) {
@@ -266,23 +299,84 @@ public final class CacheContext {
     }
 
     private <T> T read(SqlWork<T> work) throws SQLException {
-        Connection reader;
-        synchronized (readers) { reader = readers.poll(); }
-        if (reader == null) reader = cache.newReader();
-        boolean reusable = false;
-        try (Statement s = reader.createStatement()) {
-            // The generation, storage schema, pruning floors and ranges must describe one snapshot.
-            s.execute("BEGIN");
-            T result = work.run(reader);
-            s.execute("COMMIT");
-            reusable = true;
-            return result;
+        try (var reader = borrowReader(null)) {
+            return work.run(reader.connection());
         }
-        finally {
-            synchronized (readers) {
-                if (reusable && !closing) readers.add(reader); else reader.close();
+    }
+
+    private Reader borrowReader(Execution execution) throws SQLException {
+        Connection connection;
+        synchronized (readers) { connection = readers.poll(); }
+        if (connection == null) connection = cache.newReader();
+        try { return new Reader(connection, execution); }
+        catch (SQLException | RuntimeException | Error e) {
+            try { connection.close(); } catch (SQLException close) { e.addSuppressed(close); }
+            throw e;
+        }
+    }
+
+    /** One execution's snapshot and interrupt target. An old lease never interrupts a reused connection. */
+    public final class Reader implements AutoCloseable {
+        private final Connection connection;
+        private final Statement control;
+        private Execution.Subscription stop;
+        private PreparedStatement statement;
+        private ResultSet rows;
+        private boolean released;
+        private boolean initialized;
+        private SQLException interruptFailure;
+
+        private Reader(Connection connection, Execution execution) throws SQLException {
+            this.connection = connection;
+            control = connection.createStatement();
+            try {
+                if (execution != null) stop = execution.onStop(this::interrupt);
+                control.execute("BEGIN");
+                if (execution != null) execution.check();
+                initialized = true;
+            } catch (SQLException | RuntimeException | Error e) {
+                try { close(); } catch (SQLException close) { e.addSuppressed(close); }
+                throw e;
             }
         }
+
+        public Connection connection() { return connection; }
+        public PreparedStatement prepare(String sql) throws SQLException {
+            statement = connection.prepareStatement(sql);
+            return statement;
+        }
+        public ResultSet executeQuery() throws SQLException { rows = statement.executeQuery(); return rows; }
+
+        private synchronized void interrupt() {
+            if (released) return;
+            try { control.cancel(); }
+            catch (SQLException e) { interruptFailure = e; }
+        }
+
+        @Override public void close() throws SQLException {
+            // Never take Execution's lock while holding the reader lock: stop callbacks hold it first.
+            if (stop != null) stop.close();
+            synchronized (this) {
+                if (released) return;
+                released = true;
+                SQLException failure = interruptFailure;
+                try { if (rows != null) rows.close(); } catch (SQLException e) { failure = append(failure, e); }
+                try { if (statement != null) statement.close(); } catch (SQLException e) { failure = append(failure, e); }
+                try { control.execute("COMMIT"); } catch (SQLException e) { failure = append(failure, e); }
+                try { control.close(); } catch (SQLException e) { failure = append(failure, e); }
+                synchronized (readers) {
+                    if (initialized && failure == null && !closing) readers.add(connection);
+                    else try { connection.close(); } catch (SQLException e) { failure = append(failure, e); }
+                }
+                if (failure != null) throw failure;
+            }
+        }
+    }
+
+    private static SQLException append(SQLException failure, SQLException next) {
+        if (failure == null) return next;
+        failure.addSuppressed(next);
+        return failure;
     }
 
     private void release() throws SQLException {

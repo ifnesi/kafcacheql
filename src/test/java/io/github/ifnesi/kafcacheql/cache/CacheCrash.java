@@ -13,7 +13,7 @@ public final class CacheCrash {
     public static void main(String[] args) throws Exception {
         CacheStore cache = CacheStore.open(Path.of(args[0]), Optional.of("A"));
         try (Statement s = cache.writer().createStatement()) {
-            s.execute("INSERT INTO \"$subjects\" VALUES ('crash-value', 1, '1', 0)");
+            s.execute("INSERT INTO \"$schemas\" VALUES ('1', 'AVRO', '\"string\"', '[]', 0)");
         }
         Runtime.getRuntime().halt(0);
     }

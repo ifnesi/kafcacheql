@@ -6,17 +6,13 @@ import com.google.common.cache.CacheBuilder;
 import io.confluent.kafka.schemaregistry.ParsedSchema;
 import io.confluent.kafka.schemaregistry.avro.AvroSchema;
 import io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient;
-import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
 import io.confluent.kafka.schemaregistry.client.rest.RestService;
-import io.confluent.kafka.schemaregistry.client.rest.entities.SchemaReference;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
 import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
-import io.confluent.kafka.serializers.subject.TopicNameStrategy;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore;
 import io.github.ifnesi.kafcacheql.cache.SchemaStore.StoredSchema;
-import io.github.ifnesi.kafcacheql.cache.SchemaStore.SubjectSchema;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.Secrets;
 import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
@@ -34,8 +30,6 @@ public final class SchemaRegistry implements AutoCloseable {
     private final Client client;
     private final Transport transport;
     private final Cache<String, ResolvedSchema> schemas;
-
-    private static final TypeReference<List<SchemaReference>> REFERENCES = new TypeReference<>() {};
 
     record ResolvedSchema(StoredSchema stored, ParsedSchema parsed) {}
 
@@ -60,7 +54,7 @@ public final class SchemaRegistry implements AutoCloseable {
                         AbstractKafkaSchemaSerDeConfig.baseConfigDef(), registry, false);
                 return new SchemaRegistry(registry, config, reader);
             } catch (RuntimeException e) {
-                throw failure("opening client", String.valueOf(registry.get("schema.registry.url")), e, registry);
+                throw failure("opening client", java.util.Objects.toString(registry.get("schema.registry.url"), ""), e, registry);
             }
         });
     }
@@ -99,7 +93,7 @@ public final class SchemaRegistry implements AutoCloseable {
         });
     }
 
-    /** Parse a durable schema only when decoding needs it; Confluent resolves its references. */
+    /** Parse the resolved schema returned by the ID/GUID endpoint, without subject lookups. */
     ResolvedSchema parse(ResolvedSchema schema) throws SQLException {
         if (schema.parsed() != null) {
             return schema;
@@ -107,19 +101,21 @@ public final class SchemaRegistry implements AutoCloseable {
         return DriverLoader.call(() -> {
             StoredSchema row = schema.stored();
             try {
-                List<SchemaReference> refs = row.refs() == null ? List.of()
-                        : JacksonMapper.INSTANCE.readValue(row.refs(), REFERENCES);
-                ParsedSchema parsed = client.parseSchema(row.type(), row.schemaText(), refs)
-                        .orElseThrow(() -> new IOException("Cannot parse cached schema " + row.ref()));
+                ParsedSchema parsed = parseAvro(row);
                 ResolvedSchema resolved = new ResolvedSchema(row, parsed);
                 schemas.put(row.ref(), resolved);
                 return resolved;
             } catch (LookupFailure e) {
                 throw e.failure();
-            } catch (IOException | RuntimeException e) {
+            } catch (RuntimeException e) {
                 throw failure("parsing schema " + row.ref(), urls, e, settings);
             }
         });
+    }
+
+    /** Shared offline parser for decoding and typed views. ID/GUID lookups request resolved Avro. */
+    public static AvroSchema parseAvro(StoredSchema schema) {
+        return new AvroSchema(schema.schemaText());
     }
 
     KafkaAvroDeserializer avro(boolean key) throws SQLException {
@@ -128,29 +124,6 @@ public final class SchemaRegistry implements AutoCloseable {
                 return new KafkaAvroDeserializer(client, settings, key);
             } catch (RuntimeException e) {
                 throw failure("configuring Avro decoder", urls, e, settings);
-            }
-        });
-    }
-
-    public Optional<SubjectSchema> latest(String topic, boolean key) throws SQLException {
-        return DriverLoader.call(() -> {
-            String subject = new TopicNameStrategy().subjectName(topic, key, null);
-            try {
-                // -1 is the registry's latest-version selector. This client API fetches live metadata;
-                // getLatestSchemaMetadata caches it indefinitely by default, contrary to PLAN §7.3.
-                SchemaMetadata schema = client.getSchemaMetadata(subject, -1);
-                return Optional.of(new SubjectSchema(subject, schema.getVersion(), new StoredSchema(
-                        Integer.toString(schema.getId()), schema.getSchemaType(), schema.getSchema(),
-                        JacksonMapper.INSTANCE.writeValueAsString(schema.getReferences()), System.currentTimeMillis())));
-            } catch (LookupFailure e) {
-                throw e.failure();
-            } catch (RestClientException e) {
-                if (e.getErrorCode() == 40401) {
-                    return Optional.empty();
-                }
-                throw failure("refreshing subject " + subject, urls, e, settings);
-            } catch (IOException | RuntimeException e) {
-                throw failure("refreshing subject " + subject, urls, e, settings);
             }
         });
     }
@@ -168,7 +141,7 @@ public final class SchemaRegistry implements AutoCloseable {
     }
 
     private static SQLException failure(String action, String urls, Exception cause, Map<String, ?> settings) {
-        return new SQLException(Secrets.redact("Schema Registry at " + urls + ": " + action
+        return new SQLException(Secrets.redact("Schema Registry" + (urls.isBlank() ? "" : " at " + urls) + ": " + action
                 + ": " + cause.getMessage(), settings), "08001", Secrets.sanitize(cause, settings));
     }
 
@@ -198,8 +171,8 @@ public final class SchemaRegistry implements AutoCloseable {
 
         StoredSchema fetch(String ref) throws IOException, RestClientException {
             // Resolve metadata before choosing a parser: phase-2 schema types are still cacheable.
-            var schema = ref.indexOf('-') >= 0 ? transport.getByGuid(ref, null)
-                    : transport.getId(Integer.parseInt(ref));
+            var schema = ref.indexOf('-') >= 0 ? transport.getByGuid(ref, "resolved")
+                    : transport.getId(RestService.DEFAULT_REQUEST_PROPERTIES, Integer.parseInt(ref), null, "resolved", null, false);
             return new StoredSchema(ref, java.util.Objects.requireNonNullElse(schema.getSchemaType(), AvroSchema.TYPE),
                     schema.getSchemaString(), JacksonMapper.INSTANCE.writeValueAsString(schema.getReferences()),
                     System.currentTimeMillis());
@@ -235,7 +208,7 @@ public final class SchemaRegistry implements AutoCloseable {
     }
 
     /** Mark failures at the registry transport, so an Avro EOF is a row error while a network failure
-     * is fatal, including lookups Confluent performs for schema references.
+     * is fatal, on the ID/GUID lookup endpoints.
      */
     private final class Transport extends RestService {
         Transport(List<String> urls) {

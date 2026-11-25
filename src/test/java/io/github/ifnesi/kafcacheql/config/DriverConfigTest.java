@@ -59,7 +59,6 @@ class DriverConfigTest {
         assertEquals(10_000, c.appendDefaultWindowMaxRecords());
         assertEquals(0, c.maxStalenessMs());
         assertFalse(c.offline());
-        assertTrue(c.cachePruneExpired());
         assertEquals(".*", c.topicsInclude().pattern());
         assertEquals("__.*|_confluent.*|_schemas", c.topicsExclude().pattern());
         assertFalse(c.metadataShowInternal());
@@ -244,7 +243,7 @@ class DriverConfigTest {
                 "append.default.window.max.records,0", "append.default.window.max.records,-5",
                 "append.default.window.max.records,ten", "max.staleness.ms,1.5",
                 "sync.batch.records,0", "sync.batch.records,2147483648",
-                "offline,yes", "cache.prune.expired,1", "metadata.show.internal,''",
+                "offline,yes", "metadata.show.internal,''",
                 "topics.include,(", "topics.exclude,[a-", "client.id,' '"})
         void badValuesNameTheProperty(String key, String value) {
             SQLException e = fails(URL, props(key, value));
@@ -257,7 +256,6 @@ class DriverConfigTest {
                     "append.default.window.max.records", "1",
                     "max.staleness.ms", "30000",
                     "offline", "FALSE",
-                    "cache.prune.expired", "False",
                     "metadata.show.internal", "TRUE",
                     "topics.include", "orders\\..*",
                     "topics.exclude", "",
@@ -266,7 +264,6 @@ class DriverConfigTest {
                     "cache.path", "~/c.db"));
             assertEquals(1, c.appendDefaultWindowMaxRecords());
             assertEquals(30_000, c.maxStalenessMs());
-            assertFalse(c.cachePruneExpired());
             assertTrue(c.metadataShowInternal());
             assertTrue(c.topicsInclude().matcher("orders.v1").matches());
             assertEquals("", c.topicsExclude().pattern());

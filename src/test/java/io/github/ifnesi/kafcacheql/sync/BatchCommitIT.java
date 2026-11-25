@@ -184,23 +184,22 @@ class BatchCommitIT {
         }
     }
 
-    /** PLAN L596: "each sync raises each partition's pruning floor ... and trims $ranges ... in one
-     * transaction"; rows deleted "in chunks of sync.batch.records"; "With false, nothing is ever deleted."
-     * L628: "A batch fetched before a prune can't bring pruned records back."
+    /** PLAN §10: pruning is always on; "each sync raises each partition's pruning floor ... and trims
+     * $ranges ... in one transaction"; rows deleted "in chunks of sync.batch.records".
+     * §10.1: "A batch fetched before a prune can't bring pruned records back."
      */
     @Test void retentionPrunesCachedWindowsAndAnOlderProcessesBufferCannotRestoreThem() throws Exception {
         String topic = TestStack.uniqueTopic("batch-retention");
         TestStack.createTopic(topic, 1, Map.of("retention.ms", "-1", "segment.ms", "1000", "file.delete.delay.ms", "0"));
-        Path file = dir.resolve("prune.db"), kept = dir.resolve("keep.db");
+        Path file = dir.resolve("prune.db");
         for (int i = 0; i < 7; i++) TestStack.sendString(topic, "k" + i, "old" + i, TestStack.recent(i));
         TestStack.sendString(topic, "tail", "kept", System.currentTimeMillis() + 120_000);
-        try (var cache = CacheContext.acquire(config(file)); var keep = CacheContext.acquire(config(kept, "cache.prune.expired", "false"));
+        try (var cache = CacheContext.acquire(config(file));
              var execution = new Execution(Duration.ofSeconds(60))) {
             Process stale = child("buffer", file, topic);
             try {
                 assertEquals("BUFFERED", SyncWorkerIT.line(stale));
                 long id = cache.sync(cache.plan(topic, execution), execution, WRITER);
-                long keepId = keep.sync(keep.plan(topic, execution), execution, WRITER);
                 var resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
                 TestStack.admin().incrementalAlterConfigs(Map.of(resource, List.of(new AlterConfigOp(
                         new ConfigEntry("retention.ms", "1000"), AlterConfigOp.OpType.SET)))).all().get(10, TimeUnit.SECONDS);
@@ -241,15 +240,11 @@ class BatchCommitIT {
                 }
                 cache.sync(cache.plan(topic, execution), execution);
                 assertEquals(List.of(2, 2, 2, 1), chunks, "each deletion commits at most sync.batch.records, resuming after cancellation");
-                keep.sync(keep.plan(topic, execution), execution, WRITER);
                 assertEquals(List.of("7|\"kept\""), cache.read(c -> values(c, "SELECT _offset,_value FROM \"$t" + id + "\"")));
                 assertEquals(List.of("7|8"), cache.read(c -> values(c, "SELECT start_offset,end_offset FROM \"$ranges\"")));
                 assertEquals(List.of("7"), cache.read(c -> values(c, "SELECT pruned_below FROM \"$partitions\"")));
                 SyncWorkerIT.unlock(stale);
                 assertEquals(List.of("7"), cache.read(c -> values(c, "SELECT _offset FROM \"$t" + id + "\"")));
-                assertEquals(List.of("8"), keep.read(c -> values(c, "SELECT count(*) FROM \"$t" + keepId + "\"")));
-                assertEquals(List.of("0|8"), keep.read(c -> values(c, "SELECT start_offset,end_offset FROM \"$ranges\"")));
-                assertEquals(List.of("0"), keep.read(c -> values(c, "SELECT pruned_below FROM \"$partitions\"")));
             } finally { stale.destroyForcibly(); }
         }
     }

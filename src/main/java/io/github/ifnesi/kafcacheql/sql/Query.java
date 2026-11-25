@@ -24,11 +24,12 @@ import net.sf.jsqlparser.statement.select.WithItem;
 import net.sf.jsqlparser.util.TablesNamesFinder;
 
 /** One execution's SQL tree: validate the entire statement before resolving any table. */
-public record Query(Select select, List<Reference> references) {
+public record Query(Select select, List<Reference> references, Set<Integer> parameters) {
     public record Reference(Table table, ResolvedTable target, PlainSelect select) {}
     @FunctionalInterface public interface Resolver { ResolvedTable resolve(String name) throws SQLException; }
 
     public static Query parseAndResolve(String sql, Resolver resolver) throws SQLException {
+        if (sql == null) throw new SQLException("SQL is null", "42000");
         Select select;
         try {
             var statements = CCJSqlParserUtil.parseStatements(sql, p -> p.withSquareBracketQuotation(true));
@@ -61,7 +62,7 @@ public record Query(Select select, List<Reference> references) {
             }
             references.add(new Reference(table, target, located.select()));
         }
-        return new Query(select, List.copyOf(references));
+        return new Query(select, List.copyOf(references), Set.copyOf(tables.parameters));
     }
 
     private static SQLException onlySelect() {
@@ -72,6 +73,7 @@ public record Query(Select select, List<Reference> references) {
     private static final class Tables extends TablesNamesFinder<Void> {
         private record Located(Table table, PlainSelect select) {}
         private final List<Located> references = new ArrayList<>();
+        private final Set<Integer> parameters = new HashSet<>();
         private Set<String> ctes = Set.of();
         private PlainSelect current;
         private boolean readOnly = true;
@@ -157,6 +159,7 @@ public record Query(Select select, List<Reference> references) {
         @Override public <S> Void visit(JdbcParameter parameter, S context) {
             // Folding a constant operand must not renumber the remaining parameters in the query.
             parameter.setUseFixedIndex(true);
+            parameters.add(parameter.getIndex());
             return null;
         }
     }
