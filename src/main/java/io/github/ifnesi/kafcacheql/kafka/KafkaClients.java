@@ -3,6 +3,7 @@ package io.github.ifnesi.kafcacheql.kafka;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.Secrets;
+import io.github.ifnesi.kafcacheql.sync.Execution;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.HashMap;
@@ -269,9 +270,13 @@ public final class KafkaClients {
 
     /** The topic, or empty when it doesn't exist. */
     public Optional<TopicInfo> describeTopic(String topic, DriverConfig config) throws SQLException {
+        return describeTopic(topic, config, null);
+    }
+
+    public Optional<TopicInfo> describeTopic(String topic, DriverConfig config, Execution execution) throws SQLException {
         TopicDescription description;
         try {
-            description = admin.describeTopics(List.of(topic)).allTopicNames().get().get(topic);
+            description = await(admin.describeTopics(List.of(topic)).allTopicNames(), execution).get(topic);
         } catch (ExecutionException e) {
             if (e.getCause() instanceof UnknownTopicOrPartitionException) {
                 return Optional.empty();
@@ -285,7 +290,7 @@ public final class KafkaClients {
         ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
         Optional<Map<String, String>> configs;
         try {
-            Config topicConfig = admin.describeConfigs(List.of(resource)).all().get().get(resource);
+            Config topicConfig = await(admin.describeConfigs(List.of(resource)).all(), execution).get(resource);
             configs = Optional.of(topicConfig.entries().stream()
                     .filter(e -> e.value() != null)
                     .collect(Collectors.toMap(ConfigEntry::name, ConfigEntry::value)));
@@ -305,17 +310,25 @@ public final class KafkaClients {
     // ------------------------------------------------------------------ offsets
 
     public Map<Integer, Long> logStartOffsets(String topic, int partitions) throws SQLException {
+        return logStartOffsets(topic, partitions, null);
+    }
+
+    public Map<Integer, Long> logStartOffsets(String topic, int partitions, Execution execution) throws SQLException {
         Map<Integer, Long> out = new TreeMap<>();
-        list(topic, partitions, OffsetSpec.earliest(), "Reading the log start offsets of " + topic)
+        list(topic, partitions, OffsetSpec.earliest(), "Reading the log start offsets of " + topic, execution)
                 .forEach((p, info) -> out.put(p, info.offset()));
         return out;
     }
 
     /** Under read_committed these are the last stable offsets: an open transaction holds them back. */
     public EndOffsets endOffsets(String topic, int partitions) throws SQLException {
+        return endOffsets(topic, partitions, null);
+    }
+
+    public EndOffsets endOffsets(String topic, int partitions, Execution execution) throws SQLException {
         long capturedAt = System.currentTimeMillis();
         Map<Integer, Long> out = new TreeMap<>();
-        list(topic, partitions, OffsetSpec.latest(), "Reading the end offsets of " + topic)
+        list(topic, partitions, OffsetSpec.latest(), "Reading the end offsets of " + topic, execution)
                 .forEach((p, info) -> out.put(p, info.offset()));
         return new EndOffsets(out, capturedAt);
     }
@@ -328,25 +341,30 @@ public final class KafkaClients {
      */
     public Map<Integer, OptionalLong> offsetsForTimes(String topic, int partitions, long timestamp)
             throws SQLException {
+        return offsetsForTimes(topic, partitions, timestamp, null);
+    }
+
+    public Map<Integer, OptionalLong> offsetsForTimes(String topic, int partitions, long timestamp, Execution execution)
+            throws SQLException {
         Map<Integer, OptionalLong> out = new TreeMap<>();
         if (timestamp < 0) {
-            Map<Integer, Long> start = logStartOffsets(topic, partitions);
-            Map<Integer, Long> end = endOffsets(topic, partitions).offsets();
+            Map<Integer, Long> start = logStartOffsets(topic, partitions, execution);
+            Map<Integer, Long> end = endOffsets(topic, partitions, execution).offsets();
             start.forEach((p, s) -> out.put(p, s.equals(end.get(p)) ? OptionalLong.empty() : OptionalLong.of(s)));
             return out;
         }
-        list(topic, partitions, OffsetSpec.forTimestamp(timestamp), "Looking up offsets by time in " + topic)
+        list(topic, partitions, OffsetSpec.forTimestamp(timestamp), "Looking up offsets by time in " + topic, execution)
                 .forEach((p, info) -> out.put(p, info.offset() < 0 ? OptionalLong.empty() : OptionalLong.of(info.offset())));
         return out;
     }
 
     private Map<Integer, ListOffsetsResult.ListOffsetsResultInfo> list(String topic, int partitions, OffsetSpec spec,
-                                                                       String what) throws SQLException {
+                                                                       String what, Execution execution) throws SQLException {
         Map<TopicPartition, OffsetSpec> query = IntStream.range(0, partitions)
                 .mapToObj(p -> new TopicPartition(topic, p))
                 .collect(Collectors.toMap(tp -> tp, tp -> spec));
         Map<Integer, ListOffsetsResult.ListOffsetsResultInfo> out = new TreeMap<>();
-        get(admin.listOffsets(query, READ_COMMITTED).all(), what, settingsForErrors)
+        get(admin.listOffsets(query, READ_COMMITTED).all(), what, settingsForErrors, execution)
                 .forEach((tp, info) -> out.put(tp.partition(), info));
         return out;
     }
@@ -354,8 +372,17 @@ public final class KafkaClients {
     // ------------------------------------------------------------------ errors
 
     private static <T> T get(Future<T> future, String what, Map<String, Object> settings) throws SQLException {
+        return get(future, what, settings, null);
+    }
+
+    private static <T> T await(Future<T> future, Execution execution)
+            throws SQLException, ExecutionException, InterruptedException {
+        return execution == null ? future.get() : execution.awaitFuture(future);
+    }
+
+    private static <T> T get(Future<T> future, String what, Map<String, Object> settings, Execution execution) throws SQLException {
         try {
-            return future.get();
+            return await(future, execution);
         } catch (ExecutionException e) {
             throw sql(what, e.getCause(), settings);
         } catch (InterruptedException e) {

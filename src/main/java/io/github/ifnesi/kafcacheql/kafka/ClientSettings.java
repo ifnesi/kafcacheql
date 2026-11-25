@@ -1,5 +1,6 @@
 package io.github.ifnesi.kafcacheql.kafka;
 
+import io.confluent.kafka.schemaregistry.client.SchemaRegistryClientConfig;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.github.ifnesi.kafcacheql.config.ConfigErrors;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
@@ -36,15 +37,25 @@ public final class ClientSettings {
     /** The fixed consumer settings and their values. group.id must be absent. */
     static final Map<String, String> FIXED = fixed();
 
+    /** Schema Registry client settings that no Confluent definition lists: the client reads them raw. */
+    private static final Set<String> REGISTRY_CLIENT_ONLY = Set.of(
+            SchemaRegistryClientConfig.MAX_RETRIES_CONFIG, SchemaRegistryClientConfig.RETRIES_WAIT_MS_CONFIG,
+            SchemaRegistryClientConfig.RETRIES_MAX_WAIT_MS_CONFIG, SchemaRegistryClientConfig.LATEST_CACHE_TTL_CONFIG,
+            SchemaRegistryClientConfig.MISSING_CACHE_SIZE_CONFIG, SchemaRegistryClientConfig.MISSING_ID_CACHE_TTL_CONFIG,
+            SchemaRegistryClientConfig.MISSING_VERSION_CACHE_TTL_CONFIG,
+            SchemaRegistryClientConfig.MISSING_SCHEMA_CACHE_TTL_CONFIG, SchemaRegistryClientConfig.URL_RANDOMIZE,
+            SchemaRegistryClientConfig.USE_APACHE_HTTP_CLIENT);
+
     private static final Set<String> KNOWN = DriverLoader.call(() -> Stream.of(
                     ConsumerConfig.configNames(), AdminClientConfig.configNames(), ProducerConfig.configNames(),
-                    AbstractKafkaSchemaSerDeConfig.baseConfigDef().names())
+                    AbstractKafkaSchemaSerDeConfig.baseConfigDef().names(), REGISTRY_CLIENT_ONLY)
             .flatMap(Set::stream)
             .collect(Collectors.toUnmodifiableSet()));
 
     /** Prefixes of Schema Registry client and Kafka settings that no definition lists one by one. */
     private static final List<String> KNOWN_PREFIXES = List.of(
-            "schema.registry.", "basic.auth.", "bearer.auth.", "proxy.", "http.", "config.providers.");
+            "schema.registry.", "basic.auth.", "bearer.auth.", "proxy.", "http.", "config.providers.",
+            AbstractKafkaSchemaSerDeConfig.REQUEST_HEADER_PREFIX);
 
     private final Map<String, Object> consumer;
     private final Map<String, Object> admin;
@@ -69,6 +80,13 @@ public final class ClientSettings {
         }
         settings = registryCredentialsFromUrl(settings);
         checkFixed(settings);
+        for (String key : List.of(AbstractKafkaSchemaSerDeConfig.USE_LATEST_VERSION,
+                AbstractKafkaSchemaSerDeConfig.USE_SCHEMA_ID)) {
+            if (settings.containsKey(key)) {
+                throw ConfigErrors.problem(key + " can't be set: KafCacheQL decodes each key and value "
+                        + "with the schema its own bytes name; remove it");
+            }
+        }
         warnUnknown(given.keySet());
 
         Map<String, Object> consumer = only(settings, ConsumerConfig.configNames());

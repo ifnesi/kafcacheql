@@ -13,4 +13,6 @@ import java.util.Map;
  * delete.retention.ms. On older brokers it can count from its segment's last write, at most the age of the
  * oldest open transaction earlier; the rebuild rule therefore subtracts transaction.max.timeout.ms (0007a).
  */
-public record EndOffsets(Map<Integer, Long> offsets, long capturedAtMs) {}
+public record EndOffsets(Map<Integer, Long> offsets, long capturedAtMs) {
+    public EndOffsets { offsets = Map.copyOf(offsets); }
+}

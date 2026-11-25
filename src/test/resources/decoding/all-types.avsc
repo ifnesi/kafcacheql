@@ -1,0 +1,34 @@
+{
+  "type": "record",
+  "name": "AllDecodedTypes",
+  "namespace": "decoding",
+  "fields": [
+    {"name":"booleans","type":{"type":"array","items":"boolean"}},
+    {"name":"ints","type":{"type":"array","items":"int"}},
+    {"name":"longs","type":{"type":"array","items":"long"}},
+    {"name":"floats","type":{"type":"array","items":"float"}},
+    {"name":"doubles","type":{"type":"array","items":"double"}},
+    {"name":"text","type":"string"},
+    {"name":"state","type":{"type":"enum","name":"State","symbols":["OPEN","CLOSED"]}},
+    {"name":"uuid","type":{"type":"string","logicalType":"uuid"}},
+    {"name":"bytes","type":"bytes"},
+    {"name":"fixed","type":{"type":"fixed","name":"Three","size":3}},
+    {"name":"decimal","type":{"type":"bytes","logicalType":"decimal","precision":30,"scale":6}},
+    {"name":"money","type":{"type":"fixed","name":"Money","size":16,"logicalType":"decimal","precision":30,"scale":6}},
+    {"name":"dates","type":{"type":"array","items":{"type":"int","logicalType":"date"}}},
+    {"name":"timeMillis","type":{"type":"array","items":{"type":"int","logicalType":"time-millis"}}},
+    {"name":"timeMicros","type":{"type":"array","items":{"type":"long","logicalType":"time-micros"}}},
+    {"name":"timestampMillis","type":{"type":"array","items":{"type":"long","logicalType":"timestamp-millis"}}},
+    {"name":"timestampMicros","type":{"type":"array","items":{"type":"long","logicalType":"timestamp-micros"}}},
+    {"name":"localMillis","type":{"type":"array","items":{"type":"long","logicalType":"local-timestamp-millis"}}},
+    {"name":"localMicros","type":{"type":"array","items":{"type":"long","logicalType":"local-timestamp-micros"}}},
+    {"name":"byName","type":{"type":"map","values":{"type":"record","name":"Child","fields":[{"name":"n","type":"long"}]}}},
+    {"name":"arrays","type":{"type":"array","items":{"type":"array","items":"int"}}},
+    {"name":"nullable","type":["null",{"type":"array","items":["null",{"type":"int","logicalType":"date"}]}]},
+    {"name":"absent","type":["null","string"]},
+    {"name":"present","type":["null","string"]},
+    {"name":"choices","type":{"type":"array","items":["string",{"type":"record","name":"Alternative","fields":[
+      {"name":"value","type":["int",{"type":"map","values":["string","boolean"]}]}
+    ]}]}}
+  ]
+}

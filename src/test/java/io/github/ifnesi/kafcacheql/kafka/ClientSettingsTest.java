@@ -135,8 +135,12 @@ class ClientSettingsTest {
     @Test
     void unknownSettingsAreWarnedAboutByNameOnly() throws SQLException {
         LogCapture.start();
-        of("append.default.windw", "2h", "my.vault.password", "S3CR3T-typo");
+        of("append.default.windw", "2h", "my.vault.password", "S3CR3T-typo",
+                // Schema Registry client settings that no Confluent definition lists are still known.
+                "use.apache.http.client", "true", "max.retries", "1", "request.header.X-Trace", "t");
         String logs = String.join("\n", LogCapture.stop());
+        assertFalse(logs.contains("use.apache.http.client") || logs.contains("max.retries")
+                || logs.contains("request.header."), logs);
         assertTrue(logs.contains("'append.default.windw'"), logs);
         assertTrue(logs.contains("'my.vault.password'"), logs);
         assertFalse(logs.contains("S3CR3T"), logs);

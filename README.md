@@ -53,7 +53,7 @@ next query only fetches what's new. Joins, aggregations and JSON functions are S
    `_partition`, `_offset`, `_timestamp`, `_key` and `_headers`.
 4. SQLite runs the query. Each topic's table is a view with a column per field of its schema.
 
-Compacted topics hold the latest value per key, and tombstones delete keys. When the cache could have missed
+Compacted topics hold the latest value per key in each partition, as Kafka does, and tombstones delete keys. When the cache could have missed
 deletions, or a topic was recreated, the topic is rebuilt.
 
 ## Status
@@ -65,8 +65,8 @@ deletions, or a topic was recreated, the topic is rebuilt.
 | Client settings, credentials kept out of logs and errors | Done |
 | Kafka clients: cluster ID, topic metadata, offsets | Done |
 | SQLite cache file and its internal tables | Done |
-| Topic tables, decoding, syncing records into the cache | Next |
-| SQL analysis, windows, query rewrite, typed views | Later |
+| Topic tables, decoding, syncing records into the cache | Done |
+| Cache validity and rebuilds, SQL analysis, windows, query rewrite, typed views | Next |
 | Connections, statements, result sets, database metadata in tools | Later |
 | JSON Schema and Protobuf, offline mode | Later |
 

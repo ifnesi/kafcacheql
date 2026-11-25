@@ -35,9 +35,52 @@ class CacheStoreTest {
     @TempDir
     Path dir;
 
+    /** PLAN §6.1: "Before anything writes, the file is checked on a read-only connection";
+     * §16: "another process creating the WAL after the open's existence check and before its read-only look".
+     */
+    @Test
+    void aWalCreatedByAnotherProcessDuringInspectionIsReadBeforeAnyWriterOpens() throws Exception {
+        Path file = dir.resolve("race.db");
+        try (CacheStore initial = CacheStore.open(file, Optional.of("A"))) {
+            assertEquals("A", initial.clusterId());
+        }
+        Process[] child = new Process[1];
+        byte[][] before = new byte[2][];
+        CacheStore.beforeImmutableInspect = () -> {
+            try {
+                child[0] = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                        "-cp", System.getProperty("java.class.path"), CacheWalProcess.class.getName(), file.toString())
+                        .redirectError(ProcessBuilder.Redirect.INHERIT).start();
+                var ready = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                    try { return child[0].inputReader().readLine(); }
+                    catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
+                }).get(10, java.util.concurrent.TimeUnit.SECONDS);
+                assertEquals("WAL", ready);
+                before[0] = sha256(file); before[1] = sha256(Path.of(file + "-wal"));
+            } catch (Exception e) { throw new SQLException(e); }
+        };
+        try {
+            try (CacheStore concurrent = CacheStore.open(file, Optional.of("B"))) {
+                assertEquals("B", concurrent.clusterId(), "the committed WAL supersedes the immutable main file");
+            }
+            SQLException refusal = assertThrows(SQLException.class, () -> CacheStore.open(file, Optional.of("A")));
+            assertTrue(refusal.getMessage().contains("belongs to cluster B"), refusal.getMessage());
+            assertArrayEquals(before[0], sha256(file));
+            assertArrayEquals(before[1], sha256(Path.of(file + "-wal")));
+        } finally {
+            CacheStore.beforeImmutableInspect = () -> {};
+            if (child[0] != null) {
+                child[0].getOutputStream().write('\n'); child[0].getOutputStream().flush();
+                assertTrue(child[0].waitFor(10, java.util.concurrent.TimeUnit.SECONDS));
+                assertEquals(0, child[0].exitValue());
+                child[0].destroyForcibly();
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ helpers
 
-    private static List<String> query(Connection c, String sql) throws SQLException {
+    static List<String> query(Connection c, String sql) throws SQLException {
         List<String> out = new ArrayList<>();
         try (Statement s = c.createStatement(); ResultSet rs = s.executeQuery(sql)) {
             int n = rs.getMetaData().getColumnCount();
@@ -96,7 +139,7 @@ class CacheStoreTest {
                     query(cache.writer(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"));
             Map<String, String> meta = meta(cache.writer());
             assertEquals("cluster-A_1", meta.get("cluster_id"));
-            assertEquals("1", meta.get("cache_format_version"));
+            assertEquals("2", meta.get("cache_format_version"));
             assertTrue(Long.parseLong(meta.get("created_ms")) >= before);
             assertEquals(List.of("wal"), query(cache.writer(), "PRAGMA journal_mode"));
             assertEquals(List.of("1"), query(cache.writer(), "PRAGMA foreign_keys"));

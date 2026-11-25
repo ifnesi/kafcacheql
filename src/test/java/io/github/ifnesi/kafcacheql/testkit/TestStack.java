@@ -223,16 +223,21 @@ public final class TestStack {
      */
     public static RecordMetadata sendAvro(String topic, String key, Object value, Long timestamp, SchemaIdIn where) {
         Headers headers = new RecordHeaders();
-        byte[] bytes = avro(where, false).serialize(topic, headers, value);
+        byte[] bytes = serializeAvro(topic, headers, value, where, false);
         return send(topic, null, timestamp, utf8(key), bytes, headers);
     }
 
     /** Avro key and value, both registered (<topic>-key, <topic>-value) and referenced the same way. */
     public static RecordMetadata sendAvroKeyed(String topic, Object key, Object value, Long timestamp, SchemaIdIn where) {
         Headers headers = new RecordHeaders();
-        byte[] k = avro(where, true).serialize(topic, headers, key);
-        byte[] v = avro(where, false).serialize(topic, headers, value);
+        byte[] k = serializeAvro(topic, headers, key, where, true);
+        byte[] v = serializeAvro(topic, headers, value, where, false);
         return send(topic, null, timestamp, k, v, headers);
+    }
+
+    /** The same Confluent serialization as the send helpers, exposed for corrupt-record fixtures. */
+    public static byte[] serializeAvro(String topic, Headers headers, Object value, SchemaIdIn where, boolean key) {
+        return avro(where, key).serialize(topic, headers, value);
     }
 
     /**
@@ -298,6 +303,9 @@ public final class TestStack {
         props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.LINGER_MS_CONFIG, 0);
+        // Tests delete topics this producer wrote to; forget them quickly (Kafka's minimum) instead of
+        // warning on every metadata refresh for 5 minutes.
+        props.put(ProducerConfig.METADATA_MAX_IDLE_CONFIG, 5_000);
         return props;
     }
 

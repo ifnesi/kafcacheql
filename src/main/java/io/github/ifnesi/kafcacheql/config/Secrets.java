@@ -29,7 +29,8 @@ import org.apache.kafka.common.security.JaasContext;
 /**
  * Which client settings hold credentials, and how to keep them out of anything the driver shows: values
  * Kafka's and Confluent's own definitions type as PASSWORD, settings neither defines whose name looks like a
- * credential, and credentials written into URLs ({@code scheme://user:password@host}).
+ * credential, every Schema Registry request header value, and credentials written into URLs
+ * ({@code scheme://user:password@host}).
  *
  * <p>What to hide is decided by where text appears, never by what it looks like: a parser that rejects a
  * credential often quotes only part of it, and a password can look like a class name or a keyword. So the
@@ -72,7 +73,7 @@ public final class Secrets {
     private Secrets() {}
 
     public static boolean isSecret(String key) {
-        return PASSWORD_KEYS.contains(key) || LOOKS_SECRET.matcher(key).matches();
+        return key.startsWith("request.header.") || PASSWORD_KEYS.contains(key) || LOOKS_SECRET.matcher(key).matches();
     }
 
     /** A copy for toString() and logs: secret values, and credentials inside URLs, replaced by {@value #HIDDEN}. */

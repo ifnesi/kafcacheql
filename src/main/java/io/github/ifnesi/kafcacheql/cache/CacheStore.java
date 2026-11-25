@@ -47,16 +47,20 @@ public final class CacheStore implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(CacheStore.class);
 
-    /** The layout of the internal tables; a cache in any other version is refused. */
-    public static final int FORMAT_VERSION = 1;
+    /** The cache layout, including topic indexes; a cache in any other version is refused. */
+    public static final int FORMAT_VERSION = 2;
 
     static final int BUSY_TIMEOUT_MS = 5_000;
+    public static final long JOURNAL_SIZE_LIMIT = 64L * 1024 * 1024;
     private static final Pattern CLUSTER_ID = Pattern.compile("[A-Za-z0-9._-]{1,255}");
     private static final Set<PosixFilePermission> OWNER_DIR = PosixFilePermissions.fromString("rwx------");
     private static final Set<PosixFilePermission> OWNER_FILE = PosixFilePermissions.fromString("rw-------");
     private static final List<String> SIDECARS = List.of("-wal", "-shm", "-journal");
 
     private enum Role { INSPECT, WRITER, READER }
+
+    /** Test seam at the no-WAL observation; a second process may create one before the inspection opens. */
+    static volatile Check beforeImmutableInspect = () -> {};
 
     /** What a cache file holds: its $meta rows and its tables; empty for an empty database. */
     private record Contents(Map<String, String> meta, Set<String> tables) {}
@@ -95,11 +99,7 @@ public final class CacheStore implements AutoCloseable {
      */
     public static CacheStore open(Path path, Optional<String> clusterId) throws SQLException {
         // Not normalised: removing ".." before the file system follows a link would name another file.
-        Path requested = path.toAbsolutePath();
-        refuseOptions(requested);
-        createIfMissing(requested, clusterId.isPresent());
-        Path file = real(requested);
-        refuseOptions(file);
+        Path file = canonicalPath(path, clusterId.isPresent());
 
         // Checked on a read-only connection before anything writes: refusing a cache leaves it as it was.
         Optional<Contents> found = contents(file);
@@ -133,6 +133,75 @@ public final class CacheStore implements AutoCloseable {
     /** The one connection that writes: the sync worker's. Its transactions are IMMEDIATE. */
     public Connection writer() {
         return writer;
+    }
+
+    @FunctionalInterface
+    public interface Write<T> {
+        T run() throws SQLException;
+    }
+
+    @FunctionalInterface
+    public interface Check { void run() throws SQLException; }
+
+    /** Resolve before joining a cache context; also refuse aliases unsafe for SQLite's path-named WAL. */
+    public static Path canonicalPath(Path path, boolean online) throws SQLException {
+        Path requested = path.toAbsolutePath();
+        refuseOptions(requested);
+        createIfMissing(requested, online);
+        Path file = real(requested);
+        refuseOptions(file);
+        try {
+            if (file.getFileSystem().supportedFileAttributeViews().contains("unix")
+                    && ((Number) Files.getAttribute(file, "unix:nlink")).longValue() > 1) {
+                throw ConfigErrors.problem("The cache " + file + " has multiple hard links; SQLite requires one real path");
+            }
+        } catch (IOException e) {
+            throw ConfigErrors.problem("The cache " + file + " hard links can't be checked", e);
+        }
+        return file;
+    }
+
+    /**
+     * One explicit write transaction. In particular, a result containing a newly allocated generation
+     * cannot escape before COMMIT succeeds. JDBC auto-commit stays on: commit() with it off would start
+     * another IMMEDIATE transaction and hold the write lock into subsequent work.
+     */
+    public static <T> T writeTransaction(Connection writer, Write<T> work) throws SQLException {
+        return writeTransaction(writer, null, work);
+    }
+
+    /** The worker uses a short busy_timeout and checks the execution between write-lock attempts.
+     * Only lock acquisition is repeated; transaction work is never replayed.
+     */
+    public static <T> T writeTransaction(Connection writer, Check check, Write<T> work) throws SQLException {
+        if (!writer.getAutoCommit()) {
+            throw new IllegalStateException("Cache writes require JDBC auto-commit to stay on");
+        }
+        try (Statement s = writer.createStatement()) {
+            while (true) {
+                if (check != null) check.run();
+                try {
+                    s.execute("BEGIN IMMEDIATE");
+                    break;
+                } catch (SQLiteException busy) {
+                    if (check == null || busy.getResultCode() != SQLiteErrorCode.SQLITE_BUSY) throw busy;
+                }
+            }
+            try {
+                if (check != null) check.run();
+                T result = work.run();
+                if (check != null) check.run();
+                s.execute("COMMIT");
+                return result;
+            } catch (SQLException | RuntimeException | Error e) {
+                try {
+                    s.execute("ROLLBACK");
+                } catch (SQLException rollback) {
+                    e.addSuppressed(rollback);
+                }
+                throw e;
+            }
+        }
     }
 
     /** A new connection for user queries: {@code PRAGMA query_only = ON}, never blocked by the writer. */
@@ -202,8 +271,15 @@ public final class CacheStore implements AutoCloseable {
     private static Optional<Contents> contents(Path file) throws SQLException {
         SQLException failure = null;
         for (int attempt = 0; attempt < 2; attempt++) {
-            try (Connection c = connect(file, Role.INSPECT)) {
-                return contents(c, file);
+            boolean hadWal = Files.exists(Path.of(file + SIDECARS.get(0)));
+            try (Connection c = connect(file, Role.INSPECT, hadWal)) {
+                Optional<Contents> found = contents(c, file);
+                // Immutable readers ignore a WAL. Check after reading too: it may have appeared since
+                // connect's existence check. A WAL-aware reader sees the committing writer's snapshot.
+                if (!hadWal && Files.exists(Path.of(file + SIDECARS.get(0)))) {
+                    try (Connection wal = connect(file, Role.INSPECT, true)) { return contents(wal, file); }
+                }
+                return found;
             } catch (SQLException e) {
                 if (ConfigErrors.SQLSTATE.equals(e.getSQLState())) {
                     throw e;
@@ -276,8 +352,7 @@ public final class CacheStore implements AutoCloseable {
      */
     private static String initialiseOrCheck(Connection writer, Path file, Optional<String> clusterId)
             throws SQLException {
-        writer.setAutoCommit(false);
-        try {
+        return writeTransaction(writer, () -> {
             Optional<Contents> now = contents(writer, file);
             String recorded;
             if (now.isPresent()) {
@@ -298,14 +373,8 @@ public final class CacheStore implements AutoCloseable {
                     insert(p, "created_ms", String.valueOf(System.currentTimeMillis()));
                 }
             }
-            writer.commit();
             return recorded;
-        } catch (SQLException | RuntimeException e) {
-            writer.rollback();
-            throw e;
-        } finally {
-            writer.setAutoCommit(true);
-        }
+        });
     }
 
     private static void insert(PreparedStatement p, String name, String value) throws SQLException {
@@ -353,6 +422,10 @@ public final class CacheStore implements AutoCloseable {
     // ------------------------------------------------------------------ connections
 
     private static Connection connect(Path file, Role role) throws SQLException {
+        return connect(file, role, false);
+    }
+
+    private static Connection connect(Path file, Role role, boolean walAware) throws SQLException {
         SQLiteConfig config = new SQLiteConfig();
         config.setBusyTimeout(BUSY_TIMEOUT_MS);
         switch (role) {
@@ -367,7 +440,9 @@ public final class CacheStore implements AutoCloseable {
             case READER -> config.enforceForeignKeys(true);
         }
         String name = file.toString();
-        if (role == Role.INSPECT && !Files.exists(Path.of(file + SIDECARS.get(0)))) {
+        boolean immutable = role == Role.INSPECT && !walAware && !Files.exists(Path.of(file + SIDECARS.get(0)));
+        if (immutable) {
+            beforeImmutableInspect.run();
             // Without a WAL, everything is in the main file: read it immutable, which creates no -wal or -shm
             // file. With a WAL, its files exist already, and a read-only connection reads what it holds.
             name = "file:" + name.replace("%", "%25").replace("#", "%23") + "?immutable=1";
@@ -376,6 +451,9 @@ public final class CacheStore implements AutoCloseable {
         try {
             if (role == Role.WRITER) {
                 enableWal(c, file);
+                try (Statement s = c.createStatement()) {
+                    s.execute("PRAGMA journal_size_limit = " + JOURNAL_SIZE_LIMIT);
+                }
             } else if (role == Role.READER) {
                 try (Statement s = c.createStatement()) {
                     s.execute("PRAGMA query_only = ON");
