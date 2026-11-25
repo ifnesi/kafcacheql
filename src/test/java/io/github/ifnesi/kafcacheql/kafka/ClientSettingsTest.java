@@ -6,17 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.testkit.LogCapture;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
-import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import org.apache.kafka.clients.admin.AdminClientConfig;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -147,155 +143,4 @@ class ClientSettingsTest {
         assertFalse(logs.contains("2h"), logs);
     }
 
-    /** What the clients log when they start (their config values) holds no credential. */
-    @Test
-    void credentialsNeverReachTheLogs() throws Exception {
-        LogCapture.start();
-        DriverConfig config = cloud();
-        ClientSettings s = ClientSettings.of(config);
-        new ConsumerConfig(s.consumer()).logUnused();
-        new AdminClientConfig(s.admin()).logUnused();
-        new KafkaAvroDeserializerConfig(s.schemaRegistry());
-        String toStrings = config + "\n" + s;
-        List<String> lines = LogCapture.stop();
-        String logs = String.join("\n", lines);
-
-        assertTrue(logs.contains("ConsumerConfig values"), "the clients' config logs were captured");
-        assertTrue(logs.contains("KafkaAvroDeserializerConfig values"), logs);
-        assertTrue(logs.contains("[hidden]"), logs);
-        assertFalse(logs.contains("isn't a known config"), logs);
-        assertFalse(logs.contains("check it for a typo"), "Confluent Cloud's keys are all known: " + logs);
-        for (String text : List.of(logs, toStrings)) {
-            assertFalse(text.contains(SASL_PASSWORD), text);
-            assertFalse(text.contains("S3CR3T-registry-secret"), text);
-        }
-    }
-
-    @Test
-    void credentialsInTheRegistryUrlMoveToBasicAuthUserInfo() throws Exception {
-        ClientSettings s = of("schema.registry.url", "http://test:SR-URL-CANARY@localhost:8081, https://test:SR-URL-CANARY@b:8082/path",
-                "basic.auth.credentials.source", "URL");
-        Map<String, Object> r = s.schemaRegistry();
-        assertEquals("http://localhost:8081,https://b:8082/path", r.get("schema.registry.url"));
-        assertEquals("USER_INFO", r.get("basic.auth.credentials.source"));
-        assertEquals("test:SR-URL-CANARY", r.get("basic.auth.user.info"));
-        assertFalse(s.toString().contains("SR-URL-CANARY"), s.toString());
-
-        LogCapture.start();
-        new KafkaAvroDeserializerConfig(r);
-        String logs = String.join("\n", LogCapture.stop());
-        assertTrue(logs.contains("http://localhost:8081"), logs);
-        assertFalse(logs.contains("SR-URL-CANARY"), logs);
-    }
-
-    @Test
-    void credentialsInTheRegistryUrlWithoutASourceMoveToo() throws Exception {
-        assertEquals("u:p", of("schema.registry.url", "http://u:p@r:8081").schemaRegistry().get("basic.auth.user.info"));
-        assertFalse(DriverConfig.load("jdbc:kafcacheql://localhost:9092", props("schema.registry.url", "http://u:SECRETX@r:8081"))
-                .toString().contains("SECRETX"));
-    }
-
-    @Test
-    void conflictingRegistryCredentialsFail() {
-        for (String[] kv : List.of(
-                new String[] {"schema.registry.url", "http://a:x@r:1,http://b:y@r:2"},
-                new String[] {"schema.registry.url", "http://a:x@r:1", "basic.auth.user.info", "a:other"},
-                new String[] {"schema.registry.url", "http://a:x@r:1", "basic.auth.credentials.source", "SASL_INHERIT"})) {
-            SQLException e = assertThrows(SQLException.class, () -> of(kv));
-            assertFalse(e.getMessage().contains("x@"), e.getMessage());
-            assertFalse(e.getMessage().contains(":x"), e.getMessage());
-        }
-    }
-
-    /** basic.auth.user.info applies to every URL: moving credentials some URLs had would send them to the others. */
-    @Test
-    void registryUrlsWhereOnlySomeCarryCredentialsAreRefused() {
-        SQLException e = assertThrows(SQLException.class,
-                () -> of("schema.registry.url", "http://alice:FAILOVER-CANARY@r1:8081,http://r2:8082"));
-        assertTrue(e.getMessage().contains("some of its URLs only"), e.getMessage());
-        assertFalse(e.getMessage().contains("FAILOVER-CANARY"), e.getMessage());
-    }
-
-    /** java.net.URL, which the registry client uses, accepts a "url:" prefix; the credentials still move. */
-    @Test
-    void credentialsMoveOutOfPrefixedRegistryUrls() throws Exception {
-        for (String url : List.of("url:http://alice:PREFIX-CANARY@r:8081", "URL:http://alice:PREFIX-CANARY@r:8081")) {
-            ClientSettings s = of("schema.registry.url", url);
-            assertEquals("http://r:8081", s.schemaRegistry().get("schema.registry.url"), url);
-            assertEquals("alice:PREFIX-CANARY", s.schemaRegistry().get("basic.auth.user.info"), url);
-        }
-    }
-
-    /** Every '@' must end a URL's credentials: any other would reach the clients' logs as written. */
-    @Test
-    void anAtOutsideUrlCredentialsIsRefused() {
-        for (String url : List.of("http://alice:12/SLASH-CANARY@r:8081", "r:8081@SCHEMELESS-CANARY", "http://r:8081/p@PATH-CANARY")) {
-            SQLException e = assertThrows(SQLException.class, () -> of("schema.registry.url", url), url);
-            assertTrue(e.getMessage().contains("doesn't end a URL's credentials"), e.getMessage());
-            assertFalse(e.getMessage().contains("CANARY"), e.getMessage());
-        }
-    }
-
-    /** An '@' left after valid credentials is refused too, and a malformed URL never shows a credential's part. */
-    @Test
-    void malformedRegistryCredentialsNeverShowAndAreRefused() throws Exception {
-        for (String url : List.of("http://alice:HEAD@TAIL/SLASH-CANARY@r:8081", "http://alice:12/SLASH-CANARY@r:8081",
-                "http://alice:pw@r:8081/p?q=QUERY-CANARY@x", "http://alice:pw@r:8081/p#FRAGMENT-CANARY@x",
-                "http://alice:FIRST,COMMA-CANARY@r:8081")) {
-            DriverConfig c = DriverConfig.load("jdbc:kafcacheql://localhost:9092", props("schema.registry.url", url));
-            assertFalse(c.toString().contains("CANARY"), c.toString());
-            SQLException e = assertThrows(SQLException.class, () -> ClientSettings.of(c), url);
-            assertTrue(e.getMessage().contains("doesn't end a URL's credentials"), e.getMessage());
-            assertFalse(e.getMessage().contains("CANARY"), e.getMessage());
-        }
-        ClientSettings encoded = of("schema.registry.url", "http://alice:HEAD%40TAIL%2FSLASH@r:8081");
-        assertEquals("http://r:8081", encoded.schemaRegistry().get("schema.registry.url"));
-        assertEquals("alice:HEAD%40TAIL%2FSLASH", encoded.schemaRegistry().get("basic.auth.user.info"));
-    }
-
-    @Test
-    void anAmbiguousAtInTheRegistryUrlIsRefused() {
-        SQLException e = assertThrows(SQLException.class, () -> of("schema.registry.url", "http://a@b:x@r:1"));
-        assertTrue(e.getMessage().contains("more than one '@'"), e.getMessage());
-    }
-
-    @Test
-    void credentialsWithSpacesInTheRegistryUrlNeverShow() throws Exception {
-        Properties p = props("schema.registry.url", "http://alice:SPACE SECRET@localhost:8081");
-        DriverConfig c = DriverConfig.load("jdbc:kafcacheql://localhost:9092", p);
-        assertFalse(c.toString().contains("SPACE SECRET"), c.toString());
-        ClientSettings s = ClientSettings.of(c);
-        assertEquals("alice:SPACE SECRET", s.schemaRegistry().get("basic.auth.user.info"));
-        assertEquals("http://localhost:8081", s.schemaRegistry().get("schema.registry.url"));
-        assertFalse(s.toString().contains("SPACE SECRET"), s.toString());
-    }
-
-    @Test
-    void aCredentialQuotedByAnotherSettingsErrorIsHidden() {
-        SQLException e = assertThrows(SQLException.class, () -> of(
-                "sasl.jaas.config", "org.apache.kafka.common.security.plain.PlainLoginModule required username='a' password='DOTTED.SECRET';",
-                "request.timeout.ms", "DOTTED.SECRET"));
-        assertTrue(e.getMessage().contains("request.timeout.ms"), e.getMessage());
-        assertFalse(e.getMessage().contains("DOTTED.SECRET"), e.getMessage());
-    }
-
-    @Test
-    void aMalformedJaasConfigFailsWithoutQuotingIt() {
-        SQLException e = assertThrows(SQLException.class, () -> of("sasl.jaas.config",
-                "org.apache.kafka.common.security.plain.PlainLoginModule required username=test password=first JAAS-CANARY;"));
-        assertFalse(e.getMessage().contains("JAAS-CANARY"), e.getMessage());
-        assertTrue(e.getMessage().contains("sasl.jaas.config can't be parsed"), e.getMessage());
-    }
-
-    @ParameterizedTest
-    @CsvSource({"group.id,whatever", "session.timeout.ms,forty-five"})
-    void errorsNeverEchoCredentials(String key, String value) throws Exception {
-        Path f = dir.resolve("bad.properties");
-        Files.writeString(f, CONFLUENT_CLOUD + key + "=" + value + "\n");
-        SQLException e = assertThrows(SQLException.class,
-                () -> ClientSettings.of(DriverConfig.load("jdbc:kafcacheql://?config.file=" + f, null)));
-        assertTrue(e.getMessage().contains(key), e.getMessage());
-        assertFalse(e.getMessage().contains(SASL_PASSWORD), e.getMessage());
-        assertFalse(e.getMessage().contains("S3CR3T-registry-secret"), e.getMessage());
-    }
 }

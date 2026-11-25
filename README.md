@@ -2,8 +2,9 @@
 
 *Kafka + Cache + Query Language*
 
-> **Work in progress.** This driver is in early development and **can't run queries yet**. Today it
-> loads in JDBC tools and checks your configuration; reading topics comes in the next stages (see
+> **Work in progress.** This driver is in early development and **can't run queries from a JDBC tool yet**.
+> Today it loads in JDBC tools and checks your configuration; syncing topics into the cache and analysing
+> queries are built, and connections come in the next stages (see
 > [Status](#status)). Nothing here is stable: names, settings and behaviour may change. Not for production use.
 
 **What if you could query Kafka topics from your database tool of choice? No Kafka client, just a JDBC
@@ -43,6 +44,37 @@ next query only fetches what's new. Joins, aggregations and JSON functions are S
 
 ## How it works (planned)
 
+```mermaid
+flowchart LR
+    user(["You"])
+
+    subgraph app["DBeaver, DataGrip or your Java app (one process)"]
+        tool["SQL editor or app code"]
+        subgraph driver["KafCacheQL JDBC driver"]
+            query["Query side<br/>reads the SQL, works out<br/>which offsets it needs"]
+            worker["Sync worker<br/>Kafka consumer,<br/>the only writer"]
+            decoder["Decoder<br/>Schema Registry client,<br/>Avro to JSON"]
+            query -- "missing offsets" --> worker
+            worker -- "raw records" --> decoder
+            decoder -- "JSON" --> worker
+        end
+    end
+
+    user --> tool
+    tool -- "SQL over JDBC" --> query
+
+    cache[("SQLite cache file<br/>one file per cluster<br/>one view per topic")]
+    kafka[("Kafka<br/>topics")]
+    sr[("Schema Registry")]
+
+    worker -- "fetch new records" --> kafka
+    query -. "offset lookups" .-> kafka
+    decoder -- "schemas by ID, once" --> sr
+    worker -- "write batches" --> cache
+    query -- "run the SQL, read rows" --> cache
+    query -- "result set" --> tool
+```
+
 1. A query names topics as tables: `"orders"`, `"payments.v1"`.
 2. For each topic, the driver works out which offsets the query needs. Compacted topics are read up to their
    end; append topics are read for the window the query's `WHERE` clause asks for on `_partition`, `_offset`
@@ -56,6 +88,50 @@ next query only fetches what's new. Joins, aggregations and JSON functions are S
 Compacted topics hold the latest value per key in each partition, as Kafka does, and tombstones delete keys. When the cache could have missed
 deletions, or a topic was recreated, the topic is rebuilt.
 
+## SQL examples (planned)
+
+> **Not ready yet.** Queries can't run from a JDBC tool until connections are built (see [Status](#status)).
+> These examples show how querying is designed to work; they haven't been run yet.
+
+Each topic is a view named after the topic. Every view has the record's `_partition`, `_offset`,
+`_timestamp` (epoch milliseconds), `_key` and `_value` (decoded, as JSON) and `_headers` (a JSON array of
+`{"key": …, "value": …}`, values in base64), plus a column per field of the topic's schema.
+
+```sql
+-- Orders per status in the last 15 minutes: only those 15 minutes are fetched from Kafka
+SELECT status, count(*)
+FROM "orders"
+WHERE _timestamp >= unixepoch('now', '-15 minutes') * 1000
+GROUP BY status;
+
+-- An exact offset range in one partition
+SELECT _offset, order_id, amount
+FROM "orders"
+WHERE _partition = 0 AND _offset BETWEEN 1000 AND 1999;
+
+-- No _offset or _timestamp bound: the default window applies (the last hour, at most 10,000 records per
+-- partition) and the driver adds a warning saying so
+SELECT * FROM "orders" ORDER BY _timestamp DESC LIMIT 100;
+
+-- Nested fields with SQLite's JSON functions, and records carrying a given header
+SELECT o.order_id, o._value ->> '$.address.city' AS city
+FROM "orders" AS o, json_each(o._headers) AS h
+WHERE o._timestamp >= unixepoch('now', '-1 hour') * 1000
+  AND h.value ->> '$.key' = 'trace-id';
+
+-- Join an append topic with a compacted reference topic (always read to its end)
+SELECT o.order_id, o.amount, c.name, c.country
+FROM "orders" AS o
+JOIN "customers" AS c ON c.key = o.customer_id
+WHERE o._timestamp >= unixepoch('now', '-1 day') * 1000;
+
+-- Topic names with dots or dashes are quoted
+SELECT count(*) FROM "payments.v1" WHERE _offset >= 0;
+```
+
+Compacted topics hold one row per key in each partition, as Kafka does. If partitions were added to a topic,
+a key can appear in more than one; pick the newest with `_timestamp`.
+
 ## Status
 
 | Stage | State |
@@ -66,7 +142,8 @@ deletions, or a topic was recreated, the topic is rebuilt.
 | Kafka clients: cluster ID, topic metadata, offsets | Done |
 | SQLite cache file and its internal tables | Done |
 | Topic tables, decoding, syncing records into the cache | Done |
-| Cache validity and rebuilds, SQL analysis, windows, query rewrite, typed views | Next |
+| Cache validity and rebuilds, SQL analysis, windows, query rewrite | Done |
+| Typed views | Next |
 | Connections, statements, result sets, database metadata in tools | Later |
 | JSON Schema and Protobuf, offline mode | Later |
 
@@ -75,7 +152,7 @@ connections are not built yet; the configuration is valid"*.
 
 ## Trying it today
 
-Requirements: Java 21 or newer, Maven 3.9 or newer.
+Requirements: Java 21 or newer, Maven 3.9 or newer. Kafka 3.1 or newer (Confluent Platform 7.1 or newer).
 
 ```sh
 mvn package -DskipTests
@@ -114,9 +191,8 @@ The driver's own settings (accepted and checked today; most take effect as the s
 |---|---|---|
 | `config.file` | | Properties file loaded before URL parameters and the Properties object |
 | `cache.path` | `~/.kafcacheql/<cluster-id>.db` | The SQLite cache file; required when `offline=true` |
-| `append.default.window` | `1h` | Window for append-topic queries without an `_offset` or `_timestamp` bound: a duration (`500ms`, `90s`, `15m`, `1h`, `2d`) or `all` |
+| `append.default.window` | `1h` | Window for append-topic queries without an `_offset` or `_timestamp` bound: a duration (`500ms`, `90s`, `15m`, `1h`, `2d`) or `all` (the whole topic, with no record limit either) |
 | `append.default.window.max.records` | `10000` | Per-partition cap on the default window; whichever limit is smaller wins |
-| `timestamp.skew.ms` | `60000` | How far past a timestamp to read for `_timestamp < t` on CreateTime topics, for late records |
 | `max.staleness.ms` | `0` | Skip the Kafka offsets check when the topic was checked within this time; `0` checks on every query |
 | `offline` | `false` | Never contact Kafka or Schema Registry; answer from the cache only |
 | `cache.prune.expired` | `true` | Delete cached append-topic data once Kafka has deleted it; `false` keeps it in the cache for as long as you keep the file |
@@ -147,7 +223,7 @@ SQL dialect your queries are written in.
 The cache is a copy of topic data on your local disk, outside Kafka's access controls. The file is readable
 by you only.
 
-Once syncing is built, each query that touches an append topic will also delete the cached records Kafka has
+Each query that touches an append topic also deletes the cached records Kafka has
 already deleted, whether by time or size retention, so by default the cache keeps no more than the topic does.
 To keep data longer than Kafka does, set `cache.prune.expired=false`: the cache then holds everything you've
 queried for as long as you keep the file, though only what you queried before Kafka deleted it. Compacted
@@ -156,6 +232,11 @@ topics always follow the topic's latest values.
 Either way, a topic you stop querying keeps its cached data until you query it again or delete the file. Treat
 the cache like any local copy of that data, and check your organisation's rules before caching production
 topics.
+
+Several tools or applications can share one cache file, as long as they run on the same machine (not on a
+network share, nor shared between your host and a Docker Desktop container) and use the same settings that
+shape the cache: each topic's `mode` and formats, and `cache.prune.expired`. A connection with different ones
+is refused.
 
 ## Development
 
@@ -167,6 +248,13 @@ docker compose up -d broker schema-registry   # enough for the tests; `docker co
 mvn verify                                    # unit and integration tests
 mvn verify -DskipITs                          # unit tests only, no Docker needed
 ```
+
+Some tests log warnings on purpose, and they all print. Tests that recreate topics, expire tombstones or
+change settings log `Rebuilding topic …`, and Kafka's consumer logs `inconsistent topic ID` /
+`unknown topic or partition` for a recreated topic. Tests of unreachable brokers or Schema Registry log
+connection errors to `localhost:1` or to a closed port, and the wrong-password test logs Kafka's
+`failed authentication`. Tests of misspelt settings log `isn't a KafCacheQL
+property`. A test fails only on its own assertions.
 
 ## License
 

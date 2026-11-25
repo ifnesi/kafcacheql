@@ -57,7 +57,6 @@ class DriverConfigTest {
         assertEquals(Optional.empty(), c.cachePath());
         assertEquals(Window.of(Duration.ofHours(1)), c.appendDefaultWindow());
         assertEquals(10_000, c.appendDefaultWindowMaxRecords());
-        assertEquals(60_000, c.timestampSkewMs());
         assertEquals(0, c.maxStalenessMs());
         assertFalse(c.offline());
         assertTrue(c.cachePruneExpired());
@@ -243,8 +242,8 @@ class DriverConfigTest {
         @ParameterizedTest
         @CsvSource({
                 "append.default.window.max.records,0", "append.default.window.max.records,-5",
-                "append.default.window.max.records,ten", "timestamp.skew.ms,-1", "max.staleness.ms,1.5",
-                "sync.batch.records,0", "sync.batch.records,2147483648", "timestamp.skew.ms,9223372036854775808",
+                "append.default.window.max.records,ten", "max.staleness.ms,1.5",
+                "sync.batch.records,0", "sync.batch.records,2147483648",
                 "offline,yes", "cache.prune.expired,1", "metadata.show.internal,''",
                 "topics.include,(", "topics.exclude,[a-", "client.id,' '"})
         void badValuesNameTheProperty(String key, String value) {
@@ -256,7 +255,6 @@ class DriverConfigTest {
         void goodValues() throws SQLException {
             DriverConfig c = DriverConfig.load(URL, props(
                     "append.default.window.max.records", "1",
-                    "timestamp.skew.ms", "0",
                     "max.staleness.ms", "30000",
                     "offline", "FALSE",
                     "cache.prune.expired", "False",
@@ -267,7 +265,6 @@ class DriverConfigTest {
                     "sync.batch.records", "2147483647",
                     "cache.path", "~/c.db"));
             assertEquals(1, c.appendDefaultWindowMaxRecords());
-            assertEquals(0, c.timestampSkewMs());
             assertEquals(30_000, c.maxStalenessMs());
             assertFalse(c.cachePruneExpired());
             assertTrue(c.metadataShowInternal());

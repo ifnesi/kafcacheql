@@ -144,9 +144,15 @@ public final class TestStack {
             }
         }
         await(() -> topicExists(name), "topic " + name + " visible");
+        // Metadata can advertise a partition before its leader can serve requests.
+        endOffsets(name, IsolationLevel.READ_UNCOMMITTED);
     }
 
-    public static void deleteTopic(String name) {
+    public static synchronized void deleteTopic(String name) {
+        if (producer != null) {
+            producer.close(Duration.ofSeconds(5));
+            producer = null;
+        }
         get(admin().deleteTopics(List.of(name)).all());
         await(() -> !topicExists(name), "topic " + name + " deleted");
     }

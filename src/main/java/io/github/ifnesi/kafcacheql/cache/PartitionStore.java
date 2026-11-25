@@ -3,11 +3,27 @@ package io.github.ifnesi.kafcacheql.cache;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.Map;
 
 /** Partition progress and append retention. Mutations belong to the worker's guarded transaction. */
 public final class PartitionStore {
     private PartitionStore() {}
+
+    /** Capture once before fetching: later completion timestamps must not hide an expired baseline. */
+    public static Map<Integer, Long> safetyBaselines(Connection reader, long generation) throws SQLException {
+        var baselines = new HashMap<Integer, Long>();
+        try (var p = reader.prepareStatement("""
+                SELECT p.partition_no, coalesce(p.caught_up_at_ms, t.created_ms)
+                FROM "$partitions" p JOIN "$topics" t ON t.id=p.topic_ref WHERE p.topic_ref=?
+                """)) {
+            p.setLong(1, generation);
+            try (var rows = p.executeQuery()) {
+                while (rows.next()) baselines.put(rows.getInt(1), rows.getLong(2));
+            }
+        }
+        return baselines;
+    }
 
     public static long floor(Connection reader, long generation, int partition) throws SQLException {
         try (PreparedStatement p = reader.prepareStatement(

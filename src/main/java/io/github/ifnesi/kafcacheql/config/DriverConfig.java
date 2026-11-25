@@ -36,7 +36,6 @@ public record DriverConfig(
         Optional<Path> cachePath,
         Window appendDefaultWindow,
         long appendDefaultWindowMaxRecords,
-        long timestampSkewMs,
         long maxStalenessMs,
         boolean offline,
         boolean cachePruneExpired,
@@ -74,7 +73,7 @@ public record DriverConfig(
         return "DriverConfig[bootstrapServers=" + bootstrapServers + ", cachePath=" + cachePath
                 + ", appendDefaultWindow=" + appendDefaultWindow
                 + ", appendDefaultWindowMaxRecords=" + appendDefaultWindowMaxRecords
-                + ", timestampSkewMs=" + timestampSkewMs + ", maxStalenessMs=" + maxStalenessMs
+                + ", maxStalenessMs=" + maxStalenessMs
                 + ", offline=" + offline + ", cachePruneExpired=" + cachePruneExpired
                 + ", topicsInclude=" + topicsInclude + ", topicsExclude=" + topicsExclude
                 + ", metadataShowInternal=" + metadataShowInternal + ", clientId=" + clientId
@@ -147,7 +146,6 @@ public record DriverConfig(
                 window(DriverProperty.APPEND_DEFAULT_WINDOW.key(), own.get(DriverProperty.APPEND_DEFAULT_WINDOW)),
                 atLeast(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS.key(),
                         own.get(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS), 1, Long.MAX_VALUE),
-                atLeast(DriverProperty.TIMESTAMP_SKEW_MS.key(), own.get(DriverProperty.TIMESTAMP_SKEW_MS), 0, Long.MAX_VALUE),
                 atLeast(DriverProperty.MAX_STALENESS_MS.key(), own.get(DriverProperty.MAX_STALENESS_MS), 0, Long.MAX_VALUE),
                 offline,
                 bool(own, DriverProperty.CACHE_PRUNE_EXPIRED),

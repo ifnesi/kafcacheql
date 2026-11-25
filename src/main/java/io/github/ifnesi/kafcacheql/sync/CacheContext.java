@@ -1,7 +1,6 @@
 package io.github.ifnesi.kafcacheql.sync;
 
-import com.google.common.collect.ImmutableRangeSet;
-import com.google.common.collect.Range;
+import com.google.common.base.Ascii;
 import com.google.common.collect.RangeSet;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
 import io.github.ifnesi.kafcacheql.cache.PartitionStore;
@@ -16,19 +15,18 @@ import io.github.ifnesi.kafcacheql.config.Format;
 import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
 import io.github.ifnesi.kafcacheql.kafka.KafkaClients;
+import io.github.ifnesi.kafcacheql.kafka.TopicInfo;
+import io.github.ifnesi.kafcacheql.schema.AvroJsonConverter;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.sql.SQLWarning;
 import java.sql.Statement;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -68,40 +66,59 @@ public final class CacheContext {
         }
 
         public Path path() { return context.path; }
+        public DriverConfig config() { return config; }
         public synchronized <T> T read(SqlWork<T> work) throws SQLException {
             ensureOpen();
             return context.read(work);
         }
 
-        /** Full-topic window after the caller's §9 validation. Rebuild policy belongs to 0007a;
-         * SQL's window resolver can supply bounded windows through the overload.
-         */
+        /** Resolve SQL names without fetching records. Include/exclude patterns affect metadata only. */
+        public TopicRegistry.ResolvedTable resolveTable(String name, Execution execution) throws SQLException {
+            execution.check();
+            var cached = read(c -> TopicRegistry.resolve(c, name));
+            if (cached.isPresent()) return cached.get();
+            if (config.offline() || name.startsWith("$")) throw unknownTable(name);
+            String topic = clients.clients().listTopics(execution).stream()
+                    .filter(t -> Ascii.equalsIgnoreCase(TopicRegistry.baseViewName(t), name))
+                    .sorted(java.util.Comparator.comparing((String t) -> !t.equals(name)).thenComparing(t -> t))
+                    .findFirst().orElseThrow(() -> unknownTable(name));
+            var observed = read(c -> TopicRegistry.generation(c, topic));
+            var info = clients.clients().describeTopic(topic, config, execution).orElseThrow(() -> unknownTable(name));
+            var registered = context.worker.submit(execution, () -> TopicRegistry.register(context.cache, observed, info,
+                    config.topic(topic), AvroJsonConverter.VERSION, execution::check)
+                    .orElseThrow(() -> new StaleGeneration(topic)));
+            return new TopicRegistry.ResolvedTable(registered.viewName(), Optional.of(topic), registered.warning());
+        }
+
+        private static SQLException unknownTable(String name) {
+            return new SQLException("Unknown table " + name, "42S02");
+        }
+
+        /** Full-topic window with §9 validity observations; SQL's resolver can supply bounded windows. */
         public SyncPlan plan(String topic, Execution execution) throws SQLException { return plan(topic, null, execution); }
 
         public SyncPlan plan(String topic, Map<Integer, ? extends RangeSet<Long>> wanted, Execution execution) throws SQLException {
             execution.check();
-            OptionalLong generation = read(c -> TopicRegistry.generation(c, topic));
+            var observed = read(c -> TopicRegistry.observe(c, topic));
+            OptionalLong generation = observed.isPresent() ? OptionalLong.of(observed.get().id()) : OptionalLong.empty();
+            boolean deleted = observed.isPresent() && observed.get().deleted();
             if (config.offline()) throw new SQLException("Offline planning needs cached windows for topic " + topic);
             var kafka = clients.clients();
-            var info = kafka.describeTopic(topic, config, execution)
-                    .orElseThrow(() -> new SQLException("Unknown topic " + topic, "42S02"));
+            var found = kafka.describeTopic(topic, config, execution);
+            if (found.isEmpty()) {
+                context.worker.delete(topic, generation, execution);
+                throw new SQLException("Unknown topic " + topic, "42S02");
+            }
+            var info = found.get();
             var starts = kafka.logStartOffsets(topic, info.partitions(), execution);
             var ends = kafka.endOffsets(topic, info.partitions(), execution);
-            Map<Integer, ImmutableRangeSet<Long>> windows = new TreeMap<>();
-            var warnings = new ArrayList<SQLWarning>();
-            for (int partition = 0; partition < info.partitions(); partition++) {
-                Range<Long> available = Range.closedOpen(starts.get(partition), ends.offsets().get(partition));
-                RangeSet<Long> ranges = wanted == null || info.mode() == Mode.COMPACTED
-                        ? ImmutableRangeSet.of(available) : wanted.get(partition);
-                if (ranges != null) {
-                    if (info.mode() == Mode.APPEND && !ranges.subRangeSet(Range.lessThan(starts.get(partition))).isEmpty()) {
-                        warnings.add(new SQLWarning("Topic " + topic + " partition " + partition
-                                + ": requested data below offset " + starts.get(partition) + " has expired", "01000"));
-                    }
-                    windows.put(partition, ImmutableRangeSet.copyOf(ranges.subRangeSet(available)));
-                }
-            }
-            return new SyncPlan(info, generation, windows, ends, starts, warnings);
+            return SyncPlan.create(info, generation, deleted, wanted, ends, starts);
+        }
+
+        public Map<Integer, OptionalLong> offsetsForTimes(TopicInfo topic, long timestamp, Execution execution) throws SQLException {
+            ensureOpen();
+            if (config.offline()) throw new SQLException("Offline timestamp planning needs cached offsets for topic " + topic.name());
+            return clients.clients().offsetsForTimes(topic.name(), topic.partitions(), timestamp, execution);
         }
 
         public long sync(SyncPlan plan, Execution execution) throws SQLException {
@@ -115,7 +132,12 @@ public final class CacheContext {
             boolean cached = plan.generation().isPresent() && read(c -> {
                 var current = TopicRegistry.observe(c, plan.topic().name());
                 if (current.isEmpty() || current.get().id() != plan.generation().getAsLong()) throw new StaleGeneration(plan.topic().name());
-                if (current.get().deleted()) return false;
+                if (current.get().deleted()) {
+                    if (!plan.deleted()) throw new StaleGeneration(plan.topic().name());
+                    return false;
+                }
+                if (TopicRegistry.rebuildReason(c, current.get().id(), plan.topic(), config.topic(plan.topic().name()),
+                        plan.logStarts()).isPresent()) return false;
                 if (current.get().partitions() < plan.topic().partitions()) return false;
                 if (config.cachePruneExpired() && plan.topic().mode() == Mode.APPEND
                         && PartitionStore.needsPruning(c, current.get().id(), plan.logStarts())) return false;

@@ -6,15 +6,22 @@ import java.sql.SQLException;
 import java.sql.Statement;
 
 /** The fixed record layout; schema evolution changes views, never these storage tables. */
-final class StorageDdl {
+public final class StorageDdl {
     private StorageDdl() {}
 
     static String tableName(long id) {
         return "$t" + id;
     }
 
-    static String quote(String identifier) {
+    public static String quote(String identifier) {
         return '"' + identifier.replace("\"", "\"\"") + '"';
+    }
+
+    static void drop(Connection writer, long id, String viewName) throws SQLException {
+        try (Statement s = writer.createStatement()) {
+            s.execute("DROP VIEW " + quote(viewName));
+            s.execute("DROP TABLE " + quote(tableName(id)));
+        }
     }
 
     /** Caller owns the write transaction; id is still private to that transaction until COMMIT. */

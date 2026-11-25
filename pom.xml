@@ -31,7 +31,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <!-- Confluent's serializers and the kafka-clients build they are made against. -->
-    <confluent.version>8.2.5</confluent.version>
+    <confluent.version>8.4.0</confluent.version>
     <kafka.version>${confluent.version}-ccs</kafka.version>
     <jackson.version>2.22.3</jackson.version>
     <sqlite-jdbc.version>3.54.1.0</sqlite-jdbc.version>

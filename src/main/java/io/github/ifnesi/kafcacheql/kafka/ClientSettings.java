@@ -6,7 +6,10 @@ import io.github.ifnesi.kafcacheql.config.ConfigErrors;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.Secrets;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -172,71 +175,50 @@ public final class ClientSettings {
     private static final String USER_INFO = "basic.auth.user.info";
     private static final String PREFIXED_USER_INFO = "schema.registry.basic.auth.user.info";
 
-    /**
-     * Credentials written into schema.registry.url (Confluent reads them with basic.auth.credentials.source
-     * URL, its default) move to basic.auth.user.info: the clients log their URL settings in full but hide
-     * basic.auth.user.info. They are read by java.net.URL, as Confluent reads them (Secrets.urlCredentials),
-     * and taken as written, as Confluent takes URL.getUserInfo(). Every '@' in the setting must end a URL's
-     * credentials: any other, which would reach the clients' logs as written, is refused. basic.auth.user.info
-     * applies to every URL, so a list where only some URLs carry credentials is refused too: moving them would
-     * send them to URLs that had none.
-     */
+    /** Move URL credentials to a PASSWORD setting before Confluent can log its configuration. */
+    @SuppressWarnings("deprecation") // The registry client also uses URL(String).
     private static Map<String, String> registryCredentialsFromUrl(Map<String, String> settings) throws SQLException {
         String urls = settings.get(REGISTRY_URL);
         if (urls == null || !urls.contains("@")) {
             return settings;
         }
-        Set<String> credentials = new java.util.LinkedHashSet<>();
-        List<String> withoutCredentials = new java.util.ArrayList<>();
-        int bare = 0;
-        for (String url : urls.split(",")) {
-            String entry = url.trim();
-            if (entry.indexOf('@') < 0) {
-                bare++;
-                withoutCredentials.add(entry);
-                continue;
+        List<String> clean = new ArrayList<>();
+        String credentials = null;
+        for (String entry : urls.split(",", -1)) {
+            try {
+                URL url = new URL(entry.trim());
+                String userInfo = url.getUserInfo();
+                // One shared basic.auth.user.info must preserve every URL's original credentials.
+                if (userInfo == null || entry.chars().filter(c -> c == '@').count() != 1
+                        || credentials != null && !credentials.equals(userInfo)) {
+                    throw registryCredentialsError();
+                }
+                credentials = userInfo;
+                clean.add(url.getProtocol() + "://" + url.getAuthority().substring(url.getAuthority().indexOf('@') + 1)
+                        + url.getFile() + (url.getRef() == null ? "" : "#" + url.getRef()));
+            } catch (MalformedURLException e) {
+                throw registryCredentialsError();
             }
-            Secrets.UrlCredentials parsed = Secrets.urlCredentials(entry).orElse(null);
-            if (parsed != null && parsed.ambiguous()) {
-                throw ConfigErrors.problem("schema.registry.url has more than one '@' before a host: percent-encode "
-                        + "an '@' inside credentials as %40, or set them in basic.auth.user.info");
-            }
-            if (parsed == null || parsed.userInfo() == null || parsed.withoutUserInfo().indexOf('@') >= 0) {
-                throw ConfigErrors.problem("schema.registry.url has an '@' that doesn't end a URL's credentials "
-                        + "(scheme://user:password@host): percent-encode '@', '/', '?' and '#' inside credentials, "
-                        + "or set them in basic.auth.user.info");
-            }
-            credentials.add(parsed.userInfo());
-            withoutCredentials.add(parsed.withoutUserInfo());
         }
-        if (credentials.isEmpty()) {
-            return settings;
-        }
-        if (credentials.size() > 1) {
-            throw ConfigErrors.problem("schema.registry.url holds different credentials in its URLs: set them once, "
-                    + "in basic.auth.user.info");
-        }
-        if (bare > 0) {
-            throw ConfigErrors.problem("schema.registry.url gives credentials to some of its URLs only: give every URL "
-                    + "the same credentials, or set them once in basic.auth.user.info");
-        }
-        String userInfo = credentials.iterator().next();
-        String source = settings.get(CREDENTIALS_SOURCE);
-        if (source != null && !source.equals("URL") && !source.equals("USER_INFO")) {
-            throw ConfigErrors.problem("schema.registry.url holds credentials, but basic.auth.credentials.source is "
-                    + source + ": keep the credentials in one place");
+        String source = settings.getOrDefault(CREDENTIALS_SOURCE, "URL");
+        if (!source.equals("URL") && !source.equals("USER_INFO")) {
+            throw registryCredentialsError();
         }
         for (String key : List.of(USER_INFO, PREFIXED_USER_INFO)) {
-            if (settings.containsKey(key) && !settings.get(key).equals(userInfo)) {
-                throw ConfigErrors.problem("schema.registry.url and " + key + " hold different credentials: "
-                        + "keep them in " + key + " only");
+            if (settings.containsKey(key) && !settings.get(key).equals(credentials)) {
+                throw registryCredentialsError();
             }
         }
         Map<String, String> out = new LinkedHashMap<>(settings);
-        out.put(REGISTRY_URL, String.join(",", withoutCredentials));
+        out.put(REGISTRY_URL, String.join(",", clean));
         out.put(CREDENTIALS_SOURCE, "USER_INFO");
-        out.put(USER_INFO, userInfo);
+        out.put(USER_INFO, credentials);
         return out;
+    }
+
+    private static SQLException registryCredentialsError() {
+        return ConfigErrors.problem("Invalid credentials in schema.registry.url: use URLs without credentials "
+                + "and set basic.auth.user.info with basic.auth.credentials.source=USER_INFO");
     }
 
     private static Map<String, Object> only(Map<String, String> settings, Set<String> names) {

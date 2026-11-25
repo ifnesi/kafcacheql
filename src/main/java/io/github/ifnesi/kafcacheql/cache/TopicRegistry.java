@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
 import io.github.ifnesi.kafcacheql.config.Format;
+import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.config.TopicSettings;
 import io.github.ifnesi.kafcacheql.kafka.TopicInfo;
 import io.github.ifnesi.kafcacheql.schema.AvroJsonConverter;
@@ -9,7 +10,10 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLWarning;
+import java.util.Map;
 import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.util.OptionalLong;
 
 /**
@@ -18,6 +22,8 @@ import java.util.OptionalLong;
  * already registered, live generation with the same Kafka topic ID. Nothing contacts Kafka here.
  */
 public final class TopicRegistry {
+    private static final Logger log = LoggerFactory.getLogger(TopicRegistry.class);
+
     private TopicRegistry() {}
 
     /** A committed generation, its view, and any naming warning for the calling statement. */
@@ -29,7 +35,27 @@ public final class TopicRegistry {
 
     private record Row(long id, String viewName, String topicUuid, boolean deleted) {}
 
+    private record Change(Row row, String reason) {}
+
     public record Generation(long id, boolean deleted, int partitions) {}
+
+    /** A SQL view's Kafka topic, or an internal cache table with no topic to sync. */
+    public record ResolvedTable(String viewName, Optional<String> topic, Optional<SQLWarning> warning) {}
+
+    public static Optional<ResolvedTable> resolve(Connection reader, String name) throws SQLException {
+        try (PreparedStatement p = reader.prepareStatement("""
+                SELECT s.name, t.topic FROM sqlite_schema s
+                LEFT JOIN "$topics" t ON s.name = t.view_name AND t.deleted_ms IS NULL
+                WHERE s.name = ? COLLATE NOCASE AND s.type IN ('table', 'view')
+                  AND (t.topic IS NOT NULL OR substr(s.name, 1, 1) = '$')
+                """)) {
+            p.setString(1, name);
+            try (ResultSet rs = p.executeQuery()) {
+                return rs.next() ? Optional.of(new ResolvedTable(rs.getString(1), Optional.ofNullable(rs.getString(2)),
+                        Optional.empty())) : Optional.empty();
+            }
+        }
+    }
 
     /** Includes deleted rows: only a name that has never been registered is absent. */
     public static OptionalLong generation(Connection reader, String topic) throws SQLException {
@@ -66,36 +92,134 @@ public final class TopicRegistry {
 
     public static Optional<Registration> register(CacheStore cache, OptionalLong observedGeneration,
             TopicInfo topic, TopicSettings settings, int decoderVersion, CacheStore.Check check) throws SQLException {
+        return prepare(cache, observedGeneration, true, topic, settings, decoderVersion, null, check);
+    }
+
+    /** Register or replace using the same policy the caller checked on its read snapshot. */
+    public static Optional<Registration> prepare(CacheStore cache, OptionalLong observedGeneration, boolean observedDeleted,
+            TopicInfo topic, TopicSettings settings, Map<Integer, Long> logStarts,
+            CacheStore.Check check) throws SQLException {
+        return prepare(cache, observedGeneration, observedDeleted, topic, settings, AvroJsonConverter.VERSION,
+                logStarts, check);
+    }
+
+    private static Optional<Registration> prepare(CacheStore cache, OptionalLong observedGeneration, boolean observedDeleted,
+            TopicInfo topic, TopicSettings settings, int decoderVersion, Map<Integer, Long> logStarts,
+            CacheStore.Check check) throws SQLException {
         Connection writer = cache.writer();
-        Optional<Row> committed = CacheStore.writeTransaction(writer, check, () -> {
+        Optional<Change> committed = CacheStore.writeTransaction(writer, check, () -> {
             Optional<Row> current = find(writer, topic.name());
+            String reason = null;
             if (current.isPresent()) {
                 Row row = current.get();
+                if (observedGeneration.isPresent() && observedGeneration.getAsLong() != row.id()) return Optional.empty();
                 if (!row.deleted()) {
-                    if (observedGeneration.isPresent() && observedGeneration.getAsLong() != row.id()) return Optional.empty();
-                    if (!row.topicUuid().equals(topic.topicId().toString())) return Optional.empty();
-                    addPartitions(writer, row.id(), topic.partitions());
-                    return current;
-                }
-                if (observedGeneration.isEmpty() || observedGeneration.getAsLong() != row.id()) {
-                    return Optional.empty();
-                }
-                // Deletion already removed the storage, view, partitions and ranges. Its row alone stays
-                // to guard a later registration, which now replaces it under this same write lock.
+                    if (logStarts == null) {
+                        if (!row.topicUuid().equals(topic.topicId().toString())) return Optional.empty();
+                    } else {
+                        reason = rebuildReason(writer, row.id(), topic, settings, logStarts).orElse(null);
+                    }
+                    if (reason == null) {
+                        addPartitions(writer, row.id(), topic.partitions());
+                        return Optional.of(new Change(row, null));
+                    }
+                    // An absent observation may adopt a matching registration, but never replace one.
+                    if (observedGeneration.isEmpty()) return Optional.empty();
+                    removeStorage(writer, row);
+                } else if (observedGeneration.isEmpty() || !observedDeleted) return Optional.empty();
                 try (PreparedStatement p = writer.prepareStatement("DELETE FROM \"$topics\" WHERE id = ?")) {
-                    p.setLong(1, row.id());
-                    p.executeUpdate();
+                    p.setLong(1, row.id()); p.executeUpdate();
                 }
-            } else if (observedGeneration.isPresent()) {
-                return Optional.empty();
-            }
+            } else if (observedGeneration.isPresent()) return Optional.empty();
             String view = viewName(writer, topic.name());
             long id = insert(writer, topic, settings, decoderVersion, view);
             StorageDdl.create(writer, id, topic.mode(), view);
             insertPartitions(writer, id, 0, topic.partitions());
-            return Optional.of(new Row(id, view, topic.topicId().toString(), false));
+            return Optional.of(new Change(new Row(id, view, topic.topicId().toString(), false), reason));
         });
-        return committed.map(row -> new Registration(row.id(), row.viewName(), namingWarning(topic.name(), row.viewName())));
+        return committed.map(change -> {
+            if (change.reason() != null) log.warn("Rebuilding topic {}: {}", topic.name(), change.reason());
+            Row row = change.row();
+            return new Registration(row.id(), row.viewName(), namingWarning(topic.name(), row.viewName()));
+        });
+    }
+
+    /** Pure read-side check, repeated on current rows under the write lock before a replacement. */
+    public static Optional<String> rebuildReason(Connection reader, long generation, TopicInfo topic,
+            TopicSettings settings, Map<Integer, Long> logStarts) throws SQLException {
+        try (PreparedStatement p = reader.prepareStatement("""
+                SELECT topic_uuid, mode, key_format, value_format, decoder_version
+                FROM "$topics" WHERE id=? AND deleted_ms IS NULL
+                """)) {
+            p.setLong(1, generation);
+            try (ResultSet row = p.executeQuery()) {
+                if (!row.next()) return Optional.empty();
+                String[] names = {"topic ID", "mode", "key.format", "value.format", "decoder_version"};
+                String[] expected = {topic.topicId().toString(), topic.mode().value(),
+                        settings.keyFormat().orElse(Format.AUTO).value(), settings.valueFormat().orElse(Format.AUTO).value(),
+                        Integer.toString(AvroJsonConverter.VERSION)};
+                for (int i = 0; i < names.length; i++) {
+                    String before = row.getString(i + 1);
+                    if (!before.equals(expected[i])) return Optional.of(names[i] + " changed from " + before + " to " + expected[i]);
+                }
+            }
+        }
+        if (topic.mode() != Mode.COMPACTED) return Optional.empty();
+        long now = System.currentTimeMillis();
+        try (PreparedStatement p = reader.prepareStatement("""
+                SELECT p.partition_no, coalesce(p.caught_up_at_ms, t.created_ms), (SELECT min(start_offset) FROM "$ranges" r
+                    WHERE r.topic_ref=p.topic_ref AND r.partition_no=p.partition_no), p.caught_up_at_ms IS NULL
+                FROM "$partitions" p JOIN "$topics" t ON t.id=p.topic_ref WHERE p.topic_ref=?
+                """)) {
+            p.setLong(1, generation);
+            try (ResultSet rows = p.executeQuery()) {
+                while (rows.next()) {
+                    int partition = rows.getInt(1);
+                    Long start = logStarts.get(partition);
+                    if (start != null && rows.getObject(3) != null && rows.getLong(3) < start) {
+                        return Optional.of("cached offset " + rows.getLong(3) + " below log start " + start + " in partition " + partition);
+                    }
+                    // Until the first complete sync there can already be committed rows. Their safety
+                    // baseline is the generation's creation, not a fabricated caught-up timestamp.
+                    if (now - rows.getLong(2) > topic.deleteRetentionMs()) {
+                        return Optional.of((rows.getBoolean(4) ? "first added " : "last full sync ")
+                                + duration(now - rows.getLong(2)) + " ago, longer than delete.retention.ms ("
+                                + duration(topic.deleteRetentionMs()) + ")");
+                    }
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static String duration(long milliseconds) {
+        return java.time.Duration.ofMillis(milliseconds).toString().substring(2).toLowerCase(java.util.Locale.ROOT);
+    }
+
+    /** Keep the deleted generation as an observation guard; no Kafka operation occurs under the lock. */
+    public static boolean delete(CacheStore cache, String topic, OptionalLong observed, CacheStore.Check check) throws SQLException {
+        return CacheStore.writeTransaction(cache.writer(), check, () -> {
+            Optional<Row> current = find(cache.writer(), topic);
+            if (current.isEmpty()) return observed.isEmpty();
+            Row row = current.get();
+            if (observed.isEmpty() || observed.getAsLong() != row.id()) return false;
+            if (!row.deleted()) {
+                removeStorage(cache.writer(), row);
+                try (PreparedStatement p = cache.writer().prepareStatement("UPDATE \"$topics\" SET deleted_ms=? WHERE id=?")) {
+                    p.setLong(1, System.currentTimeMillis()); p.setLong(2, row.id()); p.executeUpdate();
+                }
+            }
+            return true;
+        });
+    }
+
+    private static void removeStorage(Connection writer, Row row) throws SQLException {
+        StorageDdl.drop(writer, row.id(), row.viewName());
+        for (String table : java.util.List.of("$ranges", "$partitions")) {
+            try (PreparedStatement p = writer.prepareStatement("DELETE FROM " + StorageDdl.quote(table) + " WHERE topic_ref=?")) {
+                p.setLong(1, row.id()); p.executeUpdate();
+            }
+        }
     }
 
     private static int partitionCount(Connection reader, long generation) throws SQLException {
@@ -142,7 +266,7 @@ public final class TopicRegistry {
     }
 
     private static String viewName(Connection writer, String topic) throws SQLException {
-        String base = hasReservedPrefix(topic) ? topic.substring(0, 6) + '-' + topic.substring(7) : topic;
+        String base = baseViewName(topic);
         try (PreparedStatement p = writer.prepareStatement(
                 "SELECT 1 FROM \"$topics\" WHERE view_name = ? COLLATE NOCASE")) {
             String candidate = base;
@@ -156,6 +280,10 @@ public final class TopicRegistry {
                 candidate = base + "$" + suffix;
             }
         }
+    }
+
+    public static String baseViewName(String topic) {
+        return hasReservedPrefix(topic) ? topic.substring(0, 6) + '-' + topic.substring(7) : topic;
     }
 
     private static boolean hasReservedPrefix(String topic) {

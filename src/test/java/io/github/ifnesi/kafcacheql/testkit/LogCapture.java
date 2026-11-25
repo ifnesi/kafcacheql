@@ -3,7 +3,9 @@ package io.github.ifnesi.kafcacheql.testkit;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.List;
+import java.util.Deque;
 import org.slf4j.ILoggerFactory;
 import org.slf4j.IMarkerFactory;
 import org.slf4j.Marker;
@@ -18,33 +20,54 @@ import org.slf4j.spi.SLF4JServiceProvider;
 /**
  * The tests' SLF4J provider (registered in src/test/resources/META-INF/services): records every log line,
  * at every level, between {@link #start()} and {@link #stop()}, so tests can check what the driver and the
- * clients log, without printing them. Outside a capture it prints WARN and ERROR to stderr and drops the rest.
- * There is one buffer for the JVM: tests run one at a time (JUnit's default), and captures don't overlap.
+ * clients log. WARN and ERROR always print to stderr, captured or not: nothing is hidden. Captures may nest;
+ * each records its whole lifetime, including logs recorded by an inner capture.
  */
 public final class LogCapture implements SLF4JServiceProvider {
 
-    private static final List<String> LINES = new ArrayList<>();
+    private static final Deque<Capture> CAPTURES = new ArrayDeque<>();
     private static volatile boolean capturing;
 
     private final ILoggerFactory factory = CapturingLogger::new;
     private final IMarkerFactory markers = new BasicMarkerFactory();
     private final MDCAdapter mdc = new NOPMDCAdapter();
 
-    /** Clears what was recorded and records from now on. */
-    public static synchronized void start() {
-        LINES.clear();
+    public static final class Capture implements AutoCloseable {
+        private final List<String> lines = new ArrayList<>();
+        public List<String> lines() { synchronized (LogCapture.class) { return List.copyOf(lines); } }
+        @Override public void close() {
+            synchronized (LogCapture.class) {
+                CAPTURES.remove(this);
+                capturing = !CAPTURES.isEmpty();
+            }
+        }
+    }
+
+    public static synchronized Capture capture() {
+        var capture = new Capture();
+        CAPTURES.push(capture);
         capturing = true;
+        return capture;
     }
 
-    /** Stops recording; returns every line recorded since {@link #start()}. */
+    /** Records all levels until {@link #stop()}. */
+    public static void start() { capture(); }
+
+    /** Ends the innermost capture. */
     public static synchronized List<String> stop() {
-        capturing = false;
-        return List.copyOf(LINES);
+        if (CAPTURES.isEmpty()) return List.of();
+        var capture = CAPTURES.peek();
+        capture.close();
+        return capture.lines();
     }
 
-    private static synchronized void record(String line) {
-        if (capturing) {
-            LINES.add(line);
+    /** Also accepts WARN/ERROR lines forwarded from a forked test process. */
+    public static synchronized void record(String line) {
+        for (var capture : CAPTURES) {
+            capture.lines.add(line);
+        }
+        if (line.startsWith("WARN ") || line.startsWith("ERROR ")) {
+            System.err.println(line);
         }
     }
 
@@ -104,9 +127,6 @@ public final class LogCapture implements SLF4JServiceProvider {
                 line += "\n" + trace;
             }
             record(line);
-            if (!capturing && level.toInt() >= Level.WARN.toInt()) {
-                System.err.println(line);
-            }
         }
     }
 }

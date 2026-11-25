@@ -30,6 +30,7 @@ final class InternalTables {
               key_format          TEXT NOT NULL,
               value_format        TEXT NOT NULL,
               decoder_version     INTEGER NOT NULL,
+              created_ms          INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
               deleted_ms          INTEGER
             )""",
             """

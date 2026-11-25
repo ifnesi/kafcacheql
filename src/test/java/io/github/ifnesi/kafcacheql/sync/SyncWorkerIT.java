@@ -277,21 +277,22 @@ class SyncWorkerIT {
             assertTrue((boolean) cache.read(c -> io.github.ifnesi.kafcacheql.cache.SchemaStore.find(c, newer.schema().ref()).isPresent()));
             assertEquals(List.of(caughtUp), cache.read(c -> values(c, "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + replacement)));
             // Once an entry failed under a real competing writer, it is dropped, not replayed later.
-            io.github.ifnesi.kafcacheql.testkit.LogCapture.start();
-            Process holder = child("lock", cache.path(), topic);
-            try {
-                assertEquals("LOCKED", line(holder));
-                cache.storeSubject(copy);
-                TestStack.await(() -> cache.pendingBackground() == 0, "failed copy taken");
-                var barrier = CompletableFuture.supplyAsync(() -> {
-                    try { return cache.write(topic, replacement, execution, c -> null); }
-                    catch (SQLException e) { throw new java.util.concurrent.CompletionException(e); }
-                });
-                assertThrows(java.util.concurrent.TimeoutException.class, () -> barrier.get(250, TimeUnit.MILLISECONDS));
-                unlock(holder); barrier.get(5, TimeUnit.SECONDS);
-                assertTrue(io.github.ifnesi.kafcacheql.testkit.LogCapture.stop().stream().anyMatch(l -> l.contains("Dropped background cache write")));
-                assertEquals(List.of("0"), cache.read(c -> values(c, "SELECT count(*) FROM \"$subjects\" WHERE subject='" + blocking + "-value'")));
-            } finally { holder.destroyForcibly(); io.github.ifnesi.kafcacheql.testkit.LogCapture.stop(); }
+            try (var logs = io.github.ifnesi.kafcacheql.testkit.LogCapture.capture()) {
+                Process holder = child("lock", cache.path(), topic);
+                try {
+                    assertEquals("LOCKED", line(holder));
+                    cache.storeSubject(copy);
+                    TestStack.await(() -> cache.pendingBackground() == 0, "failed copy taken");
+                    var barrier = CompletableFuture.supplyAsync(() -> {
+                        try { return cache.write(topic, replacement, execution, c -> null); }
+                        catch (SQLException e) { throw new java.util.concurrent.CompletionException(e); }
+                    });
+                    assertThrows(java.util.concurrent.TimeoutException.class, () -> barrier.get(250, TimeUnit.MILLISECONDS));
+                    unlock(holder); barrier.get(5, TimeUnit.SECONDS);
+                    assertTrue(logs.lines().stream().anyMatch(l -> l.contains("Dropped background cache write")));
+                    assertEquals(List.of("0"), cache.read(c -> values(c, "SELECT count(*) FROM \"$subjects\" WHERE subject='" + blocking + "-value'")));
+                } finally { holder.destroyForcibly(); }
+            }
             CountDownLatch closingHold = new CountDownLatch(1), closingRelease = new CountDownLatch(1);
             cache.hooks(new SyncWorker.Hooks() {
                 @Override public void afterCommit(SyncBatch b) throws SQLException { pause(closingHold, closingRelease); }

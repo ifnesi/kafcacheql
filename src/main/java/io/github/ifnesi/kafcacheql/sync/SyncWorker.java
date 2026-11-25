@@ -13,7 +13,6 @@ import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.config.Secrets;
 import io.github.ifnesi.kafcacheql.kafka.ClientIds;
 import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
-import io.github.ifnesi.kafcacheql.schema.AvroJsonConverter;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -50,6 +49,7 @@ public final class SyncWorker implements AutoCloseable {
 
     /** Deterministic interleavings for integration tests; hooks run outside write transactions. */
     public interface Hooks {
+        default void beforePrepare(SyncPlan plan) throws SQLException {}
         default void beforeFetch(SyncPlan plan) throws SQLException {}
         default void beforeCommit(SyncBatch batch) throws SQLException {}
         default void afterCommit(SyncBatch batch) throws SQLException {}
@@ -219,47 +219,59 @@ public final class SyncWorker implements AutoCloseable {
         });
     }
 
+    void delete(String topic, java.util.OptionalLong generation, Execution execution) throws SQLException {
+        submit(execution, () -> {
+            if (!TopicRegistry.delete(cache, topic, generation, execution::check)) throw new StaleGeneration(topic);
+            return null;
+        });
+    }
+
     private long fetch(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize) throws SQLException {
         execution.check();
-        long generation;
         var observed = TopicRegistry.observe(cache.writer(), plan.topic().name());
-        if (plan.generation().isEmpty() || observed.isPresent() && observed.get().deleted()) {
-            long before = changes();
-            generation = TopicRegistry.register(cache, plan.generation(), plan.topic(), config.topic(plan.topic().name()),
-                    AvroJsonConverter.VERSION, execution::check).orElseThrow(() -> new StaleGeneration(plan.topic().name())).id();
-            syncWrote |= changes() != before;
-        } else {
-            generation = plan.generation().getAsLong();
-            if (observed.isEmpty() || observed.get().id() != generation) throw new StaleGeneration(plan.topic().name());
+        if (plan.generation().isPresent() && (observed.isEmpty() || observed.get().id() != plan.generation().getAsLong())) {
+            throw new StaleGeneration(plan.topic().name());
         }
-        if (observed.isPresent() && !observed.get().deleted() && observed.get().partitions() < plan.topic().partitions()) {
-            transaction(plan, generation, execution, () -> {
-                TopicRegistry.addPartitions(cache.writer(), generation, plan.topic().partitions());
-                return null;
-            });
+        long generation;
+        if (plan.generation().isEmpty() || observed.orElseThrow().deleted()
+                || observed.get().partitions() < plan.topic().partitions()
+                || TopicRegistry.rebuildReason(cache.writer(), observed.get().id(), plan.topic(), config.topic(plan.topic().name()),
+                        plan.logStarts()).isPresent()) {
+            hooks.beforePrepare(plan);
+            long before = changes();
+            generation = TopicRegistry.prepare(cache, plan.generation(), plan.deleted(), plan.topic(), config.topic(plan.topic().name()),
+                    plan.logStarts(), execution::check)
+                    .orElseThrow(() -> new StaleGeneration(plan.topic().name())).id();
+            syncWrote |= changes() != before;
+        } else generation = plan.generation().getAsLong();
+        Map<Integer, Long> baselines = Map.of();
+        if (plan.topic().mode() == Mode.COMPACTED) {
+            baselines = PartitionStore.safetyBaselines(cache.writer(), generation);
+            requireGeneration(cache.writer(), plan.topic().name(), generation);
         }
         if (config.cachePruneExpired() && plan.topic().mode() == Mode.APPEND
                 && plan.logStarts().values().stream().anyMatch(start -> start > 0)) {
             prune(plan, generation, execution, batchSize);
         }
         for (var partition : plan.windows().entrySet()) {
+            long baseline = plan.topic().mode() == Mode.COMPACTED ? baselines.get(partition.getKey()) : 0;
             var missing = RangeStore.missing(cache.writer(), generation, partition.getKey(), partition.getValue());
             if (partition.getValue().isEmpty()) {
                 long end = plan.ends().offsets().get(partition.getKey());
-                commit(new SyncBatch(plan, generation, partition.getKey(), end, end, true, List.of()), execution, writer);
+                commit(new SyncBatch(plan, generation, partition.getKey(), end, end, true, List.of()), baseline, execution, writer);
             } else if (missing.isEmpty() && plan.topic().mode() == Mode.COMPACTED) {
                 caughtUp(plan.topic().name(), generation, partition.getKey(), plan.ends().capturedAtMs());
             }
             for (Range<Long> range : missing.asRanges()) {
                 hooks.beforeFetch(plan);
-                fetchRange(plan, generation, partition.getKey(), range, execution, writer, batchSize);
+                fetchRange(plan, generation, partition.getKey(), range, baseline, execution, writer, batchSize);
             }
         }
         return generation;
     }
 
     private void fetchRange(SyncPlan plan, long generation, int partition, Range<Long> range,
-                            Execution execution, BatchWriter writer, int batchSize) throws SQLException {
+                            long baseline, Execution execution, BatchWriter writer, int batchSize) throws SQLException {
         ensureConsumer();
         execution.check();
         TopicPartition tp = new TopicPartition(plan.topic().name(), partition);
@@ -283,7 +295,7 @@ public final class SyncWorker implements AutoCloseable {
                     execution.check();
                     if (batch.size() == batchSize) {
                         long batchEnd = batch.getLast().offset() + 1;
-                        commit(new SyncBatch(plan, generation, partition, start, batchEnd, false, batch), execution, writer);
+                        commit(new SyncBatch(plan, generation, partition, start, batchEnd, false, batch), baseline, execution, writer);
                         start = batchEnd;
                         batch.clear();
                     }
@@ -292,12 +304,12 @@ public final class SyncWorker implements AutoCloseable {
                 }
                 if (position >= end) {
                     if (start < end) commit(new SyncBatch(plan, generation, partition, start, end,
-                            end == plan.ends().offsets().get(partition), batch), execution, writer);
+                            end == plan.ends().offsets().get(partition), batch), baseline, execution, writer);
                     start = end;
                 }
                 log.debug("{} partition {}: {} records fetched, {} offsets remaining", tp.topic(), partition, fetched, end - position);
             }
-        } catch (OffsetOutOfRangeException expired) {
+        } catch (OffsetOutOfRangeException | org.apache.kafka.common.errors.UnknownTopicOrPartitionException expired) {
             // The read-side validity planner owns §9's append-prune/compacted-rebuild decision.
             throw new StaleGeneration(tp.topic());
         } catch (RuntimeException failure) {
@@ -337,10 +349,16 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    private void commit(SyncBatch batch, Execution execution, BatchWriter writer) throws SQLException {
+    private void commit(SyncBatch batch, long baseline, Execution execution, BatchWriter writer) throws SQLException {
         hooks.beforeCommit(batch);
         transaction(batch.plan(), batch.generation(), execution, () -> {
             writer.write(cache.writer(), batch);
+            // Roll back every compacted batch if fetching outlived its original safety baseline.
+            // The unchanged baseline makes the existing validity check rebuild on the bounded replan.
+            if (batch.plan().topic().mode() == Mode.COMPACTED
+                    && System.currentTimeMillis() - baseline > batch.plan().topic().deleteRetentionMs()) {
+                throw new StaleGeneration(batch.plan().topic().name());
+            }
             return null;
         });
         hooks.afterCommit(batch);
@@ -407,7 +425,7 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    static void requireGeneration(Connection reader, String topic, long generation) throws SQLException {
+    public static void requireGeneration(Connection reader, String topic, long generation) throws SQLException {
         var current = TopicRegistry.observe(reader, topic);
         if (current.isEmpty() || current.get().id() != generation || current.get().deleted()) throw new StaleGeneration(topic);
     }

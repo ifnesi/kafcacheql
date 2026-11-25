@@ -16,8 +16,6 @@ public enum DriverProperty {
             "Window for append-topic queries without an _offset or _timestamp bound: a duration (500ms, 90s, 15m, 1h, 2d) or all."),
     APPEND_DEFAULT_WINDOW_MAX_RECORDS("append.default.window.max.records", "10000",
             "Per-partition cap on the default window; whichever limit is smaller wins."),
-    TIMESTAMP_SKEW_MS("timestamp.skew.ms", "60000",
-            "How far past offsetsForTimes(t) to read for _timestamp < t on CreateTime topics."),
     MAX_STALENESS_MS("max.staleness.ms", "0",
             "Skip the Kafka offsets check if the topic was checked within this time; 0 checks on every query."),
     OFFLINE("offline", "false",

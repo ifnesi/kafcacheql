@@ -171,7 +171,14 @@ class TestStackIT {
         String topic = TestStack.uniqueTopic("recreate");
         TestStack.createTopic(topic, 1, Map.of());
         Uuid before = TestStack.topicId(topic);
-        TestStack.recreateTopic(topic, 1, Map.of());
+        TestStack.sendString(topic, "old", "old", null);
+        try (var logs = LogCapture.capture()) {
+            TestStack.recreateTopic(topic, 1, Map.of());
+            TestStack.sendString(topic, "new", "new", null);
+            assertEquals(List.of("new"), TestStack.readAll(topic, true).stream().map(r -> utf8(r.value())).toList());
+            assertTrue(logs.lines().stream().noneMatch(line -> line.startsWith("WARN ") && line.contains("UNKNOWN_TOPIC_ID")),
+                    logs.lines().toString());
+        }
         assertNotEquals(before, TestStack.topicId(topic));
         TestStack.deleteTopic(topic);
         assertTrue(!TestStack.topicExists(topic));

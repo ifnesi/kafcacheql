@@ -49,7 +49,7 @@ public record TopicInfo(
         }
         Mode mode = overrides.mode().orElseThrow(() -> ConfigErrors.problem("The configs of topic " + name
                 + " can't be read (no DescribeConfigs permission): set topic." + name + ".mode to append or compacted"));
-        // CreateTime is the cautious guess: it is the one whose upper bounds need the skew margin.
+        // CreateTime is the cautious guess: its timestamp upper bounds never limit the fetch.
         return new TopicInfo(name, topicId, partitions, mode,
                 overrides.deleteRetentionMs().orElse(DEFAULT_DELETE_RETENTION_MS), TimestampType.CREATE_TIME, false);
     }
