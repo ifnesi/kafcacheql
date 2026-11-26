@@ -14,6 +14,7 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.zaxxer.hikari.HikariPoolMXBean;
 import io.github.ifnesi.kafcacheql.cache.StorageDdl;
+import io.github.ifnesi.kafcacheql.cache.TopicRegistry;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.kafka.KafkaClients;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
@@ -83,6 +84,358 @@ class JdbcIT {
         var result = new ArrayList<Integer>();
         while (rows.next()) result.add(rows.getInt(1));
         return result;
+    }
+
+    /** 0016b / PLAN §10: used SQLite pages, oldest append records across topics/partitions first,
+     * then whole compacted topics in last-query order; evicted ranges can be fetched again.
+     * Eviction waits for the checked reader snapshot, so that query still sees all its records.
+     * Append cache retention expires old timestamps independently of Kafka and the size limit;
+     * unset means no age expiry, compacted state stays whole, and expired ranges can be fetched again.
+     * The used-page limit also applies to cache-only queries after reopening an oversized cache.
+     */
+    @Test void sizeLimitEvictsOldestAppendRowsThenWholeCompactedTopicsAndRefetches() throws Exception {
+        String a = topic("delete"), b = topic("delete"), cold = topic("compact"), hot = topic("compact");
+        // Two partitions and out-of-order timestamps ensure eviction cannot just trim an offset prefix.
+        TestStack.addPartitions(a, 2); TestStack.addPartitions(b, 2);
+        String payload = "x".repeat(32_000);
+        long now = TestStack.recent(0), limit = 512 * 1024;
+        for (String topic : List.of(cold, hot)) for (int i = 0; i < 5; i++)
+            TestStack.send(topic, 0, now + i, TestStack.utf8("k" + i), TestStack.utf8(payload), null);
+        int[] ranks = {9, 1, 7, 3, 11, 5};
+        for (int i = 0; i < ranks.length; i++) for (String topic : List.of(a, b))
+            TestStack.send(topic, i % 2, now + ranks[i] + (topic.equals(b) ? 1 : 0),
+                    TestStack.utf8("k" + i), TestStack.utf8(payload), null);
+        var p = settings(); p.setProperty("cache.max.bytes", Long.toString(limit));
+        p.setProperty("sync.batch.records", "2"); p.setProperty("max.poll.records", "2");
+        try (var c = DriverManager.getConnection(URL, p); var cache = CacheContext.acquire(DriverConfig.load(URL, p));
+             var s = c.createStatement()) {
+            for (String topic : List.of(cold, hot)) try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(topic))) {
+                assertEquals(List.of(0, 1, 2, 3, 4), values(r));
+            }
+            assertTrue(usedBytes(cache) < limit, "compacted data alone initially fits");
+            try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(a) + " UNION ALL SELECT _offset FROM " + StorageDdl.quote(b))) {
+                int count = 0; while (r.next()) count++; assertEquals(12, count, "the reader survives eviction of its own rows");
+            }
+            TestStack.await(() -> usedBytes(cache) <= limit, "append eviction reaches the used-page limit");
+            var remaining = cache.read(reader -> {
+                var times = new ArrayList<Long>();
+                for (String topic : List.of(a, b)) {
+                    long id = TopicRegistry.generation(reader, topic).orElseThrow();
+                    try (var q = reader.createStatement(); var r = q.executeQuery("SELECT _timestamp FROM " + StorageDdl.quote(StorageDdl.tableName(id)))) {
+                        while (r.next()) times.add(r.getLong(1) - now);
+                    }
+                }
+                Collections.sort(times); return times;
+            });
+            assertFalse(remaining.isEmpty()); assertTrue(remaining.size() < 12);
+            assertEquals(java.util.stream.LongStream.rangeClosed(13 - remaining.size(), 12).boxed().toList(), remaining);
+            for (String topic : List.of(cold, hot)) assertEquals(5, cachedCount(cache, topic));
+            cache.read(reader -> {
+                try (var q = reader.createStatement(); var r = q.executeQuery("SELECT max(pruned_below) FROM \"$partitions\"")) {
+                    assertTrue(r.next()); assertEquals(0, r.getLong(1));
+                }
+                return null;
+            });
+            var fetched = new AtomicInteger();
+            cache.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) { fetched.addAndGet(batch.records().size()); } });
+            try (var r = s.executeQuery("SELECT _timestamp FROM " + StorageDdl.quote(a) + " WHERE _partition=1 AND _offset>=0 AND _offset<1")) {
+                assertTrue(r.next()); assertEquals(now + 1, r.getLong(1)); assertFalse(r.next());
+            }
+            assertEquals(1, fetched.get(), "the evicted offset is fetched again, without a pruning floor blocking it");
+            TestStack.await(() -> usedBytes(cache) <= limit, "refetch eviction completes");
+            long hotId = cache.read(reader -> TopicRegistry.generation(reader, hot).orElseThrow());
+            // cold was created/queried first, but touching it now makes hot the least recently queried.
+            try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(cold))) { assertEquals(5, values(r).size()); }
+            TestStack.await(() -> cacheLastQuery(cache, cold) > cacheLastQuery(cache, hot), "last query timestamps are persisted");
+            for (int i = 5; i < 11; i++) TestStack.send(cold, 0, now + i,
+                    TestStack.utf8("k" + i), TestStack.utf8(payload), null);
+            try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(cold))) { assertEquals(11, values(r).size()); }
+            TestStack.await(() -> cacheDeleted(cache, hot), "the least recently queried compacted topic is evicted whole");
+            assertEquals(0, cachedCount(cache, a)); assertEquals(0, cachedCount(cache, b)); assertEquals(11, cachedCount(cache, cold));
+            assertTrue(usedBytes(cache) <= limit);
+            cache.read(reader -> { assertTrue(TopicRegistry.resolve(reader, hot).isEmpty()); return null; });
+            fetched.set(0);
+            try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(hot))) { assertEquals(List.of(0, 1, 2, 3, 4), values(r)); }
+            assertEquals(5, fetched.get());
+            assertTrue(cache.read(reader -> TopicRegistry.generation(reader, hot).orElseThrow()) > hotId);
+            TestStack.await(() -> cacheDeleted(cache, cold), "refetched compacted state evicts the older whole topic");
+            assertEquals(5, cachedCount(cache, hot)); assertTrue(usedBytes(cache) <= limit);
+        }
+        // No record or whole compacted topic can reclaim the cache's own metadata pages.
+        p.setProperty("cache.max.bytes", "1");
+        TestStack.send(hot, 0, now + 20, TestStack.utf8("last"), TestStack.utf8(payload), null);
+        try (var logs = LogCapture.capture(); var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+             var cache = CacheContext.acquire(DriverConfig.load(URL, p)); var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(hot))) {
+            assertEquals(6, values(r).size());
+            TestStack.await(() -> logs.lines().stream().anyMatch(line -> line.startsWith("WARN ") && line.contains("cache.max.bytes")), "one warning when nothing can be evicted");
+            assertEquals(1, logs.lines().stream().filter(line -> line.startsWith("WARN ") && line.contains("cache.max.bytes")).count());
+            assertTrue(usedBytes(cache) > 1);
+        }
+        // Cancellation commits a batch but opens no reader snapshot. Reopening must still enforce the limit.
+        p.setProperty("cache.path", dir.resolve("reopened.db").toString());
+        String cachedWindow = "SELECT _offset FROM " + StorageDdl.quote(a) + " WHERE _partition=0 AND _offset>=0 AND _offset<2";
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+             var cache = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            cache.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) throws SQLException { s.cancel(); } });
+            assertEquals("57014", assertThrows(SQLException.class, () -> s.executeQuery(cachedWindow)).getSQLState());
+            assertEquals(2, cachedCount(cache, a)); assertTrue(usedBytes(cache) > 1);
+        }
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+             var cache = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            var fetched = new AtomicInteger();
+            cache.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) { fetched.addAndGet(batch.records().size()); } });
+            try (var r = s.executeQuery(cachedWindow)) { assertEquals(List.of(0, 1), values(r)); }
+            assertEquals(0, fetched.get(), "the reopened query reads only cached records");
+            TestStack.await(() -> {
+                try { return cachedCount(cache, a) == 0; }
+                catch (SQLException e) { throw new IllegalStateException(e); }
+            }, "a cache-only query evicts data left over the limit by an earlier process");
+        }
+        // Reuse the Kafka data in a fresh, unlimited cache: old timestamps occur between newer offsets.
+        long old = now - TimeUnit.HOURS.toMillis(2);
+        for (String topic : List.of(a, b)) {
+            TestStack.send(topic, 0, old, TestStack.utf8("old"), TestStack.utf8(payload), null);
+            TestStack.send(topic, 0, now, TestStack.utf8("new"), TestStack.utf8(payload), null);
+        }
+        TestStack.send(hot, 0, old, TestStack.utf8("old"), TestStack.utf8(payload), null);
+        p.remove("cache.max.bytes"); p.setProperty("cache.path", dir.resolve("age.db").toString());
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+             var cache = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            for (String topic : List.of(a, b, hot)) {
+                try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(topic))) {
+                    assertEquals(topic.equals(hot) ? 7 : 8, values(r).size());
+                }
+                assertEquals(topic.equals(hot) ? 7 : 8, cachedCount(cache, topic), "age expiry is unset by default");
+            }
+        }
+        p.setProperty("cache.retention.hours", "1");
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+             var cache = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            var fetched = new AtomicInteger();
+            cache.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) { fetched.addAndGet(batch.records().size()); } });
+            try (var r = s.executeQuery("SELECT _offset FROM " + StorageDdl.quote(a)
+                    + " UNION ALL SELECT _offset FROM " + StorageDdl.quote(b)
+                    + " UNION ALL SELECT _offset FROM " + StorageDdl.quote(hot))) {
+                assertEquals(23, values(r).size(), "age expiry also waits for the query snapshot");
+            }
+            var different = new Properties(); different.putAll(p); different.setProperty("cache.retention.hours", "2");
+            assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, different))
+                    .getMessage().contains("cache.retention.hours"));
+            assertEquals(0, fetched.get(), "age expiry runs even when a query fetches no new records");
+            TestStack.await(() -> {
+                try { return cachedCount(cache, a) == 7 && cachedCount(cache, b) == 7; }
+                catch (SQLException e) { throw new IllegalStateException(e); }
+            }, "only old append timestamps expire, without a size limit");
+            assertEquals(7, cachedCount(cache, hot), "old compacted values never expire individually");
+            try (var r = s.executeQuery("SELECT _timestamp FROM " + StorageDdl.quote(a)
+                    + " WHERE _partition=0 AND _offset>=3 AND _offset<4")) {
+                assertTrue(r.next()); assertEquals(old, r.getLong(1)); assertFalse(r.next());
+            }
+            assertEquals(1, fetched.get(), "Kafka still has the age-expired record and it can be fetched again");
+            cache.read(reader -> {
+                try (var q = reader.createStatement(); var r = q.executeQuery("SELECT max(pruned_below) FROM \"$partitions\"")) {
+                    assertTrue(r.next()); assertEquals(0, r.getLong(1));
+                }
+                return null;
+            });
+        }
+    }
+
+    private static long usedBytes(CacheContext.Lease cache) {
+        try { return cache.read(reader -> {
+            try (var q = reader.createStatement(); var r = q.executeQuery("SELECT (page_count-freelist_count)*page_size FROM pragma_page_count(),pragma_freelist_count(),pragma_page_size()")) {
+                r.next(); return r.getLong(1);
+            }
+        }); } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    private static int cachedCount(CacheContext.Lease cache, String topic) throws SQLException {
+        return cache.read(reader -> {
+            long id = TopicRegistry.generation(reader, topic).orElseThrow();
+            try (var q = reader.createStatement(); var r = q.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(StorageDdl.tableName(id)))) { r.next(); return r.getInt(1); }
+        });
+    }
+    private static boolean cacheDeleted(CacheContext.Lease cache, String topic) {
+        try { return cache.read(reader -> TopicRegistry.observe(reader, topic).orElseThrow().deleted()); }
+        catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    private static long cacheLastQuery(CacheContext.Lease cache, String topic) {
+        try { return cache.read(reader -> {
+            try (var q = reader.prepareStatement("SELECT last_query_ms FROM \"$topics\" WHERE topic=?")) {
+                q.setString(1, topic); try (var r = q.executeQuery()) { r.next(); return r.getLong(1); }
+            }
+        }); } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+
+    /** 0007c / PLAN §6.5: a newer compacted value replaces its key; only a Kafka null deletes it.
+     * §7.1: failed decoding stores base64 and an error. §9: a cached offset below log start rebuilds
+     * a compacted topic, including compact,delete retention without tombstones.
+     */
+    @Test void compactedRetentionFailedUpdatesAndJsonNull() throws Exception {
+        String topic = TestStack.uniqueTopic("jdbc-compact-edges"), table = StorageDdl.quote(topic);
+        TestStack.createTopic(topic, 1, Map.of("cleanup.policy", "compact,delete", "retention.ms", "-1",
+                "segment.ms", "1000", "file.delete.delay.ms", "0"));
+        var p = settings(); p.setProperty("topic." + topic + ".value.format", "json");
+        for (String key : List.of("bad", "json-null", "expired")) {
+            TestStack.sendJson(topic, key, "{\"status\":\"old\"}", TestStack.recent(0));
+        }
+        try (var c = DriverManager.getConnection(URL, p); var statement = c.createStatement();
+             var control = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            try (var rows = statement.executeQuery("SELECT count(*) FROM " + table)) { assertTrue(rows.next()); assertEquals(3, rows.getInt(1)); }
+            TestStack.sendJson(topic, "bad", "not-json", TestStack.recent(1));
+            TestStack.sendJson(topic, "json-null", "null", TestStack.recent(2));
+            try (var rows = statement.executeQuery("SELECT _key ->> '$',_offset,_value,_decode_error FROM " + table + " ORDER BY _offset")) {
+                assertTrue(rows.next()); assertEquals("expired", rows.getString(1)); assertEquals(2, rows.getLong(2));
+                assertEquals("{\"status\":\"old\"}", rows.getString(3)); assertNull(rows.getString(4));
+                assertTrue(rows.next()); assertEquals("bad", rows.getString(1)); assertEquals(3, rows.getLong(2));
+                assertEquals("\"" + Base64.getEncoder().encodeToString(TestStack.utf8("not-json")) + "\"", rows.getString(3));
+                assertNotNull(rows.getString(4));
+                assertTrue(rows.next()); assertEquals("json-null", rows.getString(1)); assertEquals(4, rows.getLong(2));
+                assertEquals("null", rows.getString(3)); assertFalse(rows.wasNull()); assertNull(rows.getString(4));
+                assertFalse(rows.next());
+            }
+            // A future timestamp rolls a fresh segment and keeps its row while the old segment expires.
+            TestStack.sendJson(topic, "tail", "{\"status\":\"kept\"}", System.currentTimeMillis() + 120_000);
+            try (var rows = statement.executeQuery("SELECT count(*) FROM " + table)) { assertTrue(rows.next()); assertEquals(4, rows.getInt(1)); }
+            long generation = control.read(r -> io.github.ifnesi.kafcacheql.cache.TopicRegistry.generation(r, topic).orElseThrow());
+            var resource = new org.apache.kafka.common.config.ConfigResource(org.apache.kafka.common.config.ConfigResource.Type.TOPIC, topic);
+            TestStack.admin().incrementalAlterConfigs(Map.of(resource, List.of(new org.apache.kafka.clients.admin.AlterConfigOp(
+                    new org.apache.kafka.clients.admin.ConfigEntry("retention.ms", "1000"), org.apache.kafka.clients.admin.AlterConfigOp.OpType.SET))))
+                    .all().get(10, TimeUnit.SECONDS);
+            var partition = new org.apache.kafka.common.TopicPartition(topic, 0);
+            TestStack.await(() -> {
+                try { return TestStack.admin().listOffsets(Map.of(partition, OffsetSpec.earliest())).all().get(10, TimeUnit.SECONDS)
+                        .get(partition).offset() == 5; }
+                catch (Exception e) { throw new IllegalStateException(e); }
+            }, "retention removes compact,delete records without tombstones");
+            try (var logs = LogCapture.capture(); var rows = statement.executeQuery("SELECT status,_offset FROM " + table)) {
+                assertTrue(rows.next()); assertEquals("kept", rows.getString(1)); assertEquals(5, rows.getLong(2)); assertFalse(rows.next());
+                assertTrue(logs.lines().stream().anyMatch(line -> line.startsWith("WARN ") && line.contains(topic)
+                        && line.contains("log start")), logs.lines().toString());
+            }
+            assertTrue(control.read(r -> io.github.ifnesi.kafcacheql.cache.TopicRegistry.generation(r, topic).orElseThrow()) > generation);
+        }
+    }
+
+    /** 0012b / PLAN §12.1–12.2: Refresh lists Kafka topics and queues missing cached topics for deletion
+     * without waiting or making another Kafka call. §10.1: an older observation cannot delete a newer generation.
+     * §9: deletion drops storage, view, ranges and partitions, retaining the generation with deleted_ms.
+     * §10.1: busy background writes are logged and dropped; closing never waits for another process's lock.
+     */
+    @SuppressWarnings("try") // Explicit close is checked while the other process still holds its lock.
+    @Test void metadataRefreshDropsMissingTopicsButNotRecreatedGenerations() throws Exception {
+        String base = TestStack.uniqueTopic("jdbc-refresh"), gone = base + "-gone", race = base + "-race", busy = base + "-busy";
+        for (String topic : List.of(gone, race, busy)) {
+            TestStack.createTopic(topic, 1, Map.of()); send(topic, 1, null);
+        }
+        var p = settings(); p.setProperty("topics.include", Pattern.quote(base) + ".*");
+        p.setProperty("topics.exclude", Pattern.quote(busy));
+        var config = DriverConfig.load(URL, p);
+        try (var c = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(config);
+             var clients = KafkaClients.acquire(config); var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (String topic : List.of(gone, race, busy)) {
+                try (var s = c.createStatement(); var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(topic))) { assertEquals(List.of(1), values(r)); }
+            }
+            long goneId = control.read(r -> TopicRegistry.generation(r, gone).orElseThrow());
+            long raceId = control.read(r -> TopicRegistry.generation(r, race).orElseThrow());
+            long busyId = control.read(r -> TopicRegistry.generation(r, busy).orElseThrow());
+            var paused = new CountDownLatch(1); var release = new CountDownLatch(1);
+            control.hooks(new SyncWorker.Hooks() {
+                @Override public void beforeCommit(SyncBatch batch) throws SQLException {
+                    if (!batch.plan().topic().name().equals(busy)) return;
+                    paused.countDown();
+                    try { if (!release.await(20, TimeUnit.SECONDS)) throw new SQLException("Test did not release worker"); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new SQLException(e); }
+                }
+            });
+            send(busy, 2, null);
+            var syncing = executor.submit(() -> {
+                try (var other = DriverManager.getConnection(URL, p); var s = other.createStatement();
+                     var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(busy) + " ORDER BY _offset")) { return values(r); }
+            });
+            try {
+                assertTrue(paused.await(10, TimeUnit.SECONDS));
+                TestStack.deleteTopic(gone); TestStack.deleteTopic(race);
+                Field admin = KafkaClients.class.getDeclaredField("admin"); admin.setAccessible(true);
+                Admin original = (Admin) admin.get(clients.clients());
+                var calls = new ArrayList<String>();
+                admin.set(clients.clients(), Proxy.newProxyInstance(Admin.class.getClassLoader(), new Class<?>[] {Admin.class}, (self, method, args) -> {
+                    calls.add(method.getName());
+                    try { return method.invoke(original, args); }
+                    catch (InvocationTargetException e) { throw e.getCause(); }
+                }));
+                try {
+                    var refresh = executor.submit(() -> {
+                        var names = new HashSet<String>();
+                        try (var rows = c.getMetaData().getTables(null, null, "%", null)) { while (rows.next()) names.add(rows.getString("TABLE_NAME")); }
+                        return names;
+                    });
+                    assertEquals(Set.of(), refresh.get(5, TimeUnit.SECONDS));
+                    assertEquals(List.of("listTopics"), calls);
+                    assertEquals(1, release.getCount(), "Refresh returned while the worker remained paused");
+                } finally { admin.set(clients.clients(), original); }
+                assertFalse(control.<Boolean>read(r -> TopicRegistry.observe(r, gone).orElseThrow().deleted()));
+                TestStack.createTopic(race, 1, Map.of()); send(race, 9, null);
+                Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+                        System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sql.PipelineProcess.class.getName(),
+                        control.path().toString(), race, "jdbc").redirectError(ProcessBuilder.Redirect.INHERIT).start();
+                try {
+                    assertTrue(child.waitFor(15, TimeUnit.SECONDS)); assertEquals(0, child.exitValue());
+                    assertEquals("ROW 9", new String(child.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim());
+                } finally { child.destroyForcibly(); }
+                assertTrue(control.read(r -> TopicRegistry.generation(r, race).orElseThrow()) > raceId);
+            } finally { release.countDown(); }
+            assertEquals(List.of(1, 2), syncing.get(10, TimeUnit.SECONDS));
+            control.hooks(new SyncWorker.Hooks() {});
+            TestStack.await(() -> {
+                try { return control.read(r -> TopicRegistry.observe(r, gone).orElseThrow().deleted()); }
+                catch (SQLException e) { throw new IllegalStateException(e); }
+            }, "Refresh drops the missing cached topic");
+            // The other queued drop was already scheduled before the missing topic's deletion committed.
+            try (var execution = new Execution(java.time.Duration.ofSeconds(10))) { control.write(busy, busyId, execution, w -> null); }
+            var deleted = control.read(r -> TopicRegistry.observe(r, gone).orElseThrow());
+            assertEquals(goneId, deleted.id()); assertTrue(deleted.deleted());
+            control.read(r -> {
+                assertTrue(TopicRegistry.resolve(r, gone).isEmpty());
+                try (var s = r.createStatement(); var rows = s.executeQuery("SELECT count(*) FROM sqlite_schema WHERE name="
+                        + "'" + StorageDdl.tableName(goneId) + "'")) { assertTrue(rows.next()); assertEquals(0, rows.getInt(1)); }
+                for (String table : List.of("$ranges", "$partitions")) {
+                    try (var s = r.createStatement(); var rows = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(table) + " WHERE topic_ref=" + goneId)) {
+                        assertTrue(rows.next()); assertEquals(0, rows.getInt(1));
+                    }
+                }
+                assertFalse(TopicRegistry.observe(r, race).orElseThrow().deleted());
+                assertTrue(TopicRegistry.generation(r, race).orElseThrow() > raceId);
+                assertEquals(busyId, TopicRegistry.generation(r, busy).orElseThrow(), "metadata filters do not delete a listed topic");
+                return null;
+            });
+            try (var rows = c.getMetaData().getColumns(null, null, gone, null)) { assertFalse(rows.next()); }
+            try (var s = c.createStatement(); var rows = s.executeQuery("SELECT n FROM " + StorageDdl.quote(race))) { assertEquals(List.of(9), values(rows)); }
+            TestStack.deleteTopic(race);
+            Process holder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+                    System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sync.SyncProcess.class.getName(),
+                    "lock", control.path().toString(), race, TestStack.BOOTSTRAP)
+                    .redirectError(ProcessBuilder.Redirect.INHERIT).start();
+            Future<?> close = null;
+            try (var logs = LogCapture.capture()) {
+                assertEquals("LOCKED", executor.submit(() -> holder.inputReader().readLine()).get(15, TimeUnit.SECONDS));
+                try (var rows = c.getMetaData().getTables(null, null, race, null)) { assertFalse(rows.next()); }
+                // Ensure the drop has started before closing: otherwise close could discard it unattempted.
+                TestStack.await(() -> logs.lines().stream().anyMatch(line -> line.contains("Dropped background cache write"))
+                        || Thread.getAllStackTraces().entrySet().stream().anyMatch(entry ->
+                            entry.getKey().getName().equals("kafcacheql-sync-" + control.path().getFileName())
+                            && Arrays.stream(entry.getValue()).anyMatch(frame -> frame.getClassName().equals(TopicRegistry.class.getName())
+                                    && frame.getMethodName().equals("delete"))), "the background drop attempts the held write lock");
+                close = executor.submit(() -> { c.close(); control.close(); return null; });
+                close.get(2, TimeUnit.SECONDS);
+                assertTrue(holder.isAlive(), "close finishes while the competing process still holds its lock");
+                assertTrue(logs.lines().stream().anyMatch(line -> line.startsWith("WARN ") && line.contains("Dropped background cache write")));
+            } finally {
+                holder.getOutputStream().write('\n'); holder.getOutputStream().flush();
+                try { assertTrue(holder.waitFor(5, TimeUnit.SECONDS)); assertEquals(0, holder.exitValue()); }
+                finally { holder.destroyForcibly(); }
+                if (close != null) close.get(10, TimeUnit.SECONDS);
+            }
+        }
     }
 
     /** 0016d / PLAN §8.4: a simple offset-descending literal LIMIT replaces the default window,

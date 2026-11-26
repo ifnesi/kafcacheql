@@ -265,17 +265,21 @@ class SyncWorkerIT {
             assertEquals(List.of(caughtUp), cache.read(c -> values(c,
                     "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)));
             // A current generation's newest pending value wins, and a later stale write cannot regress it.
-            cache.caughtUp(topic, replacement, 0, observedAt + 1000);
-            cache.caughtUp(topic, replacement, 0, observedAt + 999);
+            long stored = Long.parseLong(caughtUp);
+            cache.caughtUp(topic, replacement, 0, stored + 1000);
+            cache.caughtUp(topic, replacement, 0, stored + 999);
             cache.write(topic, replacement, execution, c -> null);
-            caughtUp = Long.toString(observedAt + 1000);
+            caughtUp = Long.toString(stored + 1000);
             assertEquals(List.of(caughtUp), cache.read(c -> values(c,
                     "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)));
             try (var logs = io.github.ifnesi.kafcacheql.testkit.LogCapture.capture()) {
                 Process holder = child("lock", cache.path(), topic);
                 try {
                     assertEquals("LOCKED", line(holder));
-                    cache.caughtUp(topic, replacement, 0, observedAt + 2000);
+                    long failedAt = stored + 2000;
+                    assertTrue(failedAt > Long.parseLong(cache.read(c -> values(c,
+                            "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)).getFirst()));
+                    cache.caughtUp(topic, replacement, 0, failedAt);
                     TestStack.await(() -> cache.pendingBackground() == 0, "failed update taken");
                     var barrier = CompletableFuture.supplyAsync(() -> {
                         try { return cache.write(topic, current, execution, c -> null); }
@@ -297,7 +301,10 @@ class SyncWorkerIT {
             var pendingSync = CompletableFuture.supplyAsync(() -> sync(cache, pending, execution, RecordStore::write));
             try {
                 assertTrue(closingHold.await(10, TimeUnit.SECONDS));
-                cache.caughtUp(topic, replacement, 0, observedAt + 3000);
+                long closingAt = stored + 3000;
+                assertTrue(closingAt > Long.parseLong(cache.read(c -> values(c,
+                        "SELECT caught_up_at_ms FROM \"$partitions\" WHERE topic_ref=" + current)).getFirst()));
+                cache.caughtUp(topic, replacement, 0, closingAt);
                 var close = CompletableFuture.runAsync(() -> {
                     try { cache.close(); } catch (SQLException e) { throw new java.util.concurrent.CompletionException(e); }
                 });

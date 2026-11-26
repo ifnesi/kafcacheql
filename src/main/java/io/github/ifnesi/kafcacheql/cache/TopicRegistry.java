@@ -209,12 +209,18 @@ public final class TopicRegistry {
 
     /** Keep the deleted generation as an observation guard; no Kafka operation occurs under the lock. */
     public static boolean delete(CacheStore cache, String topic, OptionalLong observed, CacheStore.Check check) throws SQLException {
+        return delete(cache, topic, observed, check, () -> true);
+    }
+
+    /** Eviction also rechecks its size/order decision under the same lock as the generation check. */
+    public static boolean delete(CacheStore cache, String topic, OptionalLong observed, CacheStore.Check check,
+                                 CacheStore.Write<Boolean> needed) throws SQLException {
         return CacheStore.writeTransaction(cache.writer(), check, () -> {
             Optional<Row> current = find(cache.writer(), topic);
             if (current.isEmpty()) return observed.isEmpty();
             Row row = current.get();
             if (observed.isEmpty() || observed.getAsLong() != row.id()) return false;
-            if (!row.deleted()) {
+            if (!row.deleted() && needed.run()) {
                 removeStorage(cache.writer(), row);
                 try (PreparedStatement p = cache.writer().prepareStatement("UPDATE \"$topics\" SET deleted_ms=? WHERE id=?")) {
                     p.setLong(1, System.currentTimeMillis()); p.setLong(2, row.id()); p.executeUpdate();

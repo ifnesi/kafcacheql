@@ -110,6 +110,26 @@ public final class RangeStore {
         }
     }
 
+    /** Eviction removes only these offsets, without raising the retention floor. */
+    public static void remove(Connection writer, long topicId, int partition, long start, long end) throws SQLException {
+        RangeSet<Long> remaining = TreeRangeSet.create();
+        try (var p = writer.prepareStatement("""
+                DELETE FROM "$ranges" WHERE topic_ref=? AND partition_no=? AND start_offset<? AND end_offset>?
+                RETURNING start_offset,end_offset
+                """)) {
+            bindPartition(p, topicId, partition); p.setLong(3, end); p.setLong(4, start);
+            try (var r = p.executeQuery()) { while (r.next()) remaining.add(Range.closedOpen(r.getLong(1), r.getLong(2))); }
+        }
+        remaining.remove(Range.closedOpen(start, end));
+        try (var p = writer.prepareStatement("INSERT INTO \"$ranges\" VALUES (?,?,?,?)")) {
+            bindPartition(p, topicId, partition);
+            for (var range : remaining.asRanges()) {
+                p.setLong(3, range.lowerEndpoint()); p.setLong(4, range.upperEndpoint()); p.addBatch();
+            }
+            p.executeBatch();
+        }
+    }
+
     private static void bindPartition(PreparedStatement p, long topicId, int partition) throws SQLException {
         p.setLong(1, topicId);
         p.setInt(2, partition);

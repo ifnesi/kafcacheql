@@ -2,6 +2,7 @@ package io.github.ifnesi.kafcacheql.sync;
 
 import com.google.common.collect.Range;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
+import io.github.ifnesi.kafcacheql.cache.EvictionStore;
 import io.github.ifnesi.kafcacheql.cache.PartitionStore;
 import io.github.ifnesi.kafcacheql.cache.RangeStore;
 import io.github.ifnesi.kafcacheql.cache.TopicRegistry;
@@ -77,19 +78,10 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    private record CaughtUp(String topic, long generation, int partition, long capturedAt) {
-        public Object key() { return List.of("caught-up", generation, partition); }
-        public long version() { return capturedAt; }
-        public void write(Connection writer) throws SQLException {
-            var current = TopicRegistry.observe(writer, topic);
-            if (current.isPresent() && current.get().id() == generation && !current.get().deleted()) {
-                PartitionStore.caughtUp(writer, generation, partition, capturedAt);
-            }
-        }
-    }
+    private record Background(Object key, long version, Work<Void> work) {}
 
     private final BlockingQueue<Runnable> queue = new LinkedBlockingQueue<>();
-    private final Map<Object, CaughtUp> background = new LinkedHashMap<>();
+    private final Map<Object, Background> background = new LinkedHashMap<>();
     private final Set<Job<?>> pending = new HashSet<>();
     private final Runnable backgroundTurn = this::backgroundTurn;
     private final Thread thread;
@@ -443,13 +435,79 @@ public final class SyncWorker implements AutoCloseable {
     }
 
     void caughtUp(String topic, long generation, int partition, long capturedAt) {
-        background(new CaughtUp(topic, generation, partition, capturedAt));
+        background(new Background(List.of("caught-up", generation, partition), capturedAt, () ->
+                CacheStore.writeTransaction(cache.writer(), () -> {
+                    var current = TopicRegistry.observe(cache.writer(), topic);
+                    if (current.isPresent() && current.get().id() == generation && !current.get().deleted()) {
+                        PartitionStore.caughtUp(cache.writer(), generation, partition, capturedAt);
+                    }
+                    return null;
+                })));
     }
 
-    private synchronized void background(CaughtUp write) {
+    void drop(String topic, long generation) {
+        background(new Background(List.of("drop", generation), 0, () -> {
+            TopicRegistry.delete(cache, topic, java.util.OptionalLong.of(generation), null);
+            return null;
+        }));
+    }
+
+    void queried(String topic, long generation, long at) {
+        background(new Background(List.of("last-query", generation), at, () ->
+                CacheStore.writeTransaction(cache.writer(), () -> {
+                    EvictionStore.queried(cache.writer(), topic, generation, at);
+                    return null;
+                })));
+    }
+
+    /** The caller already holds its checked read snapshot. A sync alone must never evict its window. */
+    void readerReady() {
+        if (config.cacheMaxBytes().isEmpty() && config.cacheRetentionHours().isEmpty()) return;
+        background(new Background("eviction", 0, () -> {
+            evict();
+            checkpoint();
+            return null;
+        }));
+    }
+
+    private void evict() throws SQLException {
+        if (config.cacheRetentionHours().isEmpty() && !overLimit()) return;
+        long cutoff = config.cacheRetentionHours().isPresent()
+                ? System.currentTimeMillis() - Duration.ofHours(config.cacheRetentionHours().getAsLong()).toMillis()
+                : Long.MIN_VALUE;
+        while (true) {
+            synchronized (this) { if (closing) return; }
+            boolean removed = CacheStore.writeTransaction(cache.writer(), () -> {
+                boolean oversized = overLimit();
+                var oldest = EvictionStore.oldestAppend(cache.writer());
+                if (oldest.isEmpty() || (!oversized && oldest.get().timestamp() >= cutoff)) return false;
+                var topic = oldest.get().topic();
+                long ceiling = oversized ? oldest.get().ceiling() : Math.min(oldest.get().ceiling(), cutoff - 1);
+                requireGeneration(cache.writer(), topic.name(), topic.generation());
+                return PartitionStore.evictChunk(cache.writer(), topic.generation(), ceiling, config.syncBatchRecords()) > 0;
+            });
+            if (removed) continue;
+            if (!overLimit()) return;
+            var oldest = EvictionStore.oldestCompacted(cache.writer());
+            if (oldest.isEmpty()) {
+                log.warn("Cache uses {} bytes, above cache.max.bytes={}; nothing remains to evict", CacheStore.usedBytes(cache.writer()), config.cacheMaxBytes().orElseThrow());
+                return;
+            }
+            var topic = oldest.get();
+            TopicRegistry.delete(cache, topic.name(), java.util.OptionalLong.of(topic.generation()), null, () ->
+                    overLimit() && EvictionStore.oldestAppend(cache.writer()).isEmpty()
+                    && EvictionStore.oldestCompacted(cache.writer()).map(t -> t.generation() == topic.generation()).orElse(false));
+        }
+    }
+
+    private boolean overLimit() throws SQLException {
+        return config.cacheMaxBytes().isPresent() && CacheStore.usedBytes(cache.writer()) > config.cacheMaxBytes().getAsLong();
+    }
+
+    private synchronized void background(Background write) {
         if (closing) return;
         Object key = write.key();
-        CaughtUp pending = background.get(key);
+        Background pending = background.get(key);
         if (pending != null && pending.version() >= write.version()) return;
         if (pending == null && background.size() >= 1000) return;
         boolean empty = background.isEmpty();
@@ -461,7 +519,7 @@ public final class SyncWorker implements AutoCloseable {
     synchronized int queuedRequests() { return pending.size() - (active == null ? 0 : 1); }
 
     private void backgroundTurn() {
-        CaughtUp write;
+        Background write;
         synchronized (this) {
             if (background.isEmpty() || closing) return;
             var iterator = background.values().iterator();
@@ -471,7 +529,7 @@ public final class SyncWorker implements AutoCloseable {
         }
         // Background copies are disposable; a busy lock or any other failure is logged and dropped.
         try {
-            CacheStore.writeTransaction(cache.writer(), () -> { write.write(cache.writer()); return null; });
+            write.work().run();
         } catch (SQLException | RuntimeException e) { log.warn("Dropped background cache write: {}", failure("Background write", e).getMessage()); }
     }
 

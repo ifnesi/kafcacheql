@@ -55,6 +55,8 @@ class DriverConfigTest {
         DriverConfig c = DriverConfig.load(URL, null);
         assertEquals(Optional.of("localhost:9092"), c.bootstrapServers());
         assertEquals(Optional.empty(), c.cachePath());
+        assertTrue(c.cacheMaxBytes().isEmpty());
+        assertTrue(c.cacheRetentionHours().isEmpty());
         assertEquals(Window.of(Duration.ofHours(1)), c.appendDefaultWindow());
         assertEquals(10_000, c.appendDefaultWindowMaxRecords());
         assertEquals(0, c.maxStalenessMs());
@@ -243,6 +245,9 @@ class DriverConfigTest {
                 "append.default.window.max.records,0", "append.default.window.max.records,-5",
                 "append.default.window.max.records,ten", "max.staleness.ms,1.5",
                 "sync.batch.records,0", "sync.batch.records,2147483648",
+                "cache.max.bytes,0", "cache.max.bytes,-1", "cache.max.bytes,1.5", "cache.max.bytes,9223372036854775808",
+                "cache.retention.hours,0", "cache.retention.hours,-1", "cache.retention.hours,1.5",
+                "cache.retention.hours,2562047788016", "cache.retention.hours,9223372036854775808",
                 "offline,yes", "metadata.show.internal,''",
                 "topics.include,(", "topics.exclude,[a-", "client.id,' '"})
         void badValuesNameTheProperty(String key, String value) {
@@ -261,9 +266,13 @@ class DriverConfigTest {
                     "topics.exclude", "",
                     "client.id", "my-app",
                     "sync.batch.records", "2147483647",
+                    "cache.max.bytes", "9223372036854775807",
+                    "cache.retention.hours", "24",
                     "cache.path", "~/c.db"));
             assertEquals(1, c.appendDefaultWindowMaxRecords());
             assertEquals(30_000, c.maxStalenessMs());
+            assertEquals(Long.MAX_VALUE, c.cacheMaxBytes().orElseThrow());
+            assertEquals(24, c.cacheRetentionHours().orElseThrow());
             assertTrue(c.metadataShowInternal());
             assertTrue(c.topicsInclude().matcher("orders.v1").matches());
             assertEquals("", c.topicsExclude().pattern());
@@ -275,7 +284,7 @@ class DriverConfigTest {
         @Test
         void driverPropertiesDontReachTheClients() throws SQLException {
             DriverConfig c = DriverConfig.load(URL + "?client.id=x&sync.batch.records=7&topic.t.mode=append"
-                    + "&security.protocol=SSL", null);
+                    + "&cache.retention.hours=1&security.protocol=SSL", null);
             assertEquals(Map.of("bootstrap.servers", "localhost:9092", "security.protocol", "SSL"), c.clientSettings());
         }
     }

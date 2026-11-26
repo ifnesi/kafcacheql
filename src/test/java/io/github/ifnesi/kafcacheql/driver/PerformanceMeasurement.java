@@ -12,6 +12,7 @@ import io.github.ifnesi.kafcacheql.sync.SyncPlan;
 import io.github.ifnesi.kafcacheql.sync.SyncWorker;
 import io.github.ifnesi.kafcacheql.testkit.TestStack;
 import java.io.PrintWriter;
+import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -24,6 +25,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -37,9 +41,11 @@ import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.MetricsReporter;
 import org.junit.jupiter.api.Test;
 
-/** PLAN §16/§18: measure full, unchanged and incremental JDBC queries, without performance thresholds.
+/** PLAN §16/§18 and 0013c: measure JDBC queries, fetch metrics and heap, without performance thresholds.
  * Deliberately matches neither *Test nor *IT: see docs/performance.md for the opt-in command.
  */
 class PerformanceMeasurement {
@@ -59,7 +65,7 @@ class PerformanceMeasurement {
                 Runtime.getRuntime().availableProcessors(), Runtime.getRuntime().maxMemory(), Runtime.version());
         List<String> created = new ArrayList<>();
         try (var report = new PrintWriter(Files.newBufferedWriter(output.resolve("queries.csv")))) {
-            report.println("topic,query,seconds,rows,fetched,batches,planning_s,fetch_decode_wait_s,commit_s,after_sync_s,checkpoint_s,db_bytes,wal_bytes,admin_calls");
+            report.println("topic,query,seconds,rows,committed_records,batches,planning_s,fetch_decode_wait_s,commit_s,after_sync_s,checkpoint_s,db_bytes,wal_bytes,kafka_bytes,kafka_records,heap_before_bytes,heap_after_bytes,admin_calls");
             for (boolean compacted : List.of(true, false)) {
                 String mode = compacted ? "compact" : "append";
                 String topic = TestStack.uniqueTopic("perf-" + mode);
@@ -67,26 +73,34 @@ class PerformanceMeasurement {
                 created.add(topic);
                 int records = compacted ? 1_000_000 : 3_000_000;
                 try (var producer = producer()) {
-                    produce(producer, topic, 0, records, false);
-                    if (!compacted) defaultWindow(topic, output, report);
+                    long timestampBase = System.currentTimeMillis() - records * 2L - 60_000;
+                    produce(producer, topic, 0, records, false, timestampBase);
+                    if (!compacted) defaultWindow(topic, records, timestampBase, output, report);
                     Path cache = output.resolve(mode + ".db");
                     Properties p = settings(cache);
                     var config = DriverConfig.load(URL, p);
+                    String sql = aggregate(topic) + " WHERE _offset>=0";
                     long opening = System.nanoTime();
                     try (var connection = DriverManager.getConnection(URL, p);
                          var control = CacheContext.acquire(config);
                          var clients = KafkaClients.acquire(config);
                          var calls = new Calls(clients.clients())) {
                         System.out.printf("PERF %s connection_open_s=%.3f%n", mode, seconds(System.nanoTime() - opening));
-                        String sql = "SELECT count(*),sum(id),sum(CASE WHEN status='updated' THEN 1 ELSE 0 END) FROM "
-                                + StorageDdl.quote(topic) + " WHERE _offset>=0";
-                        query(connection, control, calls, topic, "first", sql, records, 0, records, cache, output, report, true);
-                        query(connection, control, calls, topic, "unchanged", sql, records, 0, 0, cache, output, report, false);
-                        produce(producer, topic, compacted ? 0 : records, DELTA, true);
-                        query(connection, control, calls, topic, "delta", sql,
+                        query(connection, control, calls, topic, "first", sql, 0, records, 0, records, cache, output, report, true);
+                        query(connection, control, calls, topic, "unchanged", sql, 0, records, 0, 0, cache, output, report, false);
+                        produce(producer, topic, compacted ? 0 : records, DELTA, true,
+                                compacted ? timestampBase + records * 2L : timestampBase);
+                        query(connection, control, calls, topic, "delta", sql, 0,
                                 compacted ? records : records + DELTA, DELTA, DELTA, cache, output, report, false);
                     }
                     System.out.printf("PERF %s closed_cache_bytes=%d wal_bytes=%d%n", mode, size(cache), size(Path.of(cache + "-wal")));
+                    p.setProperty("offline", "true");
+                    try (var connection = DriverManager.getConnection("jdbc:kafcacheql://", p);
+                         var control = CacheContext.acquire(DriverConfig.load("jdbc:kafcacheql://", p))) {
+                        assertTrue(FetchMetrics.ACTIVE.isEmpty(), "offline opens no Kafka clients");
+                        query(connection, control, null, topic, "offline", sql, 0,
+                                compacted ? records : records + DELTA, DELTA, 0, cache, output, report, false);
+                    }
                 }
             }
         } finally {
@@ -104,6 +118,7 @@ class PerformanceMeasurement {
         var p = new Properties();
         p.setProperty("cache.path", cache.toString());
         p.setProperty("schema.registry.url", TestStack.REGISTRY);
+        p.setProperty("metric.reporters", FetchMetrics.class.getName());
         return p;
     }
 
@@ -119,7 +134,7 @@ class PerformanceMeasurement {
     }
 
     private static void produce(KafkaProducer<String, GenericData.Record> producer, String topic,
-                                int start, int count, boolean updated) {
+                                int start, int count, boolean updated, long timestampBase) {
         long begin = System.nanoTime();
         var failure = new AtomicReference<Exception>();
         for (int i = 0; i < count; i++) {
@@ -128,7 +143,7 @@ class PerformanceMeasurement {
             value.put("id", id); value.put("status", updated ? "updated" : "new");
             value.put("amount", id / 100.0); value.put("active", id % 2 == 0);
             // Explicit assignment makes every partition's load and default window reproducible.
-            producer.send(new ProducerRecord<>(topic, (int) (id % PARTITIONS), "key-" + id, value),
+            producer.send(new ProducerRecord<>(topic, (int) (id % PARTITIONS), timestampBase + id * 2, "key-" + id, value),
                     (metadata, error) -> { if (error != null) failure.compareAndSet(null, error); });
             if ((i + 1) % 100_000 == 0 || i + 1 == count) {
                 producer.flush();
@@ -139,29 +154,37 @@ class PerformanceMeasurement {
     }
 
     private static void query(Connection connection, CacheContext.Lease control, Calls calls, String topic,
-                              String label, String sql, long expectedRows, long expectedUpdated, long expectedFetched,
+                              String label, String sql, long firstId, long expectedRows, long expectedUpdated, long expectedFetched,
                               Path cache, Path output, PrintWriter report, boolean profile) throws Exception {
         var timings = new Timings(label);
-        control.hooks(timings); calls.reset();
+        control.hooks(timings); if (calls != null) calls.reset();
         try (var recording = profile ? new Recording(Configuration.getConfiguration("profile")) : null) {
             if (recording != null) recording.start();
-            long begin = System.nanoTime(), rows;
-            try (var statement = connection.createStatement(); var result = statement.executeQuery(sql)) {
-                assertTrue(result.next()); rows = result.getLong(1);
-                assertEquals(expectedRows, rows);
-                assertEquals(expectedRows * (expectedRows - 1) / 2, result.getLong(2));
-                assertEquals(expectedUpdated, result.getLong(3));
-                assertFalse(result.next());
-            }
+            var before = FetchMetrics.snapshot(); long heapBefore = heapUsed();
+            long begin = System.nanoTime();
+            long rows = aggregate(connection, sql, firstId, expectedRows, expectedUpdated);
             long end = System.nanoTime();
             assertEquals(expectedFetched, timings.fetched);
-            write(report, topic, label, begin, end, rows, timings, cache, calls);
+            write(report, topic, label, begin, end, rows, timings, cache, calls, before, heapBefore);
             if (recording != null) { recording.stop(); recording.dump(output.resolve(topic + "-" + label + ".jfr")); }
         }
     }
 
+    private static String aggregate(String topic) {
+        return "SELECT count(*),sum(id),sum(CASE WHEN status='updated' THEN 1 ELSE 0 END) FROM " + StorageDdl.quote(topic);
+    }
+
+    private static long aggregate(Connection connection, String sql, long firstId, long expectedRows, long expectedUpdated) throws Exception {
+        try (var statement = connection.createStatement(); var result = statement.executeQuery(sql)) {
+            assertTrue(result.next()); long rows = result.getLong(1);
+            assertEquals(expectedRows, rows);
+            assertEquals(expectedRows * (2 * firstId + expectedRows - 1) / 2, result.getLong(2));
+            assertEquals(expectedUpdated, result.getLong(3)); assertFalse(result.next()); return rows;
+        }
+    }
+
     /** Cold, ordinary SELECT (no bounds): the §18 large-append/default-window criterion, without a GUI. */
-    private static void defaultWindow(String topic, Path output, PrintWriter report) throws Exception {
+    private static void defaultWindow(String topic, int records, long timestampBase, Path output, PrintWriter report) throws Exception {
         Path cache = output.resolve("append-default.db");
         var p = settings(cache); var config = DriverConfig.load(URL, p);
         try (var connection = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(config);
@@ -169,6 +192,7 @@ class PerformanceMeasurement {
              var recording = new Recording(Configuration.getConfiguration("profile"))) {
             var timings = new Timings("default"); control.hooks(timings); calls.reset();
             recording.start();
+            var before = FetchMetrics.snapshot(); long heapBefore = heapUsed();
             long begin = System.nanoTime(), rows = 0;
             try (var statement = connection.createStatement();
                  var result = statement.executeQuery("SELECT * FROM " + StorageDdl.quote(topic))) {
@@ -177,21 +201,103 @@ class PerformanceMeasurement {
             }
             long end = System.nanoTime();
             assertEquals(30_000, rows); assertEquals(rows, timings.fetched);
-            write(report, topic, "default", begin, end, rows, timings, cache, calls);
+            write(report, topic, "default", begin, end, rows, timings, cache, calls, before, heapBefore);
             recording.stop(); recording.dump(output.resolve(topic + "-default.jfr"));
+            String recent = aggregate(topic) + " WHERE _timestamp>=" + (timestampBase + (records - 90_000L) * 2);
+            query(connection, control, calls, topic, "timestamp", recent, records - 90_000L, 90_000, 0, 60_000,
+                    cache, output, report, false);
+            query(connection, control, calls, topic, "timestamp-repeat", recent, records - 90_000L, 90_000, 0, 0,
+                    cache, output, report, false);
+            query(connection, control, calls, topic, "historical", aggregate(topic) + " WHERE _offset>=0 AND _offset<10000",
+                    0, 30_000, 0, 30_000, cache, output, report, false);
+            try (var other = DriverManager.getConnection(URL, p)) {
+                concurrent(connection, other, control, calls, topic, cache, report);
+            }
+        }
+    }
+
+    /** Two callers start together on the same uncached window; shared fetch metrics are reported once. */
+    private static void concurrent(Connection first, Connection second, CacheContext.Lease control, Calls calls,
+                                   String topic, Path cache, PrintWriter report) throws Exception {
+        var timings = new Timings("concurrent-pair"); control.hooks(timings); calls.reset();
+        var before = FetchMetrics.snapshot(); long heapBefore = heapUsed();
+        var start = new CountDownLatch(1);
+        try (var tasks = Executors.newVirtualThreadPerTaskExecutor()) {
+            var queries = new ArrayList<java.util.concurrent.Future<Long>>();
+            for (var connection : List.of(first, second)) queries.add(tasks.submit(() -> {
+                start.await(); long begin = System.nanoTime();
+                aggregate(connection, aggregate(topic) + " WHERE _offset>=10000 AND _offset<20000", 30_000, 30_000, 0);
+                return System.nanoTime() - begin;
+            }));
+            long begin = System.nanoTime(); start.countDown();
+            var durations = new ArrayList<Double>();
+            for (var query : queries) durations.add(seconds(query.get()));
+            long end = System.nanoTime();
+            assertEquals(30_000, timings.fetched, "the shared worker fetches the missing window once");
+            write(report, topic, "concurrent-pair", begin, end, 60_000, timings, cache, calls, before, heapBefore);
+            System.out.println("PERF concurrent_query_seconds=" + durations);
         }
     }
 
     private static void write(PrintWriter report, String topic, String label, long begin, long end, long rows,
-                              Timings t, Path cache, Calls calls) throws Exception {
+                              Timings t, Path cache, Calls calls, Fetched before, long heapBefore) throws Exception {
+        var fetched = FetchMetrics.snapshot().minus(before);
+        long heapAfter = heapUsed();
+        if (t.fetched == 0) {
+            assertEquals(0, fetched.bytes()); assertEquals(0, fetched.records());
+        } else {
+            assertTrue(fetched.bytes() > 0, "consumer byte metric advances on a fetch");
+            assertTrue(fetched.records() > 0, "consumer record metric advances on a fetch");
+        }
         long planning = t.firstFetch == 0 ? 0 : t.firstFetch - begin;
         long fetching = t.firstFetch == 0 ? 0 : t.lastCommit - t.firstFetch - t.committing;
         long after = t.lastCommit == 0 ? end - begin : end - t.lastCommit;
-        String line = String.format(Locale.ROOT, "%s,%s,%.6f,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,\"%s\"",
+        String line = String.format(Locale.ROOT, "%s,%s,%.6f,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d,%d,%d,%d,\"%s\"",
                 topic, label, seconds(end - begin), rows, t.fetched, t.batches, seconds(planning), seconds(fetching),
-                seconds(t.committing), seconds(after), seconds(t.checkpointing), size(cache), size(Path.of(cache + "-wal")), calls.counts());
+                seconds(t.committing), seconds(after), seconds(t.checkpointing), size(cache), size(Path.of(cache + "-wal")),
+                fetched.bytes(), fetched.records(), heapBefore, heapAfter, calls == null ? Map.of() : calls.counts());
         report.println(line); report.flush();
         System.out.println("PERF " + line);
+    }
+
+    private static long heapUsed() { return ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed(); }
+
+    private record Fetched(long bytes, long records) {
+        Fetched minus(Fetched before) { return new Fetched(bytes - before.bytes, records - before.records); }
+    }
+
+    /** Kafka's own cumulative consumer totals; exclude per-topic metrics to avoid double counting.
+     * Admin reporters have neither metric and contribute zero. Never touch the consumer from the caller.
+     */
+    public static final class FetchMetrics implements MetricsReporter {
+        private static final Set<FetchMetrics> ACTIVE = ConcurrentHashMap.newKeySet();
+        private volatile KafkaMetric bytes, records;
+        public FetchMetrics() {}
+        @Override public void configure(Map<String, ?> config) {}
+        @Override public void init(List<KafkaMetric> metrics) { metrics.forEach(this::metricChange); ACTIVE.add(this); }
+        @Override public void metricChange(KafkaMetric metric) {
+            var name = metric.metricName();
+            if (!name.group().equals("consumer-fetch-manager-metrics") || name.tags().containsKey("topic")) return;
+            switch (name.name()) {
+                case "bytes-consumed-total" -> bytes = metric;
+                case "records-consumed-total" -> records = metric;
+                default -> { }
+            }
+        }
+        @Override public void metricRemoval(KafkaMetric metric) {
+            if (bytes == metric) bytes = null;
+            if (records == metric) records = null;
+        }
+        @Override public void close() { ACTIVE.remove(this); }
+        static Fetched snapshot() {
+            long bytes = 0, records = 0;
+            for (var reporter : ACTIVE) {
+                var b = reporter.bytes; var r = reporter.records;
+                if (b != null) bytes += ((Number) b.metricValue()).longValue();
+                if (r != null) records += ((Number) r.metricValue()).longValue();
+            }
+            return new Fetched(bytes, records);
+        }
     }
 
     private static double seconds(long nanos) { return nanos / 1_000_000_000.0; }

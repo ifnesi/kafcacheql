@@ -48,10 +48,20 @@ public final class CacheStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(CacheStore.class);
 
     /** The cache layout, including topic indexes; a cache in any other version is refused. */
-    public static final int FORMAT_VERSION = 6;
+    public static final int FORMAT_VERSION = 7;
 
     static final int BUSY_TIMEOUT_MS = 5_000;
     public static final long JOURNAL_SIZE_LIMIT = 64L * 1024 * 1024;
+
+    /** Reusable free pages do not count; neither VACUUM nor a checkpoint is needed to measure usage. */
+    public static long usedBytes(Connection reader) throws SQLException {
+        try (var s = reader.createStatement(); var r = s.executeQuery("""
+                SELECT (page_count-freelist_count)*page_size
+                FROM pragma_page_count(),pragma_freelist_count(),pragma_page_size()
+                """)) {
+            r.next(); return r.getLong(1);
+        }
+    }
     private static final Pattern CLUSTER_ID = Pattern.compile("[A-Za-z0-9._-]{1,255}");
     private static final Set<PosixFilePermission> OWNER_DIR = PosixFilePermissions.fromString("rwx------");
     private static final Set<PosixFilePermission> OWNER_FILE = PosixFilePermissions.fromString("rw-------");

@@ -1,10 +1,14 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import com.google.common.collect.Range;
+import com.google.common.collect.RangeSet;
+import com.google.common.collect.TreeRangeSet;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
 
 /** Partition progress and append retention. Mutations belong to the worker's guarded transaction. */
 public final class PartitionStore {
@@ -82,15 +86,38 @@ public final class PartitionStore {
     public static int deleteChunk(Connection writer, long generation, int partition, int size) throws SQLException {
         String table = StorageDdl.quote(StorageDdl.tableName(generation));
         // The WITHOUT ROWID table's primary key bounds this scan; SQLite owns the limited deletion.
-        try (PreparedStatement p = writer.prepareStatement("""
-                DELETE FROM %s WHERE _partition=? AND _offset IN (
-                    SELECT _offset FROM %s WHERE _partition=? AND _offset < (
+        return deleteChunk(writer, generation, """
+                    SELECT _partition,_offset FROM %s WHERE _partition=? AND _offset < (
                         SELECT pruned_below FROM "$partitions" WHERE topic_ref=? AND partition_no=?)
-                    ORDER BY _offset LIMIT ?)
-                """.formatted(table, table))) {
-            p.setInt(1, partition); p.setInt(2, partition); p.setLong(3, generation);
-            p.setInt(4, partition); p.setInt(5, size);
-            int deleted = p.executeUpdate();
+                    ORDER BY _offset LIMIT ?
+                """.formatted(table), List.of(partition, generation, partition, size), false);
+    }
+
+    /** The ceiling is the next topic's oldest timestamp, so a chunk preserves global timestamp order. */
+    public static int evictChunk(Connection writer, long generation, long ceiling, int size) throws SQLException {
+        return deleteChunk(writer, generation, "SELECT _partition,_offset FROM " + StorageDdl.quote(StorageDdl.tableName(generation))
+                + " WHERE _timestamp<=? ORDER BY _timestamp LIMIT ?", List.of(ceiling, size), true);
+    }
+
+    private static int deleteChunk(Connection writer, long generation, String selection, List<?> parameters, boolean trimRanges)
+            throws SQLException {
+        String sql = "DELETE FROM " + StorageDdl.quote(StorageDdl.tableName(generation))
+                + " WHERE (_partition,_offset) IN (" + selection + ")" + (trimRanges ? " RETURNING _partition,_offset" : "");
+        try (var p = writer.prepareStatement(sql)) {
+            for (int i = 0; i < parameters.size(); i++) p.setObject(i + 1, parameters.get(i));
+            int deleted = 0;
+            if (trimRanges) {
+                var removed = new HashMap<Integer, RangeSet<Long>>();
+                try (var r = p.executeQuery()) {
+                    while (r.next()) {
+                        long offset = r.getLong(2);
+                        removed.computeIfAbsent(r.getInt(1), ignored -> TreeRangeSet.create()).add(Range.closedOpen(offset, offset + 1));
+                        deleted++;
+                    }
+                }
+                for (var entry : removed.entrySet()) for (var range : entry.getValue().asRanges())
+                    RangeStore.remove(writer, generation, entry.getKey(), range.lowerEndpoint(), range.upperEndpoint());
+            } else deleted = p.executeUpdate(); // Retention already trimmed the ranges when it raised the floor.
             if (deleted != 0) TypedViews.refresh(writer, generation);
             return deleted;
         }

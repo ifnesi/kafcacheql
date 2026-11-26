@@ -1,0 +1,47 @@
+name: kafcacheql-demo
+services:
+  zeppelin:
+    build: ./zeppelin
+    ports:
+      - "127.0.0.1:8090:8080"
+    environment:
+      ZEPPELIN_ADDR: 0.0.0.0
+      ZEPPELIN_NOTEBOOK_DIR: /notebook
+      ZEPPELIN_IN_DOCKER: "true"
+    volumes:
+      - ../target:/driver:ro
+      - ./kafcacheql.properties:/demo/kafcacheql.properties:ro
+      - cache:/cache
+      - notebook:/notebook
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/api/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [stack]
+  configure:
+    build: ./producer
+    command: ["python", "/demo/configure.py"]
+    volumes:
+      - ./zeppelin:/demo:ro
+    depends_on:
+      zeppelin:
+        condition: service_healthy
+    networks: [stack]
+  producer:
+    build: ./producer
+    environment:
+      BOOTSTRAP_SERVERS: broker:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      ORDERS_PER_SECOND: ${ORDERS_PER_SECOND:-2}
+    depends_on:
+      configure:
+        condition: service_completed_successfully
+    networks: [stack]
+volumes:
+  cache:
+  notebook:
+networks:
+  stack:
+    external: true
+    name: kafcacheql

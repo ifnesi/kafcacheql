@@ -138,6 +138,9 @@ public final class QueryPipeline {
                 bindings.bind(statement);
                 ResultSet rows = reader.executeQuery();
                 execution.check();
+                var generations = new LinkedHashMap<String, Long>();
+                for (var window : synced) generations.put(window.plan().topic().name(), window.generation());
+                cache.queried(generations, startedAt);
                 return new Cursor(reader, rows, execution, List.copyOf(warnings), types);
             } catch (SQLException | RuntimeException | Error e) {
                 try { reader.close(); } catch (SQLException close) { e.addSuppressed(close); }

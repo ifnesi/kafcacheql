@@ -1,0 +1,167 @@
+{
+  "name": "KafCacheQL web store",
+  "paragraphs": [
+    {
+      "title": "Orders per minute",
+      "text": "%store\nSELECT strftime('%H:%M', o._timestamp / 1000, 'unixepoch') AS minute, count(*) AS orders\nFROM \"shop-orders\" o\nWHERE o._timestamp >= unixepoch('now', '-15 minutes') * 1000\nGROUP BY minute ORDER BY minute",
+      "config": {
+        "title": true,
+        "colWidth": 12,
+        "results": [
+          {
+            "graph": {
+              "mode": "lineChart",
+              "height": 300,
+              "optionOpen": false,
+              "keys": [
+                {
+                  "name": "minute",
+                  "index": 0,
+                  "aggr": "sum"
+                }
+              ],
+              "values": [
+                {
+                  "name": "orders",
+                  "index": 1,
+                  "aggr": "sum"
+                }
+              ],
+              "groups": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "title": "Revenue by product",
+      "text": "%store\nSELECT p.name AS product, round(sum(i.quantity * i.unit_price_cents) / 100.0, 2) AS revenue\nFROM \"shop-order-items\" i JOIN \"shop-products\" p ON i.product_id = p.product_id\nWHERE i._timestamp >= unixepoch('now', '-15 minutes') * 1000\nGROUP BY p.name ORDER BY revenue DESC",
+      "config": {
+        "title": true,
+        "colWidth": 12,
+        "results": [
+          {
+            "graph": {
+              "mode": "multiBarChart",
+              "height": 300,
+              "optionOpen": false,
+              "keys": [
+                {
+                  "name": "product",
+                  "index": 0,
+                  "aggr": "sum"
+                }
+              ],
+              "values": [
+                {
+                  "name": "revenue",
+                  "index": 1,
+                  "aggr": "sum"
+                }
+              ],
+              "groups": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "title": "Deliveries: late versus on time",
+      "text": "%store\nSELECT CASE WHEN s.delivered_at > s.promised_at THEN 'Late' ELSE 'On time' END AS delivery,\ncount(*) AS shipments FROM \"shop-shipments\" s\nWHERE s._timestamp >= unixepoch('now', '-15 minutes') * 1000\nGROUP BY delivery ORDER BY delivery",
+      "config": {
+        "title": true,
+        "colWidth": 12,
+        "results": [
+          {
+            "graph": {
+              "mode": "pieChart",
+              "height": 300,
+              "optionOpen": false,
+              "keys": [
+                {
+                  "name": "delivery",
+                  "index": 0,
+                  "aggr": "sum"
+                }
+              ],
+              "values": [
+                {
+                  "name": "shipments",
+                  "index": 1,
+                  "aggr": "sum"
+                }
+              ],
+              "groups": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "title": "Orders, customers and payments",
+      "text": "%store\nSELECT c.name AS customer, o.order_id, round(p.amount_cents / 100.0, 2) AS paid\nFROM \"shop-orders\" o JOIN \"shop-customers\" c ON o.customer_id = c.customer_id\nJOIN \"shop-payments\" p ON p.order_id = o.order_id\nWHERE o._timestamp >= unixepoch('now', '-15 minutes') * 1000\nAND p._timestamp >= unixepoch('now', '-15 minutes') * 1000\nORDER BY o._timestamp DESC LIMIT 20",
+      "config": {
+        "title": true,
+        "colWidth": 12,
+        "results": [
+          {
+            "graph": {
+              "mode": "table",
+              "height": 300,
+              "optionOpen": false,
+              "keys": [
+                {
+                  "name": "customer",
+                  "index": 0,
+                  "aggr": "sum"
+                }
+              ],
+              "values": [
+                {
+                  "name": "paid",
+                  "index": 1,
+                  "aggr": "sum"
+                }
+              ],
+              "groups": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "title": "Current compacted product and stock",
+      "text": "%store\nSELECT p.product_id, p.name, s.quantity FROM \"shop-products\" p\nJOIN \"shop-stock\" s ON p.product_id = s.product_id\nWHERE p.product_id = 'p01'",
+      "config": {
+        "title": true,
+        "colWidth": 12,
+        "results": [
+          {
+            "graph": {
+              "mode": "table",
+              "height": 300,
+              "optionOpen": false,
+              "keys": [
+                {
+                  "name": "product_id",
+                  "index": 0,
+                  "aggr": "sum"
+                }
+              ],
+              "values": [
+                {
+                  "name": "quantity",
+                  "index": 1,
+                  "aggr": "sum"
+                }
+              ],
+              "groups": []
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "notePath": "/KafCacheQL web store",
+  "defaultInterpreterGroup": "store"
+}

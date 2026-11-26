@@ -96,17 +96,20 @@ public final class CacheContext {
             return clients == null || clients.clients().isValid(execution);
         }
 
-        /** Metadata discovery only: no registration, sync, or cache writes. The JDBC caller caches the list. */
+        /** Refresh captures generations before Kafka; missing topics are dropped by the worker, without waiting. */
         public Set<String> listTopics() throws SQLException {
             ensureOpen();
-            if (clients != null) return clients.clients().listTopics();
-            return read(reader -> {
-                var names = new HashSet<String>();
-                try (var s = reader.createStatement(); var r = s.executeQuery("SELECT topic FROM \"$topics\" WHERE deleted_ms IS NULL")) {
-                    while (r.next()) names.add(r.getString(1));
+            var cached = read(reader -> {
+                var generations = new TreeMap<String, Long>();
+                try (var s = reader.createStatement(); var r = s.executeQuery("SELECT topic,id FROM \"$topics\" WHERE deleted_ms IS NULL")) {
+                    while (r.next()) generations.put(r.getString(1), r.getLong(2));
                 }
-                return Set.copyOf(names);
+                return generations;
             });
+            if (clients == null) return Set.copyOf(cached.keySet());
+            var listed = clients.clients().listTopics();
+            cached.forEach((topic, generation) -> { if (!listed.contains(topic)) context.worker.drop(topic, generation); });
+            return listed;
         }
 
         public Optional<TopicInfo> describeTopic(String topic) throws SQLException {
@@ -312,6 +315,13 @@ public final class CacheContext {
             ensureOpen();
             context.worker.caughtUp(topic, generation, partition, capturedAt);
         }
+
+        /** Disposable metadata only; the query's own checked snapshot is already open. */
+        public void queried(Map<String, Long> generations, long at) throws SQLException {
+            ensureOpen();
+            generations.forEach((topic, generation) -> context.worker.queried(topic, generation, at));
+            if (!generations.isEmpty()) context.worker.readerReady();
+        }
         /** Registration's specialised path is in sync; rebuild/prune/view work can use this guarded handoff. */
         public <T> T write(String topic, long generation, Execution execution, SqlWork<T> work) throws SQLException {
             ensureOpen();
@@ -397,6 +407,8 @@ public final class CacheContext {
     }
 
     private void compatible(DriverConfig other, ClientSettings clients) throws SQLException {
+        if (!config.cacheMaxBytes().equals(other.cacheMaxBytes())) different("cache.max.bytes");
+        if (!config.cacheRetentionHours().equals(other.cacheRetentionHours())) different("cache.retention.hours");
         if (!config.clientId().equals(other.clientId()) || !settings.consumer().equals(clients.consumer())
                 || !settings.admin().equals(clients.admin()) || !settings.schemaRegistry().equals(clients.schemaRegistry())) {
             throw ConfigErrors.problem("The open cache " + path + " has different client settings");

@@ -1,0 +1,57 @@
+{
+  "name": "store",
+  "group": "jdbc",
+  "properties": {
+    "default.driver": {
+      "name": "default.driver",
+      "value": "io.github.ifnesi.kafcacheql.driver.KafCacheQLDriver",
+      "type": "string"
+    },
+    "default.url": {
+      "name": "default.url",
+      "value": "jdbc:kafcacheql://broker:29092?config.file=/demo/kafcacheql.properties",
+      "type": "string"
+    },
+    "default.user": {
+      "name": "default.user",
+      "value": "",
+      "type": "string"
+    },
+    "default.password": {
+      "name": "default.password",
+      "value": "",
+      "type": "string"
+    },
+    "default.validationQuery": {
+      "name": "default.validationQuery",
+      "value": "SELECT 1",
+      "type": "string"
+    },
+    "default.completer.ttlInSeconds": {
+      "name": "default.completer.ttlInSeconds",
+      "value": "0",
+      "type": "string"
+    },
+    "common.max_count": {
+      "name": "common.max_count",
+      "value": "1000",
+      "type": "string"
+    },
+    "JAVA_HOME": {
+      "name": "JAVA_HOME",
+      "value": "/opt/java21",
+      "type": "string"
+    },
+    "CLASSPATH": {
+      "name": "CLASSPATH",
+      "value": "/driver/kafcacheql-jdbc-0.1.0-SNAPSHOT.jar",
+      "type": "string"
+    }
+  },
+  "dependencies": [],
+  "option": {
+    "remote": true,
+    "perNote": "shared",
+    "perUser": "shared"
+  }
+}

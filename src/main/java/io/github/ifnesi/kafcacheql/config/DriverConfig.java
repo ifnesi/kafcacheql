@@ -14,6 +14,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
@@ -34,6 +35,8 @@ import java.util.stream.Collectors;
 public record DriverConfig(
         Optional<String> bootstrapServers,
         Optional<Path> cachePath,
+        OptionalLong cacheMaxBytes,
+        OptionalLong cacheRetentionHours,
         Window appendDefaultWindow,
         long appendDefaultWindowMaxRecords,
         long maxStalenessMs,
@@ -70,6 +73,7 @@ public record DriverConfig(
     @Override
     public String toString() {
         return "DriverConfig[bootstrapServers=" + bootstrapServers + ", cachePath=" + cachePath
+                + ", cacheMaxBytes=" + cacheMaxBytes + ", cacheRetentionHours=" + cacheRetentionHours
                 + ", appendDefaultWindow=" + appendDefaultWindow
                 + ", appendDefaultWindowMaxRecords=" + appendDefaultWindowMaxRecords
                 + ", maxStalenessMs=" + maxStalenessMs
@@ -142,6 +146,10 @@ public record DriverConfig(
         return new DriverConfig(
                 bootstrap,
                 cachePath,
+                own.containsKey(DriverProperty.CACHE_MAX_BYTES) ? OptionalLong.of(atLeast(DriverProperty.CACHE_MAX_BYTES.key(),
+                        own.get(DriverProperty.CACHE_MAX_BYTES), 1, Long.MAX_VALUE)) : OptionalLong.empty(),
+                own.containsKey(DriverProperty.CACHE_RETENTION_HOURS) ? OptionalLong.of(atLeast(DriverProperty.CACHE_RETENTION_HOURS.key(),
+                        own.get(DriverProperty.CACHE_RETENTION_HOURS), 1, Long.MAX_VALUE / Duration.ofHours(1).toMillis())) : OptionalLong.empty(),
                 window(DriverProperty.APPEND_DEFAULT_WINDOW.key(), own.get(DriverProperty.APPEND_DEFAULT_WINDOW)),
                 atLeast(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS.key(),
                         own.get(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS), 1, Long.MAX_VALUE),
