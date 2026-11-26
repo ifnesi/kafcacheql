@@ -20,16 +20,16 @@ python3 demo/check.py
 
 The note after about five minutes of producing, its charts first:
 
-![Zeppelin: orders per minute, revenue by product, late versus on-time deliveries](images/demo-zeppelin-charts.png)
+![Zeppelin: orders per minute, revenue by product, late versus on-time deliveries](images/zeppelin-charts.png)
 
 and its tables: a three-topic join and a compacted lookup:
 
-![Zeppelin: orders joined to customers and payments, and current product stock](images/demo-zeppelin-tables.png)
+![Zeppelin: orders joined to customers and payments, and current product stock](images/zeppelin-tables.png)
 
 The same `shop-orders` records as Kafka holds them, in Control Center (<http://localhost:9021>, started by
 the root `docker compose up -d`):
 
-![Control Center: the shop-orders topic's messages](images/demo-control-center.png)
+![Control Center: the shop-orders topic's messages](images/control-center.png)
 
 The producer writes ten Avro topics named `shop-*`: customers, products and stock
 are compacted; orders, order-items, payments, shipments, delivery-events, returns

@@ -123,7 +123,7 @@ fetched.
 
 ### A demo: a web store on Zeppelin
 
-[docs/demo.md](docs/demo.md) runs a producer writing ten related web-store topics (customers, products,
+[demo/README.md](demo/README.md) runs a producer writing ten related web-store topics (customers, products,
 stock, orders, payments, shipments, deliveries and more) and an Apache Zeppelin note that charts them through
 KafCacheQL: `docker compose -f demo/compose.yaml up -d --build`, then <http://localhost:8090>.
 
