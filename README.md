@@ -17,6 +17,16 @@ consistent snapshot of the cached data; rerun it to fetch new records. This is n
 
 For experimentation, not recommended for production use.
 
+**Why not Flink SQL or ksqlDB?** Use them to build pipelines: continuous queries that run on a cluster and
+write results back to Kafka. Confluent Cloud's Flink can also answer one-off snapshot queries, through its own
+JDBC driver, on a Flink compute pool billed in CFUs. KafCacheQL needs none of that:
+
+- **Any Kafka 3.1+ / Confluent Platform 7.1+:** self-managed or on a laptop.
+- **Nothing to deploy or pay for:** one JAR inside your SQL tool, and a properties file.
+- **A local cache:** a rerun fetches only new records, and cached topics stay queryable offline.
+- **Made for debugging:** a record that fails to decode stays a row, with the error and its raw bytes, next to
+  its partition, offset and headers.
+
 The same `shop-customers` topic in three tools. In Confluent Control Center:
 
 ![Confluent Control Center showing shop-customers keys and values](docs/control-center-shop-customers.png)
@@ -83,9 +93,8 @@ Wait for Kafka on `localhost:9092` and Schema Registry on <http://localhost:8081
 ### 2. Download the driver
 
 The driver is one self-contained JAR, with native libraries for Linux, macOS and Windows on x86-64 and ARM64.
-Download version 0.1.0, `kafcacheql-jdbc-0.1.0.jar`, from the
-[v0.1.0 release](https://github.com/ifnesi/kafcacheql/releases/tag/v0.1.0), and save it where your tool can
-load it:
+Download version 0.1.0, `kafcacheql-jdbc-0.1.0.jar`, from the [v0.1.0
+release](https://github.com/ifnesi/kafcacheql/releases/tag/v0.1.0), and save it where your tool can load it:
 
 ```sh
 mkdir -p ~/.kafcacheql
