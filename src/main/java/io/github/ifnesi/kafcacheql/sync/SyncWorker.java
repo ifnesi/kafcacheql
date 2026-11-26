@@ -13,6 +13,7 @@ import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.config.Secrets;
 import io.github.ifnesi.kafcacheql.kafka.ClientIds;
 import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
+import io.github.ifnesi.kafcacheql.schema.SchemaRegistry;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,7 +31,13 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.CloseOptions;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -42,7 +49,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sqlite.SQLiteConnection;
 
-/** One ordered writer/consumer owner per cache. Callers do all read-side planning independently. */
+/** One ordered writer, fed by consumer and decoder owner threads. Callers plan reads independently. */
 public final class SyncWorker implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(SyncWorker.class);
     private static final Duration POLL = Duration.ofMillis(100);
@@ -66,6 +73,7 @@ public final class SyncWorker implements AutoCloseable {
     }
 
     @FunctionalInterface interface Work<T> { T run() throws SQLException; }
+    @FunctionalInterface private interface PartitionFetch { void run(FetchConsumer consumer) throws SQLException; }
     private static final class Job<T> {
         final Execution execution;
         final Work<T> work;
@@ -91,11 +99,14 @@ public final class SyncWorker implements AutoCloseable {
     private final CompletableFuture<Void> stopped = new CompletableFuture<>();
     private volatile Hooks hooks = new Hooks() {};
     private boolean closing;
+    private SQLException terminalFailure; // Guarded by this; retained after the worker stops.
     private Job<?> active;
-    private KafkaConsumer<byte[], byte[]> consumer;
-    private String consumerId;
+    private final Set<KafkaConsumer<byte[], byte[]>> consumers = ConcurrentHashMap.newKeySet();
+    private final List<FetchConsumer> fetchers = new ArrayList<>(); // Worker-confined; each has its own owner.
     private CacheStore cache;
-    private BatchDecoder decoder;
+    private final Object registryLock = new Object();
+    private SchemaRegistry registry;
+    private CompletableFuture<Void> fetchIdle = CompletableFuture.completedFuture(null);
     // Worker-confined; reset for each foreground sync and set only after a transaction commits.
     private boolean syncWrote;
 
@@ -110,7 +121,7 @@ public final class SyncWorker implements AutoCloseable {
     CacheStore opened() throws SQLException {
         try {
             CacheStore store = opened.get();
-            synchronized (this) { if (closing) throw new SQLException("Sync worker is closed"); }
+            checkOpen();
             return store;
         }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new SQLException("Interrupted opening cache", e); }
@@ -120,14 +131,19 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
+    synchronized void checkOpen() throws SQLException {
+        if (terminalFailure != null) {
+            throw new SQLException(terminalFailure.getMessage(), terminalFailure.getSQLState(), terminalFailure);
+        }
+        if (closing) throw new SQLException("Cache context is closed");
+    }
+
     void hooks(Hooks hooks) { this.hooks = hooks; }
 
     private void own(Path path, Optional<String> clusterId) {
         SQLException failure = null;
-        try (CacheStore store = CacheStore.open(path, clusterId); Connection reader = store.newReader();
-             BatchDecoder decoding = new BatchDecoder(settings, reader, "kafcacheql-decode-" + path.getFileName())) {
-            cache = store;
-            decoder = decoding;
+        try {
+            cache = CacheStore.open(path, clusterId);
             try (Statement s = cache.writer().createStatement()) { s.execute("PRAGMA busy_timeout = 100"); }
             opened.complete(cache);
             while (true) {
@@ -140,19 +156,21 @@ public final class SyncWorker implements AutoCloseable {
             failure = failure("Sync worker", e);
             opened.completeExceptionally(failure);
             synchronized (this) {
+                terminalFailure = failure;
                 closing = true;
                 for (Job<?> job : pending) job.result.completeExceptionally(failure);
                 pending.clear(); queue.clear(); background.clear();
             }
         } finally {
-            try {
-                if (consumer != null) consumer.close(CloseOptions.timeout(Duration.ofSeconds(5)));
-            } catch (RuntimeException e) {
-                if (failure == null) failure = failure("Closing consumer", e); else failure.addSuppressed(e);
-            } finally {
-                if (consumerId != null) ClientIds.release(ClientIds.Kind.CONSUMER, consumerId);
-                if (failure == null) stopped.complete(null); else stopped.completeExceptionally(failure);
+            for (var fetcher : fetchers) {
+                try { fetcher.close(); }
+                catch (SQLException e) { if (failure == null) failure = e; else failure.addSuppressed(e); }
             }
+            try { if (registry != null) registry.close(); }
+            catch (SQLException e) { if (failure == null) failure = e; else failure.addSuppressed(e); }
+            try { if (cache != null) cache.close(); }
+            catch (SQLException e) { if (failure == null) failure = e; else failure.addSuppressed(e); }
+            if (failure == null) stopped.complete(null); else stopped.completeExceptionally(failure);
         }
     }
 
@@ -171,11 +189,11 @@ public final class SyncWorker implements AutoCloseable {
                     pending.remove(job);
                     job.result.completeExceptionally(new SQLException("Query cancelled", "57014"));
                 }
-                if (active == job && consumer != null) consumer.wakeup();
+                if (active == job) wakeConsumers();
             }
         })) {
             synchronized (this) {
-                if (closing) throw new SQLException("Cache context is closed");
+                checkOpen();
                 pending.add(job);
                 queue.add(queued);
             }
@@ -189,10 +207,10 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    long sync(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize) throws SQLException {
+    long sync(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize, int parallelism) throws SQLException {
         return submit(execution, () -> {
             syncWrote = false;
-            try { return fetch(plan, execution, writer, batchSize); }
+            try { return fetch(plan, execution, writer, batchSize, parallelism); }
             finally { if (syncWrote) checkpoint(); }
         });
     }
@@ -204,7 +222,7 @@ public final class SyncWorker implements AutoCloseable {
         });
     }
 
-    private long fetch(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize) throws SQLException {
+    private long fetch(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize, int parallelism) throws SQLException {
         execution.check();
         var observed = TopicRegistry.observe(cache.writer(), plan.topic().name());
         if (plan.generation().isPresent() && (observed.isEmpty() || observed.get().id() != plan.generation().getAsLong())) {
@@ -231,73 +249,173 @@ public final class SyncWorker implements AutoCloseable {
                 && plan.logStarts().values().stream().anyMatch(start -> start > 0)) {
             prune(plan, generation, execution, batchSize);
         }
+        var partitions = new ArrayList<PartitionFetch>();
+        var request = new FetchRequest(execution);
         for (var partition : plan.windows().entrySet()) {
             long baseline = plan.topic().mode() == Mode.COMPACTED ? baselines.get(partition.getKey()) : 0;
             var missing = RangeStore.missing(cache.writer(), generation, partition.getKey(), partition.getValue());
             if (partition.getValue().isEmpty()) {
                 long end = plan.ends().offsets().get(partition.getKey());
-                commit(new SyncBatch(plan, generation, partition.getKey(), end, end, true, List.of()), baseline, execution, writer);
+                commit(new SyncBatch(plan, generation, partition.getKey(), end, end, true, List.of()), baseline, execution::check, writer);
             } else if (missing.isEmpty() && plan.checked() && plan.topic().mode() == Mode.COMPACTED) {
                 caughtUp(plan.topic().name(), generation, partition.getKey(), plan.ends().capturedAtMs());
             }
             if (missing.isEmpty()) continue;
-            var progress = new PartitionProgress(plan.topic().name(), partition.getKey(), missing.asRanges().stream()
-                    .mapToLong(r -> r.upperEndpoint() - r.lowerEndpoint()).sum());
-            for (Range<Long> range : missing.asRanges()) {
-                hooks.beforeFetch(plan);
-                fetchRange(plan, generation, partition.getKey(), range, baseline, execution, writer, batchSize, progress);
-            }
+            partitions.add(fetcher -> {
+                // Start the cadence when this partition begins, not while it waits for a consumer.
+                var progress = request.write(() -> new PartitionProgress(plan.topic().name(), partition.getKey(), missing.asRanges().stream()
+                        .mapToLong(r -> r.upperEndpoint() - r.lowerEndpoint()).sum()));
+                for (Range<Long> range : missing.asRanges()) {
+                    request.write(() -> { hooks.beforeFetch(plan); return null; });
+                    fetchRange(fetcher, plan, generation, partition.getKey(), range, baseline, request, writer, batchSize, progress);
+                }
+            });
         }
+        if (!partitions.isEmpty()) request.fetch(partitions, Math.min(parallelism, partitions.size()));
         return generation;
     }
 
-    private void fetchRange(SyncPlan plan, long generation, int partition, Range<Long> range,
-                            long baseline, Execution execution, BatchWriter writer, int batchSize, PartitionProgress progress) throws SQLException {
-        ensureConsumer();
-        execution.check();
+    /** One outstanding handoff per owner bounds raw polls to the fixed consumer count. */
+    private final class FetchRequest {
+        private final Execution execution;
+        private final BlockingQueue<Runnable> writes = new LinkedBlockingQueue<>();
+        private final CompletableFuture<Void> failed = new CompletableFuture<>();
+
+        FetchRequest(Execution execution) { this.execution = execution; }
+
+        void check() throws SQLException {
+            execution.check();
+            if (failed.isDone()) execution.await(failed);
+        }
+
+        void fail(Throwable error) {
+            if (failed.completeExceptionally(error)) {
+                wakeConsumers();
+                writes.add(() -> {}); // Wake the writer even when no poll handoff is waiting.
+            }
+        }
+
+        <T> T write(Work<T> work) throws SQLException {
+            check();
+            var job = new Job<T>(execution, () -> { check(); return work.run(); });
+            job.result.whenComplete((result, error) -> { if (error != null) fail(error); });
+            writes.add(job::run);
+            execution.await(CompletableFuture.anyOf(job.result, failed));
+            return execution.await(job.result);
+        }
+
+        void fetch(List<PartitionFetch> partitions, int count) throws SQLException {
+            // A cancelled decode may still be finishing a bounded Registry call. Only new fetches wait.
+            execution.await(fetchIdle);
+            while (fetchers.size() < count) fetchers.add(new FetchConsumer(fetchers.size() + 1));
+            var waiting = new ConcurrentLinkedQueue<>(partitions);
+            var tasks = new ArrayList<CompletableFuture<Void>>();
+            CompletableFuture<Void> done = null;
+            try {
+                for (int i = 0; i < count; i++) {
+                    var fetcher = fetchers.get(i);
+                    tasks.add(CompletableFuture.runAsync(() -> {
+                        try {
+                            check(); fetcher.ensureConsumer();
+                            PartitionFetch partition;
+                            while ((partition = waiting.poll()) != null) { check(); partition.run(fetcher); }
+                        } catch (SQLException | RuntimeException | Error error) {
+                            fail(error);
+                            throw new CompletionException(error);
+                        }
+                    }, fetcher.owner));
+                }
+                done = CompletableFuture.allOf(tasks.toArray(CompletableFuture[]::new));
+                done.whenComplete((result, error) -> writes.add(() -> {}));
+                while (!done.isDone()) {
+                    check();
+                    try {
+                        var write = writes.poll(execution.remaining(POLL).toNanos(), TimeUnit.NANOSECONDS);
+                        if (write != null) { check(); write.run(); }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt(); execution.cancel(); execution.check();
+                    }
+                }
+                check(); execution.await(done);
+            } catch (SQLException | RuntimeException | Error error) {
+                fail(error);
+                throw error;
+            } finally {
+                // Free the writer after cancellation; owner executors drain before any later fetch.
+                if (done == null) done = CompletableFuture.allOf(tasks.toArray(CompletableFuture[]::new));
+                fetchIdle = done.handle((result, error) -> null);
+            }
+        }
+    }
+
+    private void fetchRange(FetchConsumer fetcher, SyncPlan plan, long generation, int partition, Range<Long> range,
+                            long baseline, FetchRequest request, BatchWriter writer, int batchSize, PartitionProgress progress) throws SQLException {
+        request.check();
         TopicPartition tp = new TopicPartition(plan.topic().name(), partition);
+        long end = range.upperEndpoint();
+        long position = range.lowerEndpoint();
+        var output = new RangeWriter(plan, generation, partition, range, baseline, request, writer, batchSize, progress);
         var formats = config.topic(tp.topic());
         Format key = formats.keyFormat().orElse(Format.AUTO), value = formats.valueFormat().orElse(Format.AUTO);
-        consumer.assign(List.of(tp));
-        consumer.seek(tp, range.lowerEndpoint());
-        long start = range.lowerEndpoint();
-        long end = range.upperEndpoint();
-        long previousPosition = start;
-        List<SyncBatch.Record> batch = new ArrayList<>(Math.min(batchSize, 5000));
         try {
-            while (start < end) {
-                execution.check();
-                decoder.awaitIdle(execution);
-                var records = poll(execution);
-                long position = Math.min(end, position(tp, execution));
+            fetcher.consumer.assign(List.of(tp));
+            fetcher.consumer.seek(tp, range.lowerEndpoint());
+            while (position < end) {
+                var records = fetcher.poll(request);
+                position = Math.min(end, fetcher.position(tp, request));
                 var decoded = records.isEmpty() ? List.<SyncBatch.Record>of()
-                        : decoder.decode(tp.topic(), records, end, key, value, execution);
-                progress.fetched += decoded.size();
-                progress.remaining -= position - previousPosition;
-                previousPosition = position;
-                for (var record : decoded) {
-                    execution.check();
-                    if (batch.size() == batchSize) {
-                        long batchEnd = batch.getLast().offset() + 1;
-                        commit(new SyncBatch(plan, generation, partition, start, batchEnd, false, batch), baseline, execution, writer);
-                        start = batchEnd;
-                        batch.clear();
-                        progress.report();
-                    }
-                    batch.add(record);
-                }
-                if (position >= end) {
-                    if (start < end) commit(new SyncBatch(plan, generation, partition, start, end,
-                            end == plan.ends().offsets().get(partition), batch), baseline, execution, writer);
-                    start = end;
-                }
-                progress.report();
+                        : fetcher.decoder.decode(tp.topic(), records, end, key, value);
+                long captured = position;
+                request.write(() -> { output.accept(decoded, captured); return null; });
             }
         } catch (OffsetOutOfRangeException | org.apache.kafka.common.errors.UnknownTopicOrPartitionException expired) {
-            // The read-side validity planner owns §9's append-prune/compacted-rebuild decision.
             throw new StaleGeneration(tp.topic());
-        } catch (RuntimeException failure) {
-            throw failure("Fetching topic " + tp.topic(), failure);
+        } catch (RuntimeException error) {
+            throw failure("Fetching topic " + tp.topic(), error);
+        }
+    }
+
+    /** Only the writer assembles and commits the already decoded records. */
+    private final class RangeWriter {
+        private final SyncPlan plan;
+        private final long generation, baseline, end;
+        private final int partition, batchSize;
+        private final FetchRequest request;
+        private final BatchWriter writer;
+        private final PartitionProgress progress;
+        private final List<SyncBatch.Record> batch;
+        private long start, previousPosition;
+
+        RangeWriter(SyncPlan plan, long generation, int partition, Range<Long> range, long baseline,
+                    FetchRequest request, BatchWriter writer, int batchSize, PartitionProgress progress) {
+            this.plan = plan; this.generation = generation; this.partition = partition; this.baseline = baseline;
+            this.request = request; this.writer = writer; this.batchSize = batchSize; this.progress = progress;
+            start = range.lowerEndpoint(); previousPosition = start; end = range.upperEndpoint();
+            batch = new ArrayList<>(Math.min(batchSize, 5000));
+        }
+
+        void accept(List<SyncBatch.Record> decoded, long position) throws SQLException {
+            var execution = request.execution;
+            progress.fetched += decoded.size();
+            progress.remaining -= position - previousPosition;
+            previousPosition = position;
+            for (var record : decoded) {
+                execution.check();
+                if (batch.size() == batchSize) {
+                    long batchEnd = batch.getLast().offset() + 1;
+                    commit(new SyncBatch(plan, generation, partition, start, batchEnd, false, batch), baseline, request::check, writer);
+                    start = batchEnd;
+                    batch.clear();
+                    progress.report();
+                }
+                batch.add(record);
+            }
+            if (position >= end) {
+                if (start < end) commit(new SyncBatch(plan, generation, partition, start, end,
+                        end == plan.ends().offsets().get(partition), batch), baseline, request::check, writer);
+                start = end;
+            }
+            progress.report();
         }
     }
 
@@ -321,41 +439,81 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    /** Lazy creation also lets an online lease join a context first opened by an offline lease. */
-    private void ensureConsumer() throws SQLException {
-        if (consumer != null) return;
-        String id = ClientIds.reserve(ClientIds.Kind.CONSUMER, config.clientId());
-        Map<String, Object> properties = new HashMap<>(settings.consumer());
-        properties.put(ConsumerConfig.CLIENT_ID_CONFIG, id);
-        try {
-            KafkaConsumer<byte[], byte[]> created = new KafkaConsumer<>(properties);
-            synchronized (this) { consumer = created; consumerId = id; }
-        } catch (RuntimeException e) {
-            ClientIds.release(ClientIds.Kind.CONSUMER, id);
-            throw failure("Creating cache consumer", e);
+    private SchemaRegistry registry() throws SQLException {
+        synchronized (registryLock) {
+            if (registry == null) registry = SchemaRegistry.open(settings);
+            return registry;
         }
     }
 
-    private ConsumerRecords<byte[], byte[]> poll(Execution execution) throws SQLException {
-        while (true) {
-            execution.check();
-            try { return consumer.poll(execution.remaining(POLL)); }
-            catch (WakeupException wakeup) { execution.check(); }
+    private void wakeConsumers() { consumers.forEach(KafkaConsumer::wakeup); }
+
+    /** A persistent JDK single-thread executor gives each consumer one owner for its whole lifetime. */
+    private final class FetchConsumer implements AutoCloseable {
+        private final ExecutorService owner;
+        private KafkaConsumer<byte[], byte[]> consumer;
+        private String id;
+        private BatchDecoder decoder;
+
+        FetchConsumer(int number) {
+            owner = Executors.newSingleThreadExecutor(work -> {
+                var thread = Thread.ofPlatform().daemon().name("kafcacheql-fetch-" + config.clientId() + "-" + number).unstarted(work);
+                thread.setContextClassLoader(DriverLoader.LOADER);
+                return thread;
+            });
+        }
+
+        void ensureConsumer() throws SQLException {
+            if (decoder == null) decoder = new BatchDecoder(settings, cache.newReader(), SyncWorker.this::registry);
+            if (consumer != null) return;
+            id = ClientIds.reserve(ClientIds.Kind.CONSUMER, config.clientId());
+            Map<String, Object> properties = new HashMap<>(settings.consumer());
+            properties.put(ConsumerConfig.CLIENT_ID_CONFIG, id);
+            try { consumer = new KafkaConsumer<>(properties); consumers.add(consumer); }
+            catch (RuntimeException e) {
+                ClientIds.release(ClientIds.Kind.CONSUMER, id); id = null;
+                throw failure("Creating cache consumer", e);
+            }
+        }
+
+        private ConsumerRecords<byte[], byte[]> poll(FetchRequest request) throws SQLException {
+            while (true) {
+                request.check();
+                try { return consumer.poll(request.execution.remaining(POLL)); }
+                catch (WakeupException wakeup) { request.check(); }
+            }
+        }
+
+        private long position(TopicPartition partition, FetchRequest request) throws SQLException {
+            while (true) {
+                request.check();
+                try { return consumer.position(partition, request.execution.remaining(POLL)); }
+                // Preserve the records already returned by poll if a late wakeup reaches position instead.
+                catch (WakeupException wakeup) { request.check(); }
+            }
+        }
+
+        @Override @SuppressWarnings("try") // The decoder resource supplies its close action and suppression order.
+        public void close() throws SQLException {
+            var closed = CompletableFuture.runAsync(() -> {
+                try (var decoding = decoder) {
+                    if (consumer != null) consumer.close(CloseOptions.timeout(Duration.ofSeconds(5)));
+                } catch (SQLException e) { throw new CompletionException(e); }
+                finally {
+                    if (consumer != null) consumers.remove(consumer);
+                    if (id != null) ClientIds.release(ClientIds.Kind.CONSUMER, id);
+                }
+            }, owner);
+            owner.shutdown();
+            try { closed.join(); }
+            catch (CompletionException e) { throw failure("Closing consumer", e.getCause()); }
+            finally { owner.close(); }
         }
     }
 
-    private long position(TopicPartition partition, Execution execution) throws SQLException {
-        while (true) {
-            execution.check();
-            try { return consumer.position(partition, execution.remaining(POLL)); }
-            // Preserve the records already returned by poll if a late wakeup reaches position instead.
-            catch (WakeupException wakeup) { execution.check(); }
-        }
-    }
-
-    private void commit(SyncBatch batch, long baseline, Execution execution, BatchWriter writer) throws SQLException {
+    private void commit(SyncBatch batch, long baseline, CacheStore.Check check, BatchWriter writer) throws SQLException {
         hooks.beforeCommit(batch);
-        transaction(batch.plan(), batch.generation(), execution, () -> {
+        transaction(batch.plan(), batch.generation(), check, () -> {
             writer.write(cache.writer(), batch);
             // Roll back every compacted batch if fetching outlived its original safety baseline.
             // The unchanged baseline makes the existing validity check rebuild on the bounded replan.
@@ -369,7 +527,7 @@ public final class SyncWorker implements AutoCloseable {
     }
 
     private void prune(SyncPlan plan, long generation, Execution execution, int batchSize) throws SQLException {
-        boolean needed = transaction(plan, generation, execution, () -> {
+        boolean needed = transaction(plan, generation, execution::check, () -> {
             if (!PartitionStore.needsPruning(cache.writer(), generation, plan.logStarts())) return false;
             PartitionStore.raiseFloors(cache.writer(), generation, plan.logStarts());
             return true;
@@ -378,17 +536,17 @@ public final class SyncWorker implements AutoCloseable {
         for (int partition : plan.logStarts().keySet()) {
             int deleted;
             do {
-                deleted = transaction(plan, generation, execution,
+                deleted = transaction(plan, generation, execution::check,
                         () -> PartitionStore.deleteChunk(cache.writer(), generation, partition, batchSize));
                 hooks.afterPrune(plan, generation, partition, deleted);
             } while (deleted == batchSize);
         }
     }
 
-    private <T> T transaction(SyncPlan plan, long generation, Execution execution, CacheStore.Write<T> work)
+    private <T> T transaction(SyncPlan plan, long generation, CacheStore.Check check, CacheStore.Write<T> work)
             throws SQLException {
         long before = changes();
-        T result = CacheStore.writeTransaction(cache.writer(), execution::check, () -> {
+        T result = CacheStore.writeTransaction(cache.writer(), check, () -> {
             requireGeneration(cache.writer(), plan.topic().name(), generation);
             return work.run();
         });

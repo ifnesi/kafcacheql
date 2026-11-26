@@ -172,33 +172,16 @@ final class Jdbc {
                 case "getResultSetHoldability": return ResultSet.CLOSE_CURSORS_AT_COMMIT;
                 case "supportsResultSetHoldability": return (int) args[0] == ResultSet.CLOSE_CURSORS_AT_COMMIT;
                 case "getIdentifierQuoteString", "getSearchStringEscape": return name.equals("getIdentifierQuoteString") ? "\"" : "\\";
-                case "getDriverName": return "KafCacheQL";
+                case "getDriverName", "getDatabaseProductName": return "KafCacheQL";
                 case "getDriverMajorVersion": return KafCacheQLDriver.MAJOR_VERSION;
                 case "getDriverMinorVersion": return KafCacheQLDriver.MINOR_VERSION;
-                case "getDriverVersion": return KafCacheQLDriver.MAJOR_VERSION + "." + KafCacheQLDriver.MINOR_VERSION;
+                case "getDriverVersion", "getDatabaseProductVersion": return KafCacheQLDriver.MAJOR_VERSION + "." + KafCacheQLDriver.MINOR_VERSION;
                 default: break;
             }
             if (name.equals("getTables")) {
                 topics = Set.copyOf(connection.cache.listTopics());
             }
-            // An uncached topic has no stored mode yet. Describing it for its key never registers a table.
-            String keyMode = null;
-            boolean keyVisible = false;
-            if (name.equals("getPrimaryKeys") && args[2] != null && !((String) args[2]).startsWith("$")) {
-                Key key = connection.cache.read(r -> {
-                    var stored = cached(r);
-                    String topic = knownViews(r, stored).entrySet().stream()
-                            .filter(e -> e.getValue().equalsIgnoreCase((String) args[2])).map(Map.Entry::getKey)
-                            .findFirst().orElse((String) args[2]);
-                    Table table = stored.get(topic);
-                    return new Key(topic, table == null ? null : table.mode());
-                });
-                keyVisible = visible(key.topic());
-                keyMode = key.mode();
-                if (keyMode == null) keyMode = connection.cache.describeTopic(key.topic()).map(t -> t.mode().value()).orElse(null);
-            }
-            String mode = keyMode;
-            boolean showKey = keyVisible;
+            Map<String, String> keys = name.equals("getPrimaryKeys") ? primaryKeys((String) args[2]) : Map.of();
             Object result = connection.cache.read(reader -> {
                 DatabaseMetaData sqlite = reader.getMetaData();
                 try (var match = reader.prepareStatement("SELECT ? LIKE ? ESCAPE '\\'")) {
@@ -220,11 +203,13 @@ final class Jdbc {
                             CachedRowSet rows;
                             try (var template = copy(sqlite.getPrimaryKeys(null, null, "$meta"))) { rows = template.createCopySchema(); }
                             String table = (String) args[2];
-                            if (namespace(match, args[0], args[1]) && mode != null && showKey) {
-                                add(rows, Map.of("TABLE_CAT", "main", "TABLE_SCHEM", "main", "TABLE_NAME", table,
-                                        "COLUMN_NAME", mode.equals("compacted") ? "_key" : "_offset", "KEY_SEQ", 2));
-                                add(rows, Map.of("TABLE_CAT", "main", "TABLE_SCHEM", "main", "TABLE_NAME", table,
-                                        "COLUMN_NAME", "_partition", "KEY_SEQ", 1));
+                            if (namespace(match, args[0], args[1]) && !keys.isEmpty()) {
+                                for (var key : keys.entrySet()) {
+                                    add(rows, Map.of("TABLE_CAT", "main", "TABLE_SCHEM", "main", "TABLE_NAME", key.getKey(),
+                                            "COLUMN_NAME", key.getValue().equals("compacted") ? "_key" : "_offset", "KEY_SEQ", 2));
+                                    add(rows, Map.of("TABLE_CAT", "main", "TABLE_SCHEM", "main", "TABLE_NAME", key.getKey(),
+                                            "COLUMN_NAME", "_partition", "KEY_SEQ", 1));
+                                }
                             } else if (namespace(match, args[0], args[1]) && table != null && table.startsWith("$") && connection.cache.config().metadataShowInternal()) {
                                 rows.close(); rows = copy(sqlite.getPrimaryKeys(null, null, table)); normalize(rows);
                             }
@@ -250,7 +235,52 @@ final class Jdbc {
         }
 
         private record Table(String topic, String view, long generation, String mode, int partitions) {}
-        private record Key(String topic, String mode) {}
+        private record Key(String topic, String view, String mode) {}
+
+        private Map<String, String> primaryKeys(String table) throws SQLException {
+            boolean pattern = table == null || table.contains("%") || table.contains("_");
+            if (table != null && table.startsWith("$")
+                    && (!pattern || connection.cache.read(r -> internalNames(r).contains(table)))) return Map.of();
+            String exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r)).entrySet().stream()
+                    .filter(e -> e.getValue().equalsIgnoreCase(table)).map(Map.Entry::getKey).findFirst().orElse(null));
+            boolean all = exact == null && pattern;
+            if (all) {
+                topics = Set.copyOf(connection.cache.listTopics());
+                // A real name containing '_' still names one topic, rather than being a navigator pattern.
+                exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r)).entrySet().stream()
+                        .filter(e -> e.getValue().equalsIgnoreCase(table)).map(Map.Entry::getKey).findFirst().orElse(null));
+                if (exact != null) all = false;
+            }
+            boolean listed = all;
+            String named = exact == null ? table : exact;
+            var selected = connection.cache.read(r -> {
+                var stored = cached(r);
+                var views = knownViews(r, stored);
+                var result = new ArrayList<Key>();
+                for (String topic : listed ? topics : Set.of(named)) {
+                    if (!visible(topic)) continue;
+                    Table cached = stored.get(topic);
+                    result.add(new Key(topic, listed ? views.get(topic) : table, cached == null ? null : cached.mode()));
+                }
+                return result;
+            });
+            var modes = new HashMap<String, String>();
+            var missing = new java.util.HashSet<String>();
+            for (var key : selected) {
+                if (key.mode() == null) missing.add(key.topic()); else modes.put(key.topic(), key.mode());
+            }
+            if (listed) {
+                connection.cache.topicModes(missing).forEach((topic, mode) -> modes.put(topic, mode.value()));
+            } else if (!missing.isEmpty()) {
+                connection.cache.describeTopic(named).ifPresent(info -> modes.put(named, info.mode().value()));
+            }
+            var result = new TreeMap<String, String>();
+            for (var key : selected) {
+                String mode = modes.get(key.topic());
+                if (mode != null) result.put(key.view(), mode);
+            }
+            return result;
+        }
         private Map<String, String> knownViews(Connection reader, Map<String, Table> stored) throws SQLException {
             var known = new java.util.HashSet<>(topics);
             known.addAll(stored.keySet());

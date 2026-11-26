@@ -1,7 +1,9 @@
 package io.github.ifnesi.kafcacheql.testkit;
 
+import com.sun.net.httpserver.HttpServer;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -13,6 +15,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -411,6 +418,57 @@ public final class TestStack {
             throw new IllegalStateException(e.getCause());
         } catch (Exception e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** Count actual HTTP requests while forwarding them to the running registry. */
+    public static final class CountingRegistry implements AutoCloseable {
+        private final AtomicInteger calls = new AtomicInteger();
+        private final HttpClient client = HttpClient.newHttpClient();
+        private final Queue<String> paths = new ConcurrentLinkedQueue<>();
+        private final HttpServer server;
+        private final ExecutorService handlers = Executors.newVirtualThreadPerTaskExecutor();
+        private volatile Runnable beforeResponse = () -> {};
+
+        public int calls() { return calls.get(); }
+        public List<String> paths() { return List.copyOf(paths); }
+        public void reset() { calls.set(0); paths.clear(); }
+        public void beforeResponse(Runnable action) { beforeResponse = action; }
+
+        public CountingRegistry() throws Exception {
+            server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+            server.setExecutor(handlers);
+            server.createContext("/", exchange -> {
+                calls.incrementAndGet();
+                paths.add(exchange.getRequestURI().getPath());
+                try (exchange) {
+                    beforeResponse.run();
+                    HttpResponse<byte[]> response;
+                    try {
+                        response = client.send(HttpRequest.newBuilder(
+                                URI.create(TestStack.REGISTRY + exchange.getRequestURI())).build(),
+                                HttpResponse.BodyHandlers.ofByteArray());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new java.io.IOException(e);
+                    }
+                    exchange.getResponseHeaders().set("Content-Type", "application/vnd.schemaregistry.v1+json");
+                    exchange.sendResponseHeaders(response.statusCode(), response.body().length);
+                    exchange.getResponseBody().write(response.body());
+                }
+            });
+            server.start();
+        }
+
+        public String url() {
+            return "http://localhost:" + server.getAddress().getPort();
+        }
+
+        @Override
+        public void close() {
+            server.stop(0);
+            handlers.close();
+            client.close();
         }
     }
 }

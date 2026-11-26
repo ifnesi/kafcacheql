@@ -77,6 +77,7 @@ class TopicRegistryIT {
 
     /** 0004b acceptance: "append and compacted tables as specified". PLAN §6.4's complete DDL;
      * §6.5: "The mode can be overridden with topic.<name>.mode." §6.3: pruned_below defaults to 0.
+     * 0015f / §6.6: the cache keeps each Protobuf record's message index internally.
      */
     @Test
     void appendAndCompactedTablesHaveTheSpecifiedColumnsAndIndexes() throws Exception {
@@ -101,14 +102,18 @@ class TopicRegistryIT {
                 String table = "$t" + id;
                 assertEquals(List.of(
                         "_partition|INTEGER|1|1", "_offset|INTEGER|1|2", "_timestamp|INTEGER|1|0",
-                        "_key_raw|BLOB|0|0", "_key|TEXT|0|0", "_key_schema_id|TEXT|0|0", "_value|TEXT|0|0",
-                        "_value_schema_id|TEXT|0|0", "_headers|TEXT|0|0", "_decode_error|TEXT|0|0"), query(r,
+                        "_key_raw|BLOB|0|0", "_key|TEXT|0|0", "_key_schema_id|TEXT|0|0", "_key_message_index|TEXT|0|0", "_value|TEXT|0|0",
+                        "_value_schema_id|TEXT|0|0", "_value_message_index|TEXT|0|0", "_headers|TEXT|0|0", "_decode_error|TEXT|0|0"), query(r,
                         "SELECT name, type, \"notnull\", pk FROM pragma_table_info('" + table + "') ORDER BY cid"));
                 assertEquals(List.of("1"), query(r, "SELECT wr FROM pragma_table_list WHERE name = '" + table + "'"));
                 assertEquals(expected == Mode.COMPACTED ? List.of(table + "_key|1", table + "_key_schema|0", table + "_ts|0", table + "_value_schema|0")
                                 : List.of(table + "_key_schema|0", table + "_ts|0", table + "_value_schema|0"), query(r,
                         "SELECT name, \"unique\" FROM pragma_index_list('" + table + "') WHERE origin = 'c' ORDER BY name"));
                 assertEquals(List.of("_timestamp"), query(r, "SELECT name FROM pragma_index_info('" + table + "_ts')"));
+                for (String side : List.of("key", "value")) {
+                    assertEquals(List.of("_" + side + "_schema_id", "_" + side + "_message_index"), query(r,
+                            "SELECT name FROM pragma_index_info('" + table + "_" + side + "_schema') ORDER BY seqno"));
+                }
                 if (expected == Mode.COMPACTED) {
                     assertEquals(List.of("_partition", "_key_raw"), query(r,
                             "SELECT name FROM pragma_index_info('" + table + "_key') ORDER BY seqno"));

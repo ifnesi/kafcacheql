@@ -6,7 +6,7 @@
 
   <groupId>io.github.ifnesi</groupId>
   <artifactId>kafcacheql-jdbc</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
   <packaging>jar</packaging>
 
   <name>KafCacheQL</name>
@@ -75,6 +75,16 @@
       </dependency>
       <!-- Convergence pins: the highest version any path asks for. -->
       <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java</artifactId>
+        <version>4.34.0</version>
+      </dependency>
+      <dependency>
+        <groupId>com.squareup.okio</groupId>
+        <artifactId>okio-jvm</artifactId>
+        <version>3.17.0</version>
+      </dependency>
+      <dependency>
         <groupId>com.google.guava</groupId>
         <artifactId>guava</artifactId>
         <version>${guava.version}</version>
@@ -135,6 +145,11 @@
       <version>${confluent.version}</version>
     </dependency>
     <dependency>
+      <groupId>io.confluent</groupId>
+      <artifactId>kafka-protobuf-serializer</artifactId>
+      <version>${confluent.version}</version>
+    </dependency>
+    <dependency>
       <groupId>org.xerial</groupId>
       <artifactId>sqlite-jdbc</artifactId>
       <version>${sqlite-jdbc.version}</version>
@@ -176,6 +191,8 @@
   </dependencies>
 
   <build>
+    <!-- A fixed file name: the demo and the docs point at target/kafcacheql-jdbc.jar whatever the version. -->
+    <finalName>kafcacheql-jdbc</finalName>
     <pluginManagement>
       <plugins>
         <plugin>
@@ -441,6 +458,18 @@
                 <relocation>
                   <pattern>com.google</pattern>
                   <shadedPattern>${shade.prefix}.com.google</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.squareup</pattern>
+                  <shadedPattern>${shade.prefix}.com.squareup</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.palantir.javapoet</pattern>
+                  <shadedPattern>${shade.prefix}.com.palantir.javapoet</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>okio</pattern>
+                  <shadedPattern>${shade.prefix}.okio</shadedPattern>
                 </relocation>
                 <relocation>
                   <pattern>org.apache.commons</pattern>

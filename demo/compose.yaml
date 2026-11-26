@@ -38,6 +38,17 @@ services:
       configure:
         condition: service_completed_successfully
     networks: [stack]
+  # One-shot check of every note paragraph: docker compose -f demo/compose.yaml run --rm check
+  check:
+    build: ./producer
+    command: ["python", "/demo/check.py"]
+    environment:
+      ZEPPELIN_URL: http://zeppelin:8080
+    volumes:
+      - ./check.py:/demo/check.py:ro
+      - ./zeppelin/store.json:/demo/zeppelin/store.json:ro
+    profiles: [check]
+    networks: [stack]
 volumes:
   cache:
   notebook:

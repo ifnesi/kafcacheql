@@ -51,6 +51,7 @@ import org.junit.jupiter.api.Test;
 class PerformanceMeasurement {
     private static final String URL = "jdbc:kafcacheql://" + TestStack.BOOTSTRAP;
     private static final int PARTITIONS = 3, DELTA = 1_000;
+    private static final String CSV_HEADER = "topic,query,seconds,rows,committed_records,batches,planning_s,fetch_decode_wait_s,commit_s,after_sync_s,checkpoint_s,db_bytes,wal_bytes,kafka_bytes,kafka_records,heap_before_bytes,heap_after_bytes,admin_calls";
     private static final Schema VALUE = new Schema.Parser().parse("""
             {"type":"record","name":"PerformanceValue","fields":[
               {"name":"id","type":"long"}, {"name":"status","type":"string"},
@@ -65,7 +66,7 @@ class PerformanceMeasurement {
                 Runtime.getRuntime().availableProcessors(), Runtime.getRuntime().maxMemory(), Runtime.version());
         List<String> created = new ArrayList<>();
         try (var report = new PrintWriter(Files.newBufferedWriter(output.resolve("queries.csv")))) {
-            report.println("topic,query,seconds,rows,committed_records,batches,planning_s,fetch_decode_wait_s,commit_s,after_sync_s,checkpoint_s,db_bytes,wal_bytes,kafka_bytes,kafka_records,heap_before_bytes,heap_after_bytes,admin_calls");
+            report.println(CSV_HEADER);
             for (boolean compacted : List.of(true, false)) {
                 String mode = compacted ? "compact" : "append";
                 String topic = TestStack.uniqueTopic("perf-" + mode);
@@ -114,6 +115,39 @@ class PerformanceMeasurement {
         }
     }
 
+    /** 0016c / PLAN §10: adopt parallel fetching only when it beats one consumer on the same data. */
+    @Test void parallelFetch() throws Exception {
+        TestStack.requireUp(); Class.forName(KafCacheQLDriver.class.getName());
+        Path output = Files.createTempDirectory(Path.of("target").toAbsolutePath(), "performance-parallel-");
+        System.out.printf("PERF output=%s processors=%d maxHeapBytes=%d java=%s%n", output,
+                Runtime.getRuntime().availableProcessors(), Runtime.getRuntime().maxMemory(), Runtime.version());
+        String topic = TestStack.uniqueTopic("perf-parallel");
+        TestStack.createTopic(topic, 6, Map.of("cleanup.policy", "delete"));
+        try (var report = new PrintWriter(Files.newBufferedWriter(output.resolve("queries.csv")));
+             var producer = producer()) {
+            report.println(CSV_HEADER);
+            produce(producer, topic, 0, 3_000_000, false, System.currentTimeMillis() - 6_060_000, 6);
+            var seconds = new TreeMap<Integer, Double>();
+            // Warm both configurations before timing full first syncs, each into a fresh cache.
+            for (boolean warmup : List.of(true, false)) for (int parallelism : List.of(1, 4)) {
+                String label = (warmup ? "warmup-" : "first-") + parallelism;
+                Path cache = output.resolve(label + ".db");
+                var p = settings(cache); p.setProperty("sync.fetch.parallelism", Integer.toString(parallelism));
+                var config = DriverConfig.load(URL, p);
+                try (var connection = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(config);
+                     var clients = KafkaClients.acquire(config); var calls = new Calls(clients.clients())) {
+                    long records = warmup ? 60_000 : 3_000_000;
+                    String sql = aggregate(topic) + " WHERE _offset>=0" + (warmup ? " AND _offset<10000" : "");
+                    double elapsed = query(connection, control, calls, topic, label, sql, 0, records, 0, records,
+                            cache, output, report, !warmup);
+                    if (!warmup) seconds.put(parallelism, elapsed);
+                }
+            }
+            System.out.println("PERF parallel_first_sync_seconds=" + seconds);
+            assertTrue(seconds.get(4) < seconds.get(1), "Four consumers did not beat one; stop 0016c and report the measurements");
+        } finally { TestStack.deleteTopic(topic); System.out.println("PERF deleted " + topic); }
+    }
+
     private static Properties settings(Path cache) {
         var p = new Properties();
         p.setProperty("cache.path", cache.toString());
@@ -135,6 +169,11 @@ class PerformanceMeasurement {
 
     private static void produce(KafkaProducer<String, GenericData.Record> producer, String topic,
                                 int start, int count, boolean updated, long timestampBase) {
+        produce(producer, topic, start, count, updated, timestampBase, PARTITIONS);
+    }
+
+    private static void produce(KafkaProducer<String, GenericData.Record> producer, String topic,
+                                int start, int count, boolean updated, long timestampBase, int partitions) {
         long begin = System.nanoTime();
         var failure = new AtomicReference<Exception>();
         for (int i = 0; i < count; i++) {
@@ -143,7 +182,7 @@ class PerformanceMeasurement {
             value.put("id", id); value.put("status", updated ? "updated" : "new");
             value.put("amount", id / 100.0); value.put("active", id % 2 == 0);
             // Explicit assignment makes every partition's load and default window reproducible.
-            producer.send(new ProducerRecord<>(topic, (int) (id % PARTITIONS), timestampBase + id * 2, "key-" + id, value),
+            producer.send(new ProducerRecord<>(topic, (int) (id % partitions), timestampBase + id * 2, "key-" + id, value),
                     (metadata, error) -> { if (error != null) failure.compareAndSet(null, error); });
             if ((i + 1) % 100_000 == 0 || i + 1 == count) {
                 producer.flush();
@@ -153,7 +192,7 @@ class PerformanceMeasurement {
         }
     }
 
-    private static void query(Connection connection, CacheContext.Lease control, Calls calls, String topic,
+    private static double query(Connection connection, CacheContext.Lease control, Calls calls, String topic,
                               String label, String sql, long firstId, long expectedRows, long expectedUpdated, long expectedFetched,
                               Path cache, Path output, PrintWriter report, boolean profile) throws Exception {
         var timings = new Timings(label);
@@ -167,6 +206,7 @@ class PerformanceMeasurement {
             assertEquals(expectedFetched, timings.fetched);
             write(report, topic, label, begin, end, rows, timings, cache, calls, before, heapBefore);
             if (recording != null) { recording.stop(); recording.dump(output.resolve(topic + "-" + label + ".jfr")); }
+            return seconds(end - begin);
         }
     }
 
@@ -186,7 +226,8 @@ class PerformanceMeasurement {
     /** Cold, ordinary SELECT (no bounds): the §18 large-append/default-window criterion, without a GUI. */
     private static void defaultWindow(String topic, int records, long timestampBase, Path output, PrintWriter report) throws Exception {
         Path cache = output.resolve("append-default.db");
-        var p = settings(cache); var config = DriverConfig.load(URL, p);
+        var p = settings(cache); p.setProperty("append.default.window", "1h");
+        var config = DriverConfig.load(URL, p);
         try (var connection = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(config);
              var clients = KafkaClients.acquire(config); var calls = new Calls(clients.clients());
              var recording = new Recording(Configuration.getConfiguration("profile"))) {

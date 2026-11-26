@@ -30,17 +30,20 @@ public final class RecordStore {
         boolean compacted = batch.plan().topic().mode() == Mode.COMPACTED;
         String table = StorageDdl.quote(StorageDdl.tableName(batch.generation()));
         Map<String, SchemaStore.StoredSchema> schemas = new HashMap<>();
-        Set<String> keyIds = new HashSet<>(), valueIds = new HashSet<>();
+        Set<SchemaStore.RecordType> keyIds = new HashSet<>(), valueIds = new HashSet<>();
         if (!eligible.isEmpty()) {
             String insert = "INSERT " + (compacted ? "" : "OR IGNORE ") + "INTO " + table + """
-                     (_partition,_offset,_timestamp,_key_raw,_key,_key_schema_id,_value,_value_schema_id,_headers,_decode_error)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                     (_partition,_offset,_timestamp,_key_raw,_key,_key_schema_id,_value,_value_schema_id,_headers,_decode_error,
+                      _key_message_index,_value_message_index)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     """;
             if (compacted) insert += """
                     ON CONFLICT(_partition, _key_raw) DO UPDATE SET
                         _offset=excluded._offset, _timestamp=excluded._timestamp,
                         _key=excluded._key, _key_schema_id=excluded._key_schema_id,
+                        _key_message_index=excluded._key_message_index,
                         _value=excluded._value, _value_schema_id=excluded._value_schema_id,
+                        _value_message_index=excluded._value_message_index,
                         _headers=excluded._headers, _decode_error=excluded._decode_error
                     WHERE excluded._offset > %s._offset
                     """.formatted(table);
@@ -58,6 +61,7 @@ public final class RecordStore {
                         put.setBytes(4, record.key()); put.setString(5, decoded.key().json()); put.setString(6, decoded.key().schemaRef());
                         put.setString(7, decoded.value().json()); put.setString(8, decoded.value().schemaRef());
                         put.setString(9, headers(record.headers())); put.setString(10, decoded.error());
+                        put.setString(11, decoded.key().messageIndex()); put.setString(12, decoded.value().messageIndex());
                         // Compact updates/deletes must keep Kafka order, including repeated keys within this batch.
                         if (compacted) put.executeUpdate(); else put.addBatch();
                     }
@@ -76,8 +80,8 @@ public final class RecordStore {
         }
     }
 
-    private static void schema(Map<String, SchemaStore.StoredSchema> schemas, Set<String> ids, RecordDecoder.Part part) {
-        if (part.schemaRef() != null) ids.add(part.schemaRef());
+    private static void schema(Map<String, SchemaStore.StoredSchema> schemas, Set<SchemaStore.RecordType> ids, RecordDecoder.Part part) {
+        if (part.schemaRef() != null) ids.add(new SchemaStore.RecordType(part.schemaRef(), part.messageIndex()));
         if (part.schema() != null) schemas.putIfAbsent(part.schema().ref(), part.schema());
     }
 

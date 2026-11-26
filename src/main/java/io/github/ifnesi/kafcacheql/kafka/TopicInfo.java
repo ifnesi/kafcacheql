@@ -38,19 +38,27 @@ public record TopicInfo(
     static TopicInfo resolve(String name, Uuid topicId, int partitions, Optional<Map<String, String>> brokerConfigs,
                              DriverConfig config) throws SQLException {
         TopicSettings overrides = config.topic(name);
+        Mode mode = resolveMode(name, brokerConfigs, config);
         if (brokerConfigs.isPresent()) {
             Map<String, String> c = brokerConfigs.get();
-            Mode fromPolicy = c.getOrDefault(CLEANUP_POLICY, "delete").contains("compact") ? Mode.COMPACTED : Mode.APPEND;
             long deleteRetention = Optional.ofNullable(c.get(DELETE_RETENTION_MS))
                     .map(Long::parseLong).orElse(DEFAULT_DELETE_RETENTION_MS);
             TimestampType type = "LogAppendTime".equals(c.get(TIMESTAMP_TYPE))
                     ? TimestampType.LOG_APPEND_TIME : TimestampType.CREATE_TIME;
-            return new TopicInfo(name, topicId, partitions, overrides.mode().orElse(fromPolicy), deleteRetention, type, true);
+            return new TopicInfo(name, topicId, partitions, mode, deleteRetention, type, true);
         }
-        Mode mode = overrides.mode().orElseThrow(() -> ConfigErrors.problem("The configs of topic " + name
-                + " can't be read (no DescribeConfigs permission): set topic." + name + ".mode to append or compacted"));
         // CreateTime is the cautious guess: its timestamp upper bounds never limit the fetch.
         return new TopicInfo(name, topicId, partitions, mode,
                 overrides.deleteRetentionMs().orElse(DEFAULT_DELETE_RETENTION_MS), TimestampType.CREATE_TIME, false);
+    }
+
+    static Mode resolveMode(String name, Optional<Map<String, String>> brokerConfigs, DriverConfig config) throws SQLException {
+        var override = config.topic(name).mode();
+        if (brokerConfigs.isPresent()) {
+            Mode fromPolicy = brokerConfigs.get().getOrDefault(CLEANUP_POLICY, "delete").contains("compact") ? Mode.COMPACTED : Mode.APPEND;
+            return override.orElse(fromPolicy);
+        }
+        return override.orElseThrow(() -> ConfigErrors.problem("The configs of topic " + name
+                + " can't be read (no DescribeConfigs permission): set topic." + name + ".mode to append or compacted"));
     }
 }

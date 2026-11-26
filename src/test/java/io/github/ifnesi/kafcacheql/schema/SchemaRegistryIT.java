@@ -20,6 +20,7 @@ import io.github.ifnesi.kafcacheql.sync.CacheContext;
 import io.github.ifnesi.kafcacheql.sync.Execution;
 import io.github.ifnesi.kafcacheql.testkit.LogCapture;
 import io.github.ifnesi.kafcacheql.testkit.TestStack;
+import io.github.ifnesi.kafcacheql.testkit.TestStack.CountingRegistry;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetSocketAddress;
@@ -40,7 +41,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
@@ -155,19 +155,19 @@ class SchemaRegistryIT {
                  SchemaRegistry registry = registry(counted.url())) {
                 StoredSchema byId = registry.lookup(reader, Integer.toString(id)).orElseThrow();
                 StoredSchema byGuid = registry.lookup(reader, guid).orElseThrow();
-                assertEquals(2, counted.calls.get(), "one HTTP call per new reference");
+                assertEquals(2, counted.calls(), "one HTTP call per new reference");
                 stored = List.of(byId, byGuid);
                 for (StoredSchema schema : stored) {
                     persist(cache, schema);
                 }
             }
-            counted.calls.set(0);
+            counted.reset();
             try (CacheStore cache = cache(); Connection reader = cache.newReader();
                  SchemaRegistry fresh = registry(counted.url())) {
                 for (StoredSchema schema : stored) {
                     assertEquals(schema, fresh.lookup(reader, schema.ref()).orElseThrow());
                 }
-                assertEquals(0, counted.calls.get(), "disk cache, independent of Confluent's in-memory cache");
+                assertEquals(0, counted.calls(), "disk cache, independent of Confluent's in-memory cache");
             }
         }
     }
@@ -289,45 +289,6 @@ class SchemaRegistryIT {
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(200, response.statusCode(), response.body());
             return json(response.body());
-        }
-    }
-
-    /** Count actual HTTP requests while forwarding them to the running registry. */
-    private static final class CountingRegistry implements AutoCloseable {
-        private final AtomicInteger calls = new AtomicInteger();
-        private final HttpClient client = HttpClient.newHttpClient();
-        private final HttpServer server;
-
-        CountingRegistry() throws Exception {
-            server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
-            server.createContext("/", exchange -> {
-                calls.incrementAndGet();
-                try (exchange) {
-                    HttpResponse<byte[]> response;
-                    try {
-                        response = client.send(HttpRequest.newBuilder(
-                                URI.create(TestStack.REGISTRY + exchange.getRequestURI())).build(),
-                                HttpResponse.BodyHandlers.ofByteArray());
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new java.io.IOException(e);
-                    }
-                    exchange.getResponseHeaders().set("Content-Type", "application/vnd.schemaregistry.v1+json");
-                    exchange.sendResponseHeaders(response.statusCode(), response.body().length);
-                    exchange.getResponseBody().write(response.body());
-                }
-            });
-            server.start();
-        }
-
-        String url() {
-            return "http://localhost:" + server.getAddress().getPort();
-        }
-
-        @Override
-        public void close() {
-            server.stop(0);
-            client.close();
         }
     }
 }

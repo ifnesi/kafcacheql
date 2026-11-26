@@ -42,7 +42,7 @@ missing records from Kafka; the decoder turns them into JSON using schemas fetch
 
   <!-- You -->
   <rect class="person" x="18" y="80" width="80" height="40" rx="20" stroke-width="1.5"/>
-  <text class="name" x="58" y="105" text-anchor="middle">You</text>
+  <text class="name" x="58" y="105" text-anchor="middle">User</text>
 
   <!-- The tool's process -->
   <rect class="group" x="125" y="20" width="620" height="395" rx="12" stroke-width="1.5"/>
@@ -64,13 +64,13 @@ missing records from Kafka; the decoder turns them into JSON using schemas fetch
 
   <rect class="box" x="395" y="215" width="140" height="90" rx="6" stroke-width="1.5"/>
   <text class="name" x="465" y="240" text-anchor="middle">Sync worker</text>
-  <text class="note" x="465" y="260" text-anchor="middle">Kafka consumer,</text>
+  <text class="note" x="465" y="260" text-anchor="middle">Kafka consumers,</text>
   <text class="note" x="465" y="276" text-anchor="middle">the only writer</text>
 
   <rect class="box" x="590" y="215" width="120" height="90" rx="6" stroke-width="1.5"/>
   <text class="name" x="650" y="240" text-anchor="middle">Decoder</text>
   <text class="note" x="650" y="260" text-anchor="middle">Avro, JSON Schema,</text>
-  <text class="note" x="650" y="276" text-anchor="middle">plain JSON</text>
+  <text class="note" x="650" y="276" text-anchor="middle">Protobuf, plain JSON</text>
   <text class="note" x="650" y="292" text-anchor="middle">to JSON</text>
 
   <!-- Stores -->

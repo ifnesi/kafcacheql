@@ -60,7 +60,8 @@ class QueryPipelineIT {
         for (String policy : List.of("delete", "compact")) {
             String topic = topic(policy);
             populate(topic);
-            var config = PipelineProcess.config(dir.resolve(policy + ".db"));
+            // The fake clock is shared across partitions, so its timing assertions require sequential fetching.
+            var config = PipelineProcess.config(dir.resolve(policy + ".db"), Map.of("sync.fetch.parallelism", "1"));
             try (var clients = KafkaClients.acquire(config); var calls = new Calls(clients.clients());
                  var cache = CacheContext.acquire(config); var logs = LogCapture.capture()) {
                 AtomicInteger fetched = new AtomicInteger(), ranges = new AtomicInteger();

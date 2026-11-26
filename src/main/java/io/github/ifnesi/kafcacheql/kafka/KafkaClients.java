@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.kafka;
 
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
+import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.Secrets;
 import io.github.ifnesi.kafcacheql.sync.Execution;
@@ -253,28 +254,17 @@ public final class KafkaClients {
             Optional<TopicDescription> found = description(topic, execution);
             if (found.isEmpty()) return Optional.empty();
             TopicDescription description = found.get();
-            Optional<Map<String, String>> values;
-            try {
-                var lookup = configs.computeIfAbsent(description.topicId(), ignored -> topicConfig(topic));
-                var future = lookup;
-                // Share an in-flight lookup, but retain only successful results (even if its caller gave up).
-                if (!lookup.isDone() || lookup.isCompletedExceptionally()) {
-                    future = lookup.whenComplete((ignored, failure) -> {
-                        if (failure != null) configs.remove(description.topicId(), lookup);
-                    });
-                }
-                values = Optional.of(await(future, execution));
-            } catch (ExecutionException e) {
-                if (!(e.getCause() instanceof AuthorizationException)) {
-                    throw sql("Reading the configs of topic " + topic, e.getCause(), settingsForErrors);
-                }
-                values = Optional.empty(); // TopicInfo.resolve's configured fallbacks.
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
-            } catch (RuntimeException e) {
-                throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
+            KafkaFuture<Map<String, String>> lookup;
+            try { lookup = configs.computeIfAbsent(description.topicId(), ignored -> topicConfigs(Set.of(topic)).get(topic)); }
+            catch (RuntimeException e) { throw sql("Reading the configs of topic " + topic, e, settingsForErrors); }
+            var future = lookup;
+            // Share an in-flight lookup, but retain only successful results (even if its caller gave up).
+            if (!lookup.isDone() || lookup.isCompletedExceptionally()) {
+                future = lookup.whenComplete((ignored, failure) -> {
+                    if (failure != null) configs.remove(description.topicId(), lookup);
+                });
             }
+            var values = readTopicConfig(topic, future, execution);
             return Optional.of(TopicInfo.resolve(topic, description.topicId(), description.partitions().size(), values, config));
         }
     }
@@ -291,11 +281,43 @@ public final class KafkaClients {
         }
     }
 
-    private KafkaFuture<Map<String, String>> topicConfig(String topic) {
-        ConfigResource resource = new ConfigResource(ConfigResource.Type.TOPIC, topic);
-        return admin.describeConfigs(List.of(resource)).values().get(resource).thenApply(config ->
+    /** Metadata needs only modes, so uncached topics share one config request and need no descriptions. */
+    public Map<String, Mode> topicModes(Set<String> topics, DriverConfig config) throws SQLException {
+        var result = new HashMap<String, Mode>();
+        if (!topics.isEmpty()) {
+            Map<String, KafkaFuture<Map<String, String>>> futures;
+            try { futures = topicConfigs(topics); }
+            catch (RuntimeException e) { throw sql("Reading the configs of topics " + topics, e, settingsForErrors); }
+            for (String topic : topics) {
+                result.put(topic, TopicInfo.resolveMode(topic, readTopicConfig(topic, futures.get(topic), null), config));
+            }
+        }
+        return result;
+    }
+
+    private Map<String, KafkaFuture<Map<String, String>>> topicConfigs(Set<String> topics) {
+        var resources = topics.stream().map(topic -> new ConfigResource(ConfigResource.Type.TOPIC, topic)).toList();
+        var result = new HashMap<String, KafkaFuture<Map<String, String>>>();
+        admin.describeConfigs(resources).values().forEach((resource, future) -> result.put(resource.name(), future.thenApply(config ->
                 config.entries().stream().filter(e -> e.value() != null)
-                        .collect(Collectors.toUnmodifiableMap(ConfigEntry::name, ConfigEntry::value)));
+                        .collect(Collectors.toUnmodifiableMap(ConfigEntry::name, ConfigEntry::value)))));
+        return result;
+    }
+
+    private Optional<Map<String, String>> readTopicConfig(String topic, KafkaFuture<Map<String, String>> future,
+                                                        Execution execution) throws SQLException {
+        try { return Optional.of(await(future, execution)); }
+        catch (ExecutionException e) {
+            if (!(e.getCause() instanceof AuthorizationException)) {
+                throw sql("Reading the configs of topic " + topic, e.getCause(), settingsForErrors);
+            }
+            return Optional.empty(); // TopicInfo's configured fallbacks.
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
+        } catch (RuntimeException e) {
+            throw sql("Reading the configs of topic " + topic, e, settingsForErrors);
+        }
     }
 
     // ------------------------------------------------------------------ offsets

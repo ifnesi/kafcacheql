@@ -18,12 +18,17 @@ public final class PipelineProcess {
     private PipelineProcess() {}
 
     static DriverConfig config(Path file) throws SQLException {
+        return config(file, Map.of());
+    }
+
+    static DriverConfig config(Path file, Map<String, String> overrides) throws SQLException {
         Properties p = new Properties();
         p.setProperty("cache.path", file.toString());
         p.setProperty("client.id", "pipeline-" + Integer.toHexString(file.toString().hashCode()));
         p.setProperty("schema.registry.url", TestStack.REGISTRY);
         p.setProperty("sync.batch.records", "1");
         p.setProperty("max.poll.records", "1");
+        p.putAll(overrides);
         return DriverConfig.load("jdbc:kafcacheql://" + TestStack.BOOTSTRAP, p);
     }
 

@@ -46,6 +46,7 @@ public record DriverConfig(
         boolean metadataShowInternal,
         String clientId,
         int syncBatchRecords,
+        int syncFetchParallelism,
         Map<String, TopicSettings> topics,
         Map<String, String> clientSettings) {
 
@@ -80,7 +81,7 @@ public record DriverConfig(
                 + ", offline=" + offline
                 + ", topicsInclude=" + topicsInclude + ", topicsExclude=" + topicsExclude
                 + ", metadataShowInternal=" + metadataShowInternal + ", clientId=" + clientId
-                + ", syncBatchRecords=" + syncBatchRecords + ", topics=" + topics
+                + ", syncBatchRecords=" + syncBatchRecords + ", syncFetchParallelism=" + syncFetchParallelism + ", topics=" + topics
                 + ", clientSettings=" + Secrets.masked(clientSettings) + "]";
     }
 
@@ -160,6 +161,7 @@ public record DriverConfig(
                 bool(own, DriverProperty.METADATA_SHOW_INTERNAL),
                 clientId,
                 (int) atLeast(DriverProperty.SYNC_BATCH_RECORDS.key(), own.get(DriverProperty.SYNC_BATCH_RECORDS), 1, Integer.MAX_VALUE),
+                (int) atLeast(DriverProperty.SYNC_FETCH_PARALLELISM.key(), own.get(DriverProperty.SYNC_FETCH_PARALLELISM), 1, Integer.MAX_VALUE),
                 Collections.unmodifiableMap(topics),
                 Collections.unmodifiableMap(client));
     }

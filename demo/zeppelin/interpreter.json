@@ -44,7 +44,7 @@
     },
     "CLASSPATH": {
       "name": "CLASSPATH",
-      "value": "/driver/kafcacheql-jdbc-0.1.0-SNAPSHOT.jar",
+      "value": "/driver/kafcacheql-jdbc.jar",
       "type": "string"
     }
   },

@@ -3,9 +3,14 @@ package io.github.ifnesi.kafcacheql.cache;
 import com.google.common.base.Ascii;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import com.google.protobuf.Descriptors.Descriptor;
+import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.confluent.kafka.schemaregistry.avro.AvroSchema;
 import io.confluent.kafka.schemaregistry.json.JsonSchema;
+import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema;
+import io.confluent.kafka.schemaregistry.protobuf.MessageIndexes;
+import io.github.ifnesi.kafcacheql.cache.SchemaStore.RecordType;
 import org.everit.json.schema.ObjectSchema;
 import org.everit.json.schema.ReferenceSchema;
 import org.everit.json.schema.CombinedSchema;
@@ -46,11 +51,12 @@ public final class TypedViews {
     /** Schema types are available to the later JDBC result/metadata wrappers as well as the renderer. */
     public record Column(String name, String expression, JDBCType type, String warning) {}
     public record Layout(List<Column> columns) {}
-    private record Input(List<SchemaStore.StoredSchema> keys, List<SchemaStore.StoredSchema> values, List<Inferred> inferred) {}
+    private record TypedSchema(SchemaStore.StoredSchema schema, String messageIndex) {}
+    private record Input(List<TypedSchema> keys, List<TypedSchema> values, List<Inferred> inferred) {}
     private record Inferred(String name, Schema.Type type, boolean conflict, boolean key) {}
     private record Version(String ref, Object schema) {}
     private record ViewInput(Ids ids, List<Inferred> inferred) {}
-    private record Ids(Set<String> keys, Set<String> values) {
+    private record Ids(Set<RecordType> keys, Set<RecordType> values) {
         String signature(List<Inferred> inferred) throws SQLException {
             try { return JacksonMapper.INSTANCE.writeValueAsString(inferred.isEmpty() ? List.of(keys, values) : List.of(keys, values, inferred)); }
             catch (IOException e) { throw new SQLException("Encoding view schema IDs", e); }
@@ -62,14 +68,14 @@ public final class TypedViews {
         refresh(writer, generation, Set.of(), Set.of());
     }
 
-    static void refresh(Connection writer, long generation, Set<String> keyIds, Set<String> valueIds) throws SQLException {
+    static void refresh(Connection writer, long generation, Set<RecordType> keyIds, Set<RecordType> valueIds) throws SQLException {
         var previous = StorageDdl.viewSignature(writer, generation);
         Ids ids = previous.isPresent() ? readSignature(previous.get()).ids() : new Ids(new TreeSet<>(), new TreeSet<>());
         ids.keys().addAll(keyIds); ids.values().addAll(valueIds);
         // The persisted layout is read under the same write lock as the batch, never remembered per process.
         // Indexed existence checks also discard IDs whose last row was replaced, tombstoned or pruned.
-        retainPresent(writer, generation, "_key_schema_id", ids.keys());
-        retainPresent(writer, generation, "_value_schema_id", ids.values());
+        retainPresent(writer, generation, "key", ids.keys());
+        retainPresent(writer, generation, "value", ids.values());
         List<Inferred> inferred = infer(writer, generation, ids);
         String signature = ids.signature(inferred);
         // A change of IDs still regenerates a view whose projected columns happen to be identical.
@@ -92,8 +98,8 @@ public final class TypedViews {
     private static ViewInput readSignature(String signature) throws SQLException {
         try {
             JsonNode input = JacksonMapper.INSTANCE.readTree(signature);
-            Ids ids = new Ids(new TreeSet<>(List.of(JacksonMapper.INSTANCE.treeToValue(input.get(0), String[].class))),
-                    new TreeSet<>(List.of(JacksonMapper.INSTANCE.treeToValue(input.get(1), String[].class))));
+            Ids ids = new Ids(new TreeSet<>(List.of(JacksonMapper.INSTANCE.treeToValue(input.get(0), RecordType[].class))),
+                    new TreeSet<>(List.of(JacksonMapper.INSTANCE.treeToValue(input.get(1), RecordType[].class))));
             List<Inferred> inferred = input.size() == 2 ? List.of()
                     : List.of(JacksonMapper.INSTANCE.treeToValue(input.get(2), Inferred[].class));
             return new ViewInput(ids, inferred);
@@ -104,7 +110,7 @@ public final class TypedViews {
     public static boolean hasSchemas(Connection reader, long generation) throws SQLException {
         var ids = viewInput(reader, generation).ids();
         for (var refs : List.of(ids.keys(), ids.values())) {
-            for (String ref : refs) if (SchemaStore.find(reader, ref).isPresent()) return true;
+            for (RecordType type : refs) if (SchemaStore.find(reader, type.ref()).isPresent()) return true;
         }
         return false;
     }
@@ -140,12 +146,13 @@ public final class TypedViews {
         return warnings;
     }
 
-    private static void retainPresent(Connection reader, long generation, String column, Set<String> refs) throws SQLException {
+    private static void retainPresent(Connection reader, long generation, String side, Set<RecordType> refs) throws SQLException {
         if (refs.isEmpty()) return;
         try (var p = reader.prepareStatement("SELECT 1 FROM " + StorageDdl.quote(StorageDdl.tableName(generation))
-                + " WHERE " + column + "=? LIMIT 1")) {
+                + " WHERE _" + side + "_schema_id=? AND _" + side + "_message_index IS ? LIMIT 1")) {
             for (var it = refs.iterator(); it.hasNext();) {
-                p.setString(1, it.next());
+                var type = it.next();
+                p.setString(1, type.ref()); p.setString(2, type.messageIndex());
                 try (var rows = p.executeQuery()) { if (!rows.next()) it.remove(); }
             }
         }
@@ -218,37 +225,63 @@ public final class TypedViews {
             String base = key ? "key_" + field.name() : field.name();
             String warning = field.conflict() ? "Field " + base + " has conflicting types in the cached JSON sample; exposed as text without conversion" : null;
             add(columns, names, base, field.name(), key, field.conflict() ? JDBCType.VARCHAR : type(field.type()),
-                    field.conflict() || nested(field.type()), warning);
+                    field.conflict() || nested(field.type()), warning, false);
         }
     }
 
-    private static List<SchemaStore.StoredSchema> schemas(Connection reader, Set<String> ids) throws SQLException {
-        var result = new ArrayList<SchemaStore.StoredSchema>();
-        for (String id : ids) SchemaStore.find(reader, id).filter(s -> AvroSchema.TYPE.equals(s.type()) || JsonSchema.TYPE.equals(s.type())).ifPresent(result::add);
+    private static List<TypedSchema> schemas(Connection reader, Set<RecordType> ids) throws SQLException {
+        var result = new ArrayList<TypedSchema>();
+        for (RecordType id : ids) SchemaStore.find(reader, id.ref())
+                .filter(s -> AvroSchema.TYPE.equals(s.type()) || JsonSchema.TYPE.equals(s.type())
+                        || ProtobufSchema.TYPE.equals(s.type()) && id.messageIndex() != null)
+                .ifPresent(s -> result.add(new TypedSchema(s, id.messageIndex())));
         return List.copyOf(result);
     }
 
-    private static List<Version> versions(List<SchemaStore.StoredSchema> schemas) {
-        return schemas.stream().map(s -> new Version(s.ref(), nullable(JsonSchema.TYPE.equals(s.type())
-                ? SchemaRegistry.parseJson(s).rawSchema() : SchemaRegistry.parseAvro(s).rawSchema()))).toList();
+    private static List<Version> versions(List<TypedSchema> schemas) throws SQLException {
+        var result = new ArrayList<Version>();
+        for (var typed : schemas) {
+            var s = typed.schema();
+            Object schema = switch (s.type()) {
+                case JsonSchema.TYPE -> SchemaRegistry.parseJson(s).rawSchema();
+                case ProtobufSchema.TYPE -> {
+                    var protobuf = SchemaRegistry.parseProtobuf(s);
+                    try {
+                        var indexes = new MessageIndexes(List.of(JacksonMapper.INSTANCE.readValue(typed.messageIndex(), Integer[].class)));
+                        yield protobuf.toDescriptor(protobuf.toMessageName(indexes));
+                    } catch (IOException e) { throw new SQLException("Reading cached Protobuf message index", e); }
+                }
+                default -> SchemaRegistry.parseAvro(s).rawSchema();
+            };
+            result.add(new Version(s.ref(), nullable(schema)));
+        }
+        return List.copyOf(result);
     }
 
     private static boolean multipleRecords(List<Version> versions) {
-        return versions.stream().map(Version::schema).filter(Schema.class::isInstance).map(Schema.class::cast)
-                .filter(s -> s.getType() == Schema.Type.RECORD).map(Schema::getFullName).distinct().limit(2).count() > 1;
+        return versions.stream().map(Version::schema).map(schema -> switch (schema) {
+            case Schema avro when avro.getType() == Schema.Type.RECORD -> avro.getFullName();
+            case Descriptor protobuf -> protobuf.getFullName();
+            default -> null;
+        }).filter(java.util.Objects::nonNull).distinct().limit(2).count() > 1;
     }
 
     private static void append(List<Column> columns, Set<String> names, List<Version> versions, boolean key) throws SQLException {
         Map<String, List<Version>> fields = new LinkedHashMap<>();
         for (Version version : versions) {
             Object schema = version.schema();
+            // Message identities were checked before replacing well-known descriptors with JSON shapes.
+            if (schema instanceof Descriptor protobuf) schema = protobufJson(protobuf);
             if (schema instanceof Schema avro && avro.getType() == Schema.Type.RECORD) {
                 for (Schema.Field field : avro.getFields()) fields.computeIfAbsent(field.name(), ignored -> new ArrayList<>())
                         .add(new Version(version.ref(), nullable(field.schema())));
             } else if (schema instanceof ObjectSchema json) {
                 for (var field : json.getPropertySchemas().entrySet()) fields.computeIfAbsent(field.getKey(), ignored -> new ArrayList<>())
                         .add(new Version(version.ref(), nullable(field.getValue())));
-            } else if (key) fields.computeIfAbsent("", ignored -> new ArrayList<>()).add(version);
+            } else if (schema instanceof Descriptor protobuf) {
+                for (var field : protobuf.getFields()) fields.computeIfAbsent(field.getName(), ignored -> new ArrayList<>())
+                        .add(new Version(version.ref(), protobufField(field)));
+            } else if (key) fields.computeIfAbsent("", ignored -> new ArrayList<>()).add(new Version(version.ref(), schema));
         }
         for (var entry : fields.entrySet()) {
             String field = entry.getKey();
@@ -265,12 +298,15 @@ public final class TypedViews {
             JDBCType type = conflict ? JDBCType.VARCHAR : type(widest);
             String warning = conflict ? "Field " + base + " has conflicting types in schema IDs "
                     + types.stream().map(Version::ref).toList() + "; exposed as text without conversion" : null;
-            add(columns, names, base, field.isEmpty() ? null : field, key, type, conflict || nested(kind(widest)), warning);
+            // Conversion follows every contributing representation, not just the widest descriptor.
+            boolean numericString = (type == JDBCType.BIGINT || type == JDBCType.DOUBLE)
+                    && types.stream().anyMatch(t -> numericString(t.schema()));
+            add(columns, names, base, field.isEmpty() ? null : field, key, type, conflict || nested(kind(widest)), warning, numericString);
         }
     }
 
     private static void add(List<Column> columns, Set<String> names, String base, String field, boolean key,
-                            JDBCType type, boolean json, String warning) throws SQLException {
+                            JDBCType type, boolean json, String warning, boolean numericString) throws SQLException {
         String name = base;
         for (int suffix = 1; !names.add(Ascii.toLowerCase(name)); suffix++) name = base + '_' + suffix;
         String path;
@@ -278,7 +314,36 @@ public final class TypedViews {
         catch (IOException e) { throw new SQLException("Encoding JSON field path", e); }
         String expression = (key ? "_key" : "_value") + (json ? " -> " : " ->> ") + "'" + path.replace("'", "''") + "'";
         if (type == JDBCType.NUMERIC) expression = "CAST(" + expression + " AS NUMERIC)";
+        else if (numericString) {
+            if (type == JDBCType.BIGINT) expression = "CAST(" + expression + " AS INTEGER)";
+            else expression = "CASE " + expression + " WHEN 'NaN' THEN 'NaN' WHEN 'Infinity' THEN 'Infinity'"
+                    + " WHEN '-Infinity' THEN '-Infinity' ELSE CAST(" + expression + " AS REAL) END";
+        }
         columns.add(new Column(name, expression, type, warning));
+    }
+
+    private static boolean numericString(Object schema) {
+        return schema instanceof FieldDescriptor field && !field.isRepeated()
+                && field.getJavaType() == FieldDescriptor.JavaType.LONG && type(field) == JDBCType.BIGINT;
+    }
+
+    private static Object protobufField(FieldDescriptor field) {
+        return !field.isRepeated() && field.getJavaType() == FieldDescriptor.JavaType.MESSAGE
+                ? protobufJson(field.getMessageType()) : field;
+    }
+
+    /** JsonFormat's special message shapes replace their wire descriptors before projecting fields. */
+    private static Object protobufJson(Descriptor message) {
+        return switch (message.getFullName()) {
+            case "google.protobuf.Timestamp", "google.protobuf.Duration", "google.protobuf.FieldMask" -> Schema.Type.STRING;
+            case "google.protobuf.DoubleValue", "google.protobuf.FloatValue", "google.protobuf.Int64Value",
+                    "google.protobuf.UInt64Value", "google.protobuf.Int32Value", "google.protobuf.UInt32Value",
+                    "google.protobuf.BoolValue", "google.protobuf.StringValue", "google.protobuf.BytesValue" -> message.findFieldByName("value");
+            case "google.protobuf.Struct", "google.protobuf.Any", "google.protobuf.Empty" -> Schema.Type.RECORD;
+            case "google.protobuf.Value" -> Schema.Type.UNION;
+            case "google.protobuf.ListValue" -> Schema.Type.ARRAY;
+            default -> message;
+        };
     }
 
     private static Object nullable(Object value) {
@@ -321,6 +386,8 @@ public final class TypedViews {
     private static Schema.Type kind(Object schema) {
         return switch (schema) {
             case Schema avro -> avro.getType();
+            case Schema.Type json -> json;
+            case Descriptor ignored -> Schema.Type.RECORD;
             case ObjectSchema ignored -> Schema.Type.RECORD;
             case ArraySchema ignored -> Schema.Type.ARRAY;
             case NumberSchema number -> number.requiresInteger() ? Schema.Type.LONG : Schema.Type.DOUBLE;
@@ -328,6 +395,18 @@ public final class TypedViews {
             case StringSchema ignored -> Schema.Type.STRING;
             case EnumSchema ignored -> Schema.Type.STRING;
             case NullSchema ignored -> Schema.Type.NULL;
+            case FieldDescriptor protobuf -> {
+                if (protobuf.isMapField()) yield Schema.Type.MAP;
+                if (protobuf.isRepeated()) yield Schema.Type.ARRAY;
+                if (protobuf.getType() == FieldDescriptor.Type.UINT64 || protobuf.getType() == FieldDescriptor.Type.FIXED64) yield Schema.Type.STRING;
+                yield switch (protobuf.getJavaType()) {
+                    case INT, LONG -> Schema.Type.LONG;
+                    case FLOAT, DOUBLE -> Schema.Type.DOUBLE;
+                    case BOOLEAN -> Schema.Type.BOOLEAN;
+                    case STRING, BYTE_STRING, ENUM -> Schema.Type.STRING;
+                    case MESSAGE -> Schema.Type.RECORD;
+                };
+            }
             default -> Schema.Type.UNION;
         };
     }

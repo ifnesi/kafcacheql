@@ -1,9 +1,10 @@
 """Run every shipped store paragraph through Zeppelin; no Maven or test-stack changes."""
 import json
+import os
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-BASE = "http://localhost:8090/api"
+BASE = os.environ.get("ZEPPELIN_URL", "http://localhost:8090") + "/api"
 
 
 def api(path, data=None):

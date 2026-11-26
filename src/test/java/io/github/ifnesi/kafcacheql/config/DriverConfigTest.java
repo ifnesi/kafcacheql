@@ -57,7 +57,7 @@ class DriverConfigTest {
         assertEquals(Optional.empty(), c.cachePath());
         assertTrue(c.cacheMaxBytes().isEmpty());
         assertTrue(c.cacheRetentionHours().isEmpty());
-        assertEquals(Window.of(Duration.ofHours(1)), c.appendDefaultWindow());
+        assertEquals(Window.ALL, c.appendDefaultWindow());
         assertEquals(10_000, c.appendDefaultWindowMaxRecords());
         assertEquals(0, c.maxStalenessMs());
         assertFalse(c.offline());
@@ -66,6 +66,7 @@ class DriverConfigTest {
         assertFalse(c.metadataShowInternal());
         assertEquals("kafcacheql", c.clientId());
         assertEquals(5_000, c.syncBatchRecords());
+        assertEquals(4, c.syncFetchParallelism());
         assertEquals(Map.of(), c.topics());
         assertEquals(Map.of("bootstrap.servers", "localhost:9092"), c.clientSettings());
     }
@@ -245,6 +246,7 @@ class DriverConfigTest {
                 "append.default.window.max.records,0", "append.default.window.max.records,-5",
                 "append.default.window.max.records,ten", "max.staleness.ms,1.5",
                 "sync.batch.records,0", "sync.batch.records,2147483648",
+                "sync.fetch.parallelism,0", "sync.fetch.parallelism,-1", "sync.fetch.parallelism,2147483648",
                 "cache.max.bytes,0", "cache.max.bytes,-1", "cache.max.bytes,1.5", "cache.max.bytes,9223372036854775808",
                 "cache.retention.hours,0", "cache.retention.hours,-1", "cache.retention.hours,1.5",
                 "cache.retention.hours,2562047788016", "cache.retention.hours,9223372036854775808",
@@ -266,6 +268,7 @@ class DriverConfigTest {
                     "topics.exclude", "",
                     "client.id", "my-app",
                     "sync.batch.records", "2147483647",
+                    "sync.fetch.parallelism", "1",
                     "cache.max.bytes", "9223372036854775807",
                     "cache.retention.hours", "24",
                     "cache.path", "~/c.db"));
@@ -278,12 +281,13 @@ class DriverConfigTest {
             assertEquals("", c.topicsExclude().pattern());
             assertEquals("my-app", c.clientId());
             assertEquals(Integer.MAX_VALUE, c.syncBatchRecords());
+            assertEquals(1, c.syncFetchParallelism());
             assertEquals(Optional.of(Path.of(System.getProperty("user.home"), "c.db")), c.cachePath());
         }
 
         @Test
         void driverPropertiesDontReachTheClients() throws SQLException {
-            DriverConfig c = DriverConfig.load(URL + "?client.id=x&sync.batch.records=7&topic.t.mode=append"
+            DriverConfig c = DriverConfig.load(URL + "?client.id=x&sync.batch.records=7&sync.fetch.parallelism=2&topic.t.mode=append"
                     + "&cache.retention.hours=1&security.protocol=SSL", null);
             assertEquals(Map.of("bootstrap.servers", "localhost:9092", "security.protocol", "SSL"), c.clientSettings());
         }

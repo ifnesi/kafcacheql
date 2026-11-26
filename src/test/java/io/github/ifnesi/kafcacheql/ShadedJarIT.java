@@ -37,6 +37,7 @@ class ShadedJarIT {
     private static final List<String> RELOCATED = List.of(
             "org/apache/kafka/", "io/confluent/", "org/apache/avro/", "com/fasterxml/jackson/",
             "net/sf/jsqlparser/", "com/google/", "org/apache/commons/", "org/apache/hc/",
+            "com/squareup/", "com/palantir/javapoet/", "okio/",
             "org/yaml/snakeyaml/", "io/swagger/", "com/eclipsesource/json/",
             "org/checkerframework/", "javax/annotation/",
             "org/everit/", "org/json/", "com/damnhandy/", "com/github/erosb/", "com/sanctionco/", "org/joda/", "com/kjetland/", "javax/validation/", "io/github/classgraph/", "nonapi/io/github/classgraph/", "kotlin/", "org/intellij/", "org/jetbrains/");
@@ -164,6 +165,18 @@ class ShadedJarIT {
             Class.forName(shaded + "org.apache.kafka.clients.consumer.KafkaConsumer", true, loader);
             Class.forName(shaded + "io.confluent.kafka.serializers.KafkaAvroDeserializer", true, loader);
             Class.forName(shaded + "io.confluent.kafka.serializers.json.KafkaJsonSchemaDeserializer", true, loader);
+            Class.forName(shaded + "io.confluent.kafka.serializers.protobuf.KafkaProtobufDeserializer", true, loader);
+            var protobuf = Class.forName(shaded + "io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema", true, loader);
+            Object proto = protobuf.getConstructor(String.class).newInstance("syntax = \"proto3\"; message Row { int64 n = 1; }");
+            Object descriptor = protobuf.getMethod("toDescriptor").invoke(proto);
+            assertNotNull(descriptor);
+            var descriptorType = Class.forName(shaded + "com.google.protobuf.Descriptors$Descriptor", true, loader);
+            var dynamic = Class.forName(shaded + "com.google.protobuf.DynamicMessage", true, loader);
+            Object message = dynamic.getMethod("getDefaultInstance", descriptorType).invoke(null, descriptor);
+            Object printer = Class.forName(shaded + "com.google.protobuf.util.JsonFormat", true, loader).getMethod("printer").invoke(null);
+            printer = printer.getClass().getMethod("omittingInsignificantWhitespace").invoke(printer);
+            assertEquals("{}", printer.getClass().getMethod("print",
+                    Class.forName(shaded + "com.google.protobuf.MessageOrBuilder", true, loader)).invoke(printer, message));
             var jsonSchema = Class.forName(shaded + "io.confluent.kafka.schemaregistry.json.JsonSchema", true, loader);
             // Exercise both bundled validators, including their resources, from the standalone JAR.
             for (String dialect : List.of("http://json-schema.org/draft-07/schema#", "https://json-schema.org/draft/2020-12/schema")) {

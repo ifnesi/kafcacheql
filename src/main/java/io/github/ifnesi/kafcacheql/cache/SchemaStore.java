@@ -5,12 +5,20 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Optional;
+import java.util.Comparator;
 
 /** Immutable schemas, addressed only by record ID or GUID. No registry access. */
 public final class SchemaStore {
     private SchemaStore() {}
 
     public record StoredSchema(String ref, String type, String schemaText, String refs, long fetchedMs) {}
+
+    /** A Protobuf schema can contain several messages; other formats have no message index. */
+    public record RecordType(String ref, String messageIndex) implements Comparable<RecordType> {
+        private static final Comparator<RecordType> ORDER = Comparator.comparing(RecordType::ref)
+                .thenComparing(RecordType::messageIndex, Comparator.nullsFirst(Comparator.naturalOrder()));
+        @Override public int compareTo(RecordType other) { return ORDER.compare(this, other); }
+    }
 
     public static Optional<StoredSchema> find(Connection reader, String ref) throws SQLException {
         try (PreparedStatement p = reader.prepareStatement("""

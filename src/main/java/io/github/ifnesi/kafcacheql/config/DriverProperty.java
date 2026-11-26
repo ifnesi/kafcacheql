@@ -16,10 +16,10 @@ public enum DriverProperty {
             "Limit on SQLite pages in use, in bytes. Unset means no limit; eviction follows the query's checked reader snapshot."),
     CACHE_RETENTION_HOURS("cache.retention.hours", null,
             "Positive whole hours to keep append records by timestamp, regardless of Kafka retention. Unset means no age expiry; compacted topics are excluded."),
-    APPEND_DEFAULT_WINDOW("append.default.window", "1h",
-            "Window for append-topic queries without an _offset or _timestamp bound: a duration (500ms, 90s, 15m, 1h, 2d) or all."),
+    APPEND_DEFAULT_WINDOW("append.default.window", "all",
+            "Window for append-topic queries without an _offset or _timestamp bound: a duration (500ms, 90s, 15m, 1h, 2d) or all (no time or record limit)."),
     APPEND_DEFAULT_WINDOW_MAX_RECORDS("append.default.window.max.records", "10000",
-            "Per-partition cap on the default window; whichever limit is smaller wins."),
+            "Per-partition cap when a window duration is set; whichever limit is smaller wins. Ignored for all."),
     MAX_STALENESS_MS("max.staleness.ms", "0",
             "Skip the Kafka offsets check if the topic was checked within this time; 0 checks on every query."),
     OFFLINE("offline", "false",
@@ -33,7 +33,9 @@ public enum DriverProperty {
     CLIENT_ID("client.id", "kafcacheql",
             "Consumer client.id; the admin client gets <client.id>-admin."),
     SYNC_BATCH_RECORDS("sync.batch.records", "5000",
-            "Records written per SQLite transaction while syncing.");
+            "Records written per SQLite transaction while syncing."),
+    SYNC_FETCH_PARALLELISM("sync.fetch.parallelism", "4",
+            "Maximum partitions fetched concurrently per sync; at least 1.");
 
     private final String key;
     private final String defaultValue;

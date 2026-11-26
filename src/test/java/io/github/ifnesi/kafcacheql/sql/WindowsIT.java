@@ -117,7 +117,7 @@ class WindowsIT {
             assertTrue(partitionOnly.warnings().getFirst().getMessage().contains("last 1h, ≤1 records/partition"));
             var allResult = query(all, sql);
             assertEquals(List.of("0|0", "0|1", "0|2", "1|0", "1|1", "1|2"), rows(allResult));
-            assertTrue(allResult.warnings().getFirst().getMessage().contains("default window applied (all)"));
+            assertTrue(allResult.warnings().isEmpty());
             assertTrue(query(records, "SELECT * FROM " + q(defaults) + " WHERE _offset>=0").warnings().isEmpty());
         }
     }

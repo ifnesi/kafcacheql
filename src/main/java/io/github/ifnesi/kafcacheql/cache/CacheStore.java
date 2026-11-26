@@ -48,7 +48,7 @@ public final class CacheStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(CacheStore.class);
 
     /** The cache layout, including topic indexes; a cache in any other version is refused. */
-    public static final int FORMAT_VERSION = 7;
+    public static final int FORMAT_VERSION = 8;
 
     static final int BUSY_TIMEOUT_MS = 5_000;
     public static final long JOURNAL_SIZE_LIMIT = 64L * 1024 * 1024;

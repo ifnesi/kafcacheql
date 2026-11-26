@@ -42,8 +42,10 @@ public final class StorageDdl {
                       _key_raw         BLOB,
                       _key             TEXT,
                       _key_schema_id   TEXT,
+                      _key_message_index TEXT,
                       _value           TEXT,
                       _value_schema_id TEXT,
+                      _value_message_index TEXT,
                       _headers         TEXT,
                       _decode_error    TEXT,
                       PRIMARY KEY (_partition, _offset)
@@ -53,7 +55,7 @@ public final class StorageDdl {
             for (String side : List.of("key", "value")) {
                 String column = "_" + side + "_schema_id";
                 s.execute("CREATE INDEX " + quote(name + "_" + side + "_schema") + " ON " + table
-                        + "(" + column + ") WHERE " + column + " IS NOT NULL");
+                        + "(" + column + ",_" + side + "_message_index) WHERE " + column + " IS NOT NULL");
             }
             if (mode == Mode.COMPACTED) {
                 s.execute("CREATE UNIQUE INDEX " + quote(name + "_key") + " ON " + table + "(_partition, _key_raw)");

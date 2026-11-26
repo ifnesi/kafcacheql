@@ -111,7 +111,7 @@ class KafCacheQLDriverTest {
     @Test
     void propertyInfoForAnUnreadableUrlShowsDefaults() {
         DriverPropertyInfo[] info = driver.getPropertyInfo("jdbc:kafcacheql:nonsense", null);
-        assertEquals("1h", byName(info, "append.default.window").value);
+        assertEquals("all", byName(info, "append.default.window").value);
     }
 
     private static DriverPropertyInfo byName(DriverPropertyInfo[] info, String name) {

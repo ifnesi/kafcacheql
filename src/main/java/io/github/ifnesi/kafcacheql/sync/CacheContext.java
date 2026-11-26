@@ -117,6 +117,11 @@ public final class CacheContext {
             return clients == null ? Optional.empty() : topics.describe(topic, null);
         }
 
+        public Map<String, Mode> topicModes(Set<String> names) throws SQLException {
+            ensureOpen();
+            return clients == null ? Map.of() : clients.clients().topicModes(names, config);
+        }
+
         /** Resolve SQL names without fetching records. Include/exclude patterns affect metadata only. */
         public TopicRegistry.ResolvedTable resolveTable(String name, Execution execution) throws SQLException {
             execution.check();
@@ -308,7 +313,7 @@ public final class CacheContext {
                 }
                 return id;
             }
-            return context.worker.sync(plan, execution, writer, config.syncBatchRecords());
+            return context.worker.sync(plan, execution, writer, config.syncBatchRecords(), config.syncFetchParallelism());
         }
 
         void caughtUp(String topic, long generation, int partition, long capturedAt) throws SQLException {
@@ -336,6 +341,7 @@ public final class CacheContext {
 
         private synchronized void ensureOpen() throws SQLException {
             if (closed) throw new SQLException("Cache lease is closed");
+            context.worker.checkOpen();
         }
 
         @Override public void close() throws SQLException {

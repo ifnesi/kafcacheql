@@ -1,12 +1,29 @@
 # Sample topics
 
-Topics for trying KafCacheQL on the Docker stack in this repository (`docker compose up -d broker
-schema-registry`). The console producers run inside the containers; each line is `key|value`, and an Avro
-key is JSON too, hence the quotes. The [README](../README.md#sql-examples)'s SQL examples run on this data.
+A small shop dataset for trying joins, grouping and JSON queries. Start with customers and orders: customer
+state joins to order history through customer ID. Add events and payments to compare plain JSON with
+schema-backed records. The [SQL examples](sql.md#examples) show what you can ask of each topic.
 
-## `customers` and `orders` (Avro, Schema Registry)
+Avro and JSON Schema records identify their schemas in Schema Registry, so the driver can expose fields as
+columns. Plain JSON needs no registry; its columns are inferred from the records in the local cache, the
+SQLite copy filled by your queries.
 
-A compacted `customers` topic and an append `orders` topic with three partitions:
+## Before you produce
+
+Start the stack from the [quick start](../README.md#quick-start), then run the commands from the repository
+root. Producers run inside the containers. Examples with keys use `key|value`; an Avro string key is JSON,
+hence its quotes.
+
+Use a fresh stack or unused topic names. Rerunning the producers appends more records, so aggregate counts
+will change.
+
+## Customers and orders
+
+Customers are **compacted state**: the latest value per key per partition. Orders are **append history**:
+individual events, even when keys repeat. Both use Avro with Schema Registry. The customer key becomes the SQL
+`key` column, which joins to an order's `customer_id`.
+
+The commands create one partition for customers and three for orders, then write the sample records:
 
 ```sh
 docker compose exec broker kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
@@ -35,9 +52,14 @@ docker compose exec -T schema-registry kafka-avro-console-producer \
   --reader-property 'value.schema={"type":"record","name":"Order","fields":[{"name":"order_id","type":"string"},{"name":"customer_id","type":"string"},{"name":"status","type":"string"},{"name":"amount","type":"double"}]}'
 ```
 
-## `events` (plain JSON, no Schema Registry)
+After the first query, customers expose `key`, `name` and `country`; orders expose their ID, customer ID,
+status and amount. The sample contains three customers and four orders, ready for the [customer-order
+join](sql.md#join-customer-state-to-orders).
 
-Its columns come from the top-level keys of its newest 1,000 cached records:
+## Events
+
+These plain JSON events need no Schema Registry. They describe clicks and views, with a page and duration in
+milliseconds. The driver [infers their columns](sql.md#columns) when queried:
 
 ```sh
 docker compose exec broker kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
@@ -47,9 +69,12 @@ printf '%s\n' '{"type":"click","page":"/home","ms":120}' '{"type":"view","page":
 docker compose exec -T broker kafka-console-producer --bootstrap-server broker:29092 --topic events
 ```
 
-## `payments` (JSON Schema, Schema Registry)
+The result has `type`, `page` and `ms` columns. Group by `type` to compare event counts and average durations.
 
-Like an Avro topic: a column per property of the schemas in its cached records:
+## Payments
+
+These payments use JSON Schema with Schema Registry. Each record has a payment ID, order ID, amount and
+method. The `order_id` field joins to the Avro orders above, showing that SQL joins work across formats:
 
 ```sh
 docker compose exec broker kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
@@ -61,3 +86,6 @@ docker compose exec -T schema-registry kafka-json-schema-console-producer \
   --reader-property schema.registry.url=http://localhost:8081 \
   --reader-property 'value.schema={"type":"object","properties":{"payment_id":{"type":"string"},"order_id":{"type":"string"},"amount":{"type":"number"},"method":{"type":"string"}}}'
 ```
+
+The result exposes those four fields as columns. Join to orders to see each payment's method and amount beside
+its order status, using the [SQL examples](sql.md#examples).

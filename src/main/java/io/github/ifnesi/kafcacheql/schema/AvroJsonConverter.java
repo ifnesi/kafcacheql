@@ -25,7 +25,7 @@ import org.apache.avro.generic.IndexedRecord;
 /** JSON representation defined by PLAN §7.2. */
 public final class AvroJsonConverter {
     /** Bump whenever the stored JSON representation changes (PLAN §7.3). */
-    public static final int VERSION = 3;
+    public static final int VERSION = 4;
 
     private static final GenericData DATA = AvroSchemaUtils.getGenericData();
     private static final DateTimeFormatter TIME_MILLIS = time(3);

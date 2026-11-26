@@ -8,6 +8,11 @@ import io.confluent.kafka.schemaregistry.json.JsonSchema;
 import io.confluent.kafka.schemaregistry.json.JsonSchemaUtils;
 import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
 import io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer;
+import io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema;
+import io.confluent.kafka.serializers.protobuf.KafkaProtobufSerializer;
+import com.google.protobuf.DynamicMessage;
+import com.google.protobuf.Message;
+import com.google.protobuf.util.JsonFormat;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import com.sun.net.httpserver.HttpServer;
 import com.zaxxer.hikari.HikariConfig;
@@ -22,6 +27,7 @@ import io.github.ifnesi.kafcacheql.sync.Execution;
 import io.github.ifnesi.kafcacheql.sync.SyncBatch;
 import io.github.ifnesi.kafcacheql.sync.SyncWorker;
 import io.github.ifnesi.kafcacheql.testkit.TestStack;
+import io.github.ifnesi.kafcacheql.testkit.TestStack.CountingRegistry;
 import io.github.ifnesi.kafcacheql.testkit.LogCapture;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -84,6 +90,122 @@ class JdbcIT {
         var result = new ArrayList<Integer>();
         while (rows.next()) result.add(rows.getInt(1));
         return result;
+    }
+
+    /** 0016c / PLAN §10: a fixed set of consumers fetches the waiting partitions, feeding one writer;
+     * each batch has its own generation-checked transaction and ranges. §10.1: one deadline/token
+     * stops the whole execution; §10: batches already committed are kept after cancellation.
+     * §10: each owner decodes with its own decoder/reader; the shared registry loads an ID once.
+     */
+    @Test void parallelFetchCoversAllPartitionsAndCancellationKeepsCommittedBatches() throws Exception {
+        String topic = TestStack.uniqueTopic("jdbc-parallel"), table = StorageDdl.quote(topic);
+        TestStack.createTopic(topic, 6, Map.of());
+        var schema = new Schema.Parser().parse(VALUE.toString().replace("JdbcValue", "Parallel_" + topic.replace('-', '_')));
+        String schemaId = null;
+        for (int partition = 0; partition < 6; partition++) for (int offset = 0; offset < 12; offset++) {
+            var value = new GenericData.Record(schema); value.put("n", partition * 12 + offset); value.put("ok", true);
+            var headers = new RecordHeaders();
+            byte[] bytes = TestStack.serializeAvro(topic, headers, value, TestStack.SchemaIdIn.PREFIX, false);
+            schemaId = Integer.toString(ByteBuffer.wrap(bytes, 1, 4).getInt());
+            TestStack.send(topic, partition, null, TestStack.utf8("k" + offset), bytes, headers);
+        }
+        var p = settings(); p.setProperty("client.id", topic); p.setProperty("sync.fetch.parallelism", "4");
+        p.setProperty("sync.batch.records", "2"); p.setProperty("max.poll.records", "2");
+        try (var logs = LogCapture.capture(); var registry = new CountingRegistry()) {
+            p.setProperty("schema.registry.url", registry.url());
+            String expectedSchema = schemaId;
+            for (boolean cancel : List.of(false, true)) {
+                registry.reset();
+                var schemaRequested = new CountDownLatch(1); var schemaRelease = new CountDownLatch(1);
+                registry.beforeResponse(() -> {
+                    schemaRequested.countDown();
+                    try { schemaRelease.await(); }
+                    catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalStateException(e); }
+                });
+                p.setProperty("cache.path", dir.resolve(cancel ? "cancel.db" : "complete.db").toString());
+                var held = new CountDownLatch(1); var release = new CountDownLatch(1);
+                var once = new AtomicBoolean();
+                try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+                     var control = CacheContext.acquire(DriverConfig.load(URL, p));
+                     var tasks = Executors.newVirtualThreadPerTaskExecutor()) {
+                    control.hooks(new SyncWorker.Hooks() {
+                        @Override public void afterCommit(SyncBatch batch) throws SQLException {
+                            assertTrue(Thread.currentThread().getName().startsWith("kafcacheql-sync-"), "only the worker commits");
+                            if (once.compareAndSet(false, true)) { held.countDown(); await(release); }
+                        }
+                    });
+                    var querying = tasks.submit(() -> {
+                        try (var rows = s.executeQuery("SELECT n FROM " + table + " ORDER BY _partition,_offset")) { return values(rows); }
+                    });
+                    try {
+                        try {
+                            assertTrue(schemaRequested.await(10, TimeUnit.SECONDS));
+                            TestStack.await(() -> Thread.getAllStackTraces().entrySet().stream().filter(entry ->
+                                    entry.getKey().getName().startsWith("kafcacheql-fetch-" + topic)
+                                    && Arrays.stream(entry.getValue()).anyMatch(frame -> frame.getClassName().equals(
+                                            "io.github.ifnesi.kafcacheql.schema.SchemaRegistry") && frame.getMethodName().equals("resolve")))
+                                    .count() == 4, "four owners resolving the same new schema together");
+                        } finally { schemaRelease.countDown(); }
+                        assertTrue(held.await(10, TimeUnit.SECONDS));
+                        TestStack.await(() -> consumerBeans(topic).size() == 4, "four consumers for six waiting partitions");
+                        if (cancel) {
+                            s.cancel();
+                            var failure = assertThrows(java.util.concurrent.ExecutionException.class, () -> querying.get(2, TimeUnit.SECONDS));
+                            assertInstanceOf(SQLException.class, failure.getCause());
+                            assertEquals("57014", ((SQLException) failure.getCause()).getSQLState());
+                        }
+                    } finally { release.countDown(); }
+                    long generation = control.read(r -> TopicRegistry.generation(r, topic).orElseThrow());
+                    if (cancel) {
+                        // A writer barrier confirms cancellation has released the worker.
+                        try (var execution = new Execution(java.time.Duration.ofSeconds(5))) { control.write(topic, generation, execution, w -> null); }
+                        assertEquals(2, cachedCount(control, topic));
+                        assertEquals(2L, control.<Long>read(r -> {
+                            try (var q = r.createStatement(); var rows = q.executeQuery("SELECT sum(end_offset-start_offset) FROM \"$ranges\"")) {
+                                assertTrue(rows.next()); return rows.getLong(1);
+                            }
+                        }).longValue());
+                        assertFalse(Thread.getAllStackTraces().entrySet().stream().anyMatch(entry ->
+                                entry.getKey().getName().startsWith("kafcacheql-fetch-" + topic)
+                                && Arrays.stream(entry.getValue()).anyMatch(frame -> frame.getMethodName().equals("fetchRange"))),
+                                "no consumer is still fetching after the cancelled request drains");
+                        control.hooks(new SyncWorker.Hooks() {});
+                        try (var rows = s.executeQuery("SELECT n FROM " + table + " ORDER BY _partition,_offset")) {
+                            assertEquals(java.util.stream.IntStream.range(0, 72).boxed().toList(), values(rows));
+                        }
+                    } else assertEquals(java.util.stream.IntStream.range(0, 72).boxed().toList(), querying.get(10, TimeUnit.SECONDS));
+                    control.read(r -> {
+                        try (var q = r.createStatement(); var rows = q.executeQuery("SELECT partition_no,start_offset,end_offset FROM \"$ranges\" ORDER BY partition_no")) {
+                            for (int partition = 0; partition < 6; partition++) {
+                                assertTrue(rows.next()); assertEquals(partition, rows.getInt(1)); assertEquals(0, rows.getLong(2)); assertEquals(12, rows.getLong(3));
+                            }
+                            assertFalse(rows.next());
+                        }
+                        return null;
+                    });
+                    assertEquals(1, registry.calls(), "one registry request for the ID shared by all six partitions: " + registry.paths());
+                    assertEquals(List.of(expectedSchema), control.read(r -> {
+                        var refs = new ArrayList<String>();
+                        try (var q = r.createStatement(); var rows = q.executeQuery("SELECT ref FROM \"$schemas\"")) {
+                            while (rows.next()) refs.add(rows.getString(1));
+                        }
+                        return refs;
+                    }), "the writer persisted the schema with the committed records");
+                    // Like sync.batch.records, a second lease may choose a different parallelism.
+                    var other = new Properties(); other.putAll(p); other.setProperty("sync.fetch.parallelism", "1");
+                    try (var connection = DriverManager.getConnection(URL, other); var statement = connection.createStatement();
+                         var rows = statement.executeQuery("SELECT count(*) FROM " + table)) { assertTrue(rows.next()); assertEquals(72, rows.getInt(1)); }
+                } finally { release.countDown(); schemaRelease.countDown(); }
+                assertTrue(consumerBeans(topic).isEmpty(), "last connection closes every owned consumer");
+            }
+            assertTrue(logs.lines().stream().noneMatch(line -> line.startsWith("WARN ")), logs.lines().toString());
+        }
+    }
+
+    private static Set<javax.management.ObjectName> consumerBeans(String clientId) {
+        try { return java.lang.management.ManagementFactory.getPlatformMBeanServer().queryNames(
+                new javax.management.ObjectName("kafka.consumer:type=app-info,id=" + clientId + "*"), null); }
+        catch (javax.management.MalformedObjectNameException e) { throw new IllegalArgumentException(e); }
     }
 
     /** 0016b / PLAN §10: used SQLite pages, oldest append records across topics/partitions first,
@@ -440,6 +562,7 @@ class JdbcIT {
 
     /** 0016d / PLAN §8.4: a simple offset-descending literal LIMIT replaces the default window,
      * per selected partition. Other predicates keep the default; invisible offsets extend by the shortfall.
+     * 0019a / §8.4: the built-in default reads everything Kafka holds, with no time or record cap or warning.
      */
     @Test void tailQueriesFetchOnlySelectedTailsAndExtendPastTransactionGaps() throws Exception {
         String topic = TestStack.uniqueTopic("jdbc-tail"), table = StorageDdl.quote(topic);
@@ -450,8 +573,16 @@ class JdbcIT {
             for (int n = 0; n < lengths[partition]; n++) TestStack.send(topic, partition, old,
                     TestStack.utf8("key" + n), TestStack.utf8("value" + n), null);
         }
-        var p = settings(); p.remove("schema.registry.url"); p.setProperty("append.default.window", "30s");
+        var p = settings(); p.remove("schema.registry.url"); p.remove("append.default.window");
         p.setProperty("append.default.window.max.records", "1");
+        try (var c = DriverManager.getConnection(URL, p); var statement = c.createStatement();
+             var rows = statement.executeQuery("SELECT _partition,_offset FROM " + table + " ORDER BY _partition,_offset")) {
+            for (int partition = 0; partition < lengths.length; partition++) for (int offset = 0; offset < lengths[partition]; offset++) {
+                assertTrue(rows.next()); assertEquals(partition, rows.getInt(1)); assertEquals(offset, rows.getLong(2));
+            }
+            assertFalse(rows.next()); assertNull(statement.getWarnings());
+        }
+        p.setProperty("append.default.window", "30s");
         for (boolean selected : List.of(false, true)) {
             p.setProperty("cache.path", dir.resolve("tail-" + selected + ".db").toString());
             var fetched = new ArrayList<String>();
@@ -534,6 +665,307 @@ class JdbcIT {
                 }
                 assertEquals(List.of(0L), fetched); assertNull(statement.getWarnings());
             }
+        }
+    }
+
+    /** 0015f / PLAN §7.1–7.3: Confluent handles references and message indexes from each record's
+     * prefix/header. §6.6: one message type gets descriptor-derived columns; several get JSON only.
+     * §7.2: int64 stays BIGINT even though JsonFormat writes a string; nested values stay JSON.
+     */
+    @Test void protobufRecordsUseMessageIndexesReferencesAndTypedColumns() throws Exception {
+        String single = topic("delete"), mixed = topic("delete"), file = single + "-address.proto";
+        String address = "syntax = \"proto3\"; package shop; message Address { string city = 1; }";
+        String source = """
+                syntax = "proto3";
+                package shop;
+                import "%s";
+                message Other { string note = 1; }
+                message Order {
+                  int64 order_id = 1;
+                  int32 quantity = 2;
+                  double ratio = 3;
+                  bool ok = 4;
+                  string text = 5;
+                  enum State { OPEN = 0; CLOSED = 1; }
+                  State state = 6;
+                  bytes raw = 7;
+                  Address address = 8;
+                  repeated int32 items = 9;
+                  map<string, int64> labels = 10;
+                  oneof choice { string choice_text = 11; int64 choice_n = 12; }
+                }
+                """.formatted(file);
+        try (var rest = new RestService(TestStack.REGISTRY)) {
+            rest.registerSchema(address, "PROTOBUF", List.of(), file, false);
+        }
+        var schema = new ProtobufSchema(source, List.of(new SchemaReference(file, file, 1)), Map.of(file, address), null, null);
+        var order = DynamicMessage.newBuilder(schema.toDescriptor("shop.Order"));
+        JsonFormat.parser().merge("""
+                {"order_id":"9007199254740993","quantity":3,"ratio":1.25,"ok":true,"text":"hello",
+                 "state":"CLOSED","raw":"AQI=","address":{"city":"London"},"items":[1,2],
+                 "labels":{"stock":"7"},"choice_n":"9"}
+                """, order);
+        var other = DynamicMessage.newBuilder(schema.toDescriptor("shop.Other"));
+        JsonFormat.parser().merge("{\"note\":\"other\"}", other);
+        var p = settings(); p.setProperty("topic." + single + ".key.format", "protobuf");
+        // Values use auto, keys force protobuf, and Order is the non-default message index [1].
+        for (var where : TestStack.SchemaIdIn.values()) sendProtobuf(single, other.build(), order.build(), where);
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var rows = s.executeQuery("SELECT * FROM " + StorageDdl.quote(single) + " ORDER BY _offset")) {
+                for (String name : List.of("order_id", "quantity", "choice_n")) assertType(rows, name, JDBCType.BIGINT);
+                assertType(rows, "ratio", JDBCType.DOUBLE); assertType(rows, "ok", JDBCType.BOOLEAN);
+                for (String name : List.of("key_note", "text", "state", "raw", "address", "items", "labels", "choice_text"))
+                    assertType(rows, name, JDBCType.VARCHAR);
+                for (int i = 0; i < 2; i++) {
+                    assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                    assertEquals(9007199254740993L, rows.getObject("order_id"));
+                    assertEquals(3L, rows.getObject("quantity")); assertEquals(9L, rows.getObject("choice_n"));
+                    assertEquals(1.25, rows.getObject("ratio")); assertEquals(true, rows.getObject("ok"));
+                    assertEquals("other", rows.getString("key_note")); assertEquals("hello", rows.getString("text"));
+                    assertEquals("CLOSED", rows.getString("state")); assertEquals("AQI=", rows.getString("raw"));
+                    assertEquals("{\"city\":\"London\"}", rows.getString("address")); assertEquals("[1,2]", rows.getString("items"));
+                    assertEquals("{\"stock\":\"7\"}", rows.getString("labels")); assertNull(rows.getObject("choice_text"));
+                    assertEquals("9007199254740993", JacksonMapper.INSTANCE.readTree(rows.getString("_value")).get("order_id").textValue());
+                    assertEquals(i == 1, rows.getString("_value_schema_id").contains("-"));
+                }
+                assertFalse(rows.next());
+            }
+            // SQL comparisons use the integer view expression, not JsonFormat's quoted digits.
+            try (var rows = s.executeQuery("SELECT order_id FROM " + StorageDdl.quote(single) + " WHERE order_id=9007199254740993")) {
+                assertEquals(2, values(rows).size());
+            }
+            sendProtobuf(mixed, null, order.build(), TestStack.SchemaIdIn.PREFIX);
+            try (var rows = s.executeQuery("SELECT order_id FROM " + StorageDdl.quote(mixed))) {
+                assertTrue(rows.next()); assertEquals(9007199254740993L, rows.getObject(1)); assertFalse(rows.next());
+            }
+            // Same schema ID, different message index: the existing typed columns must disappear.
+            sendProtobuf(mixed, null, other.build(), TestStack.SchemaIdIn.PREFIX);
+            try (var rows = s.executeQuery("SELECT * FROM " + StorageDdl.quote(mixed) + " ORDER BY _offset")) {
+                assertEquals(9, rows.getMetaData().getColumnCount());
+                assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                String id = rows.getString("_value_schema_id");
+                assertEquals("London", JacksonMapper.INSTANCE.readTree(rows.getString("_value")).get("address").get("city").textValue());
+                assertTrue(rows.next()); assertNull(rows.getString("_decode_error")); assertEquals(id, rows.getString("_value_schema_id"));
+                assertEquals("{\"note\":\"other\"}", rows.getString("_value")); assertFalse(rows.next());
+            }
+            assertEquals(Set.of("_partition", "_offset", "_timestamp", "_key", "_value", "_headers",
+                    "_key_schema_id", "_value_schema_id", "_decode_error"), columnTypes(c, mixed).keySet());
+            // PLAN §6.6/§7.2: numeric evolution keeps numeric SQL comparisons; unsigned values stay exact;
+            // well-known messages follow their JSON representation, including primitive keys and values.
+            assertAll(() -> protobufNumericEvolution(s), () -> protobufUnsigned(s), () -> protobufWellKnown(s),
+                    () -> protobufWellKnownMix(s), () -> protobufAny(file, address));
+        }
+    }
+
+    private static void protobufNumericEvolution(Statement statement) throws Exception {
+        var checks = new ArrayList<org.junit.jupiter.api.function.Executable>();
+        for (String changed : List.of("int32", "double")) checks.add(() -> {
+            String topic = topic("delete"), table = StorageDdl.quote(topic);
+            try (var rest = new RestService(TestStack.REGISTRY)) { rest.updateCompatibility("NONE", topic + "-value"); }
+            // Opposite changes also make this independent of the order in which cached schema IDs sort.
+            for (boolean newer : List.of(false, true)) {
+                var schema = new ProtobufSchema("syntax=\"proto3\"; package evolution; message Row { "
+                        + (newer ? changed : "int64") + " n=1; " + (newer ? "int64" : changed) + " other=2; }");
+                var row = DynamicMessage.newBuilder(schema.toDescriptor());
+                JsonFormat.parser().merge(newer ? "{\"n\":20,\"other\":\"20\"}" : "{\"n\":\"2\",\"other\":2}", row);
+                sendProtobuf(topic, null, row.build(), TestStack.SchemaIdIn.PREFIX);
+            }
+            try (var rows = statement.executeQuery("SELECT n FROM " + table + " WHERE n>10 ORDER BY _offset")) {
+                var values = new ArrayList<Double>(); while (rows.next()) values.add(rows.getDouble(1));
+                assertEquals(List.of(20.0), values, changed + " evolution must compare numbers, not quoted digits");
+            }
+            try (var rows = statement.executeQuery("SELECT n,typeof(n),other,typeof(other) FROM " + table + " ORDER BY _offset")) {
+                var type = changed.equals("double") ? JDBCType.DOUBLE : JDBCType.BIGINT;
+                assertType(rows, "n", type); assertType(rows, "other", type);
+                for (double expected : List.of(2.0, 20.0)) {
+                    assertTrue(rows.next()); assertEquals(expected, rows.getDouble(1)); assertEquals(expected, rows.getDouble(3));
+                    assertEquals(changed.equals("double") ? "real" : "integer", rows.getString(2));
+                    assertEquals(rows.getString(2), rows.getString(4));
+                }
+                assertFalse(rows.next());
+            }
+            if (changed.equals("double")) {
+                var schema = new ProtobufSchema("syntax=\"proto3\"; package evolution; message Row { double n=1; int64 other=2; }");
+                var nonFinite = DynamicMessage.newBuilder(schema.toDescriptor());
+                JsonFormat.parser().merge("{\"n\":\"NaN\",\"other\":\"30\"}", nonFinite);
+                sendProtobuf(topic, null, nonFinite.build(), TestStack.SchemaIdIn.PREFIX);
+                try (var rows = statement.executeQuery("SELECT n FROM " + table + " WHERE _offset=2")) {
+                    assertTrue(rows.next()); assertEquals(Double.NaN, rows.getObject(1)); assertEquals("NaN", rows.getString(1));
+                }
+            }
+        });
+        assertAll(checks);
+    }
+
+    private static void protobufUnsigned(Statement statement) throws Exception {
+        String topic = topic("delete");
+        var schema = new ProtobufSchema("syntax=\"proto3\"; message Unsigned { uint64 u=1; fixed64 f=2; uint32 u32=3; int64 signed=4; }");
+        var value = DynamicMessage.newBuilder(schema.toDescriptor());
+        JsonFormat.parser().merge("{\"u\":\"18446744073709551615\",\"f\":\"18446744073709551614\",\"u32\":4294967295,\"signed\":\"9007199254740993\"}", value);
+        sendProtobuf(topic, null, value.build(), TestStack.SchemaIdIn.PREFIX);
+        try (var rows = statement.executeQuery("SELECT *,typeof(u) AS storage_type FROM " + StorageDdl.quote(topic))) {
+            assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+            assertAll(() -> assertType(rows, "u", JDBCType.VARCHAR), () -> assertType(rows, "f", JDBCType.VARCHAR),
+                    () -> assertEquals("18446744073709551615", rows.getObject("u")),
+                    () -> assertEquals("18446744073709551614", rows.getObject("f")),
+                    () -> assertEquals("text", rows.getString("storage_type")));
+            assertType(rows, "u32", JDBCType.BIGINT); assertEquals(4294967295L, rows.getObject("u32"));
+            assertType(rows, "signed", JDBCType.BIGINT); assertEquals(9007199254740993L, rows.getObject("signed"));
+            assertFalse(rows.next());
+        }
+    }
+
+    private static void protobufWellKnown(Statement statement) throws Exception {
+        var schema = new ProtobufSchema("""
+                syntax="proto3";
+                import "google/protobuf/timestamp.proto";
+                import "google/protobuf/duration.proto";
+                import "google/protobuf/wrappers.proto";
+                import "google/protobuf/struct.proto";
+                import "google/protobuf/field_mask.proto";
+                import "google/protobuf/any.proto";
+                import "google/protobuf/empty.proto";
+                message Known {
+                  google.protobuf.Timestamp timestamp=1; google.protobuf.Duration duration=2;
+                  google.protobuf.DoubleValue d=3; google.protobuf.FloatValue f=4;
+                  google.protobuf.Int64Value i64=5; google.protobuf.UInt64Value u64=6;
+                  google.protobuf.Int32Value i32=7; google.protobuf.UInt32Value u32=8;
+                  google.protobuf.BoolValue b=9; google.protobuf.StringValue s=10; google.protobuf.BytesValue raw=11;
+                  google.protobuf.Struct object=12; google.protobuf.Value dynamic=13; google.protobuf.ListValue list=14;
+                  google.protobuf.FieldMask mask=15; google.protobuf.Any any=16; google.protobuf.Empty empty=17;
+                }
+                """);
+        String json = """
+                {"timestamp":"2023-11-14T22:13:20.123Z","duration":"2.300s","d":1.25,"f":2.5,
+                 "i64":"9007199254740993","u64":"18446744073709551615","i32":7,"u32":4294967295,
+                 "b":true,"s":"hello","raw":"AQI=","object":{"n":3.0},"dynamic":"text","list":[1.0,"two"],
+                 "mask":"customer.name","any":{},"empty":{}}
+                """;
+        var builder = DynamicMessage.newBuilder(schema.toDescriptor()); JsonFormat.parser().merge(json, builder);
+        Message container = builder.build(); var expected = JacksonMapper.INSTANCE.readTree(json);
+        var checks = new ArrayList<org.junit.jupiter.api.function.Executable>();
+        String nested = topic("delete"); sendProtobuf(nested, null, container, TestStack.SchemaIdIn.PREFIX);
+        checks.add(() -> {
+            try (var rows = statement.executeQuery("SELECT * FROM " + StorageDdl.quote(nested))) {
+                assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                var fields = new ArrayList<org.junit.jupiter.api.function.Executable>();
+                for (var field : schema.toDescriptor().getFields()) fields.add(() -> {
+                    String name = field.getName(); JDBCType type = wellKnownType(name); assertType(rows, name, type);
+                    var node = expected.get(name);
+                    Object value = switch (type) {
+                        case BIGINT -> node.asLong(); case DOUBLE -> node.asDouble(); case BOOLEAN -> node.asBoolean();
+                        default -> node.isTextual() && !name.equals("dynamic") ? node.textValue() : node.toString();
+                    };
+                    assertEquals(value, rows.getObject(name), name);
+                });
+                assertAll(fields); assertFalse(rows.next());
+            }
+        });
+        for (var field : container.getDescriptorForType().getFields()) checks.add(() -> {
+            Message message = (Message) container.getField(field); String topic = topic("delete");
+            sendProtobuf(topic, message, message, TestStack.SchemaIdIn.PREFIX);
+            try (var rows = statement.executeQuery("SELECT * FROM " + StorageDdl.quote(topic))) {
+                assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                assertEquals(10, rows.getMetaData().getColumnCount(), field.getMessageType().getFullName() + ": metadata and primitive/JSON key only");
+                assertType(rows, "key", wellKnownType(field.getName()));
+                assertEquals(expected.get(field.getName()), JacksonMapper.INSTANCE.readTree(rows.getString("_value")));
+                assertEquals(rows.getString("_key"), rows.getString("_value"));
+                assertFalse(rows.next());
+            }
+        });
+        assertAll(checks);
+    }
+
+    private static void protobufWellKnownMix(Statement statement) throws Exception {
+        // PLAN §6.6: several message identities get only metadata and JSON, even with special JSON shapes.
+        String topic = topic("delete"), table = StorageDdl.quote(topic);
+        try (var rest = new RestService(TestStack.REGISTRY)) { rest.updateCompatibility("NONE", topic + "-value"); }
+        var schema = new ProtobufSchema("syntax=\"proto3\"; message Row { int32 n=1; }");
+        var row = DynamicMessage.newBuilder(schema.toDescriptor()); JsonFormat.parser().merge("{\"n\":7}", row);
+        sendProtobuf(topic, null, row.build(), TestStack.SchemaIdIn.PREFIX);
+        try (var rows = statement.executeQuery("SELECT n FROM " + table)) {
+            assertTrue(rows.next()); assertEquals(7L, rows.getObject(1)); assertFalse(rows.next());
+        }
+        sendProtobuf(topic, null, com.google.protobuf.Timestamp.newBuilder().setSeconds(1700000000).build(), TestStack.SchemaIdIn.PREFIX);
+        sendProtobuf(topic, null, com.google.protobuf.Struct.newBuilder().putFields("n",
+                com.google.protobuf.Value.newBuilder().setStringValue("not-a-number").build()).build(), TestStack.SchemaIdIn.PREFIX);
+        try (var rows = statement.executeQuery("SELECT * FROM " + table + " ORDER BY _offset")) {
+            assertEquals(9, rows.getMetaData().getColumnCount(), "message identity precedes JSON-shape conversion");
+            for (String json : List.of("{\"n\":7}", "\"2023-11-14T22:13:20Z\"", "{\"n\":\"not-a-number\"}")) {
+                assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                assertEquals(JacksonMapper.INSTANCE.readTree(json), JacksonMapper.INSTANCE.readTree(rows.getString("_value")));
+            }
+            assertFalse(rows.next());
+        }
+    }
+
+    private void protobufAny(String reference, String address) throws Exception {
+        // PLAN §7.2: Any's JSON uses types in the record schema's descriptor graph, without registry lookups.
+        String topic = topic("delete"), table = StorageDdl.quote(topic);
+        var schema = new ProtobufSchema("""
+                syntax="proto3"; package shop;
+                import "google/protobuf/any.proto";
+                import "%s";
+                message Payload { string text=1; }
+                message Envelope { google.protobuf.Any body=1; }
+                """.formatted(reference), List.of(new SchemaReference(reference, reference, 1)), Map.of(reference, address), null, null);
+        var envelope = schema.toDescriptor("shop.Envelope"); var body = envelope.findFieldByName("body");
+        sendProtobuf(topic, null, DynamicMessage.newBuilder(envelope).build(), TestStack.SchemaIdIn.PREFIX);
+        try (var registry = new CountingRegistry()) {
+            var p = settings(); p.setProperty("cache.path", dir.resolve("any.db").toString());
+            p.setProperty("schema.registry.url", registry.url());
+            try (var connection = DriverManager.getConnection(URL, p); var statement = connection.createStatement()) {
+                // Load the schema and its fixed references before any packed value is seen.
+                try (var rows = statement.executeQuery("SELECT _decode_error FROM " + table)) {
+                    assertTrue(rows.next()); assertNull(rows.getString(1)); assertFalse(rows.next());
+                }
+                int requests = registry.calls(); assertTrue(requests > 0);
+                for (String type : List.of("shop.Payload", "shop.Address", "outside.Missing")) {
+                    var descriptor = type.equals("outside.Missing")
+                            ? new ProtobufSchema("syntax=\"proto3\"; package outside; message Missing { string text=1; }").toDescriptor()
+                            : schema.toDescriptor(type);
+                    var payload = DynamicMessage.newBuilder(descriptor);
+                    payload.setField(descriptor.getFields().getFirst(), type.equals("shop.Address") ? "London" : "hello");
+                    var any = DynamicMessage.newBuilder(body.getMessageType());
+                    any.setField(any.getDescriptorForType().findFieldByName("type_url"), "type.googleapis.com/" + type);
+                    any.setField(any.getDescriptorForType().findFieldByName("value"), payload.build().toByteString());
+                    sendProtobuf(topic, null, DynamicMessage.newBuilder(envelope).setField(body, any.build()).build(), TestStack.SchemaIdIn.PREFIX);
+                }
+                try (var rows = statement.executeQuery("SELECT body,_decode_error FROM " + table + " WHERE _offset>0 ORDER BY _offset")) {
+                    assertType(rows, "body", JDBCType.VARCHAR);
+                    for (String expected : List.of("{\"@type\":\"type.googleapis.com/shop.Payload\",\"text\":\"hello\"}",
+                            "{\"@type\":\"type.googleapis.com/shop.Address\",\"city\":\"London\"}")) {
+                        assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                        assertEquals(JacksonMapper.INSTANCE.readTree(expected), JacksonMapper.INSTANCE.readTree(rows.getString("body")));
+                    }
+                    assertTrue(rows.next()); String error = rows.getString("_decode_error");
+                    assertNotNull(error); assertTrue(error.contains("Cannot find type for url"), error);
+                    assertTrue(error.contains("outside.Missing"), error); assertFalse(rows.next());
+                }
+                assertEquals(requests, registry.calls(), "Any resolves only the already loaded descriptor graph");
+            }
+        }
+    }
+
+    private static JDBCType wellKnownType(String name) {
+        return switch (name) {
+            case "i64", "i32", "u32" -> JDBCType.BIGINT;
+            case "d", "f" -> JDBCType.DOUBLE;
+            case "b" -> JDBCType.BOOLEAN;
+            default -> JDBCType.VARCHAR;
+        };
+    }
+
+    private static void sendProtobuf(String topic, Message key, Message value, TestStack.SchemaIdIn where) {
+        try (var keys = new KafkaProtobufSerializer<Message>(); var values = new KafkaProtobufSerializer<Message>()) {
+            Map<String, Object> config = new HashMap<>(); config.put("schema.registry.url", TestStack.REGISTRY);
+            if (where == TestStack.SchemaIdIn.HEADER) {
+                config.put("key.schema.id.serializer", "io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer");
+                config.put("value.schema.id.serializer", "io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer");
+            }
+            keys.configure(config, true); values.configure(config, false);
+            var headers = new RecordHeaders();
+            TestStack.send(topic, 0, null, keys.serialize(topic, headers, key), values.serialize(topic, headers, value), headers);
         }
     }
 
@@ -947,7 +1379,7 @@ class JdbcIT {
             }
             assertMissing(assertThrows(SQLException.class, () -> s.executeQuery(cached)), topic, "[0..1)");
             assertEquals(0, requests.get()); assertNull(field(control, "clients"));
-            assertNull(field(field(field(control, "context"), "worker"), "consumer"));
+            assertTrue(((Set<?>) field(field(field(control, "context"), "worker"), "consumers")).isEmpty());
         } finally { registry.stop(0); }
         p.setProperty("append.default.window.max.records", "1");
         try (var c = DriverManager.getConnection(url, p); var s = c.createStatement(); var rows = s.executeQuery("SELECT n FROM " + table + " ORDER BY _partition")) {
@@ -980,6 +1412,7 @@ class JdbcIT {
         long base = System.currentTimeMillis() - 10000;
         for (int n = 0; n < 4; n++) send(topic, n, base + 1000 * n);
         Properties p = settings();
+        p.setProperty("append.default.window", "1h"); // This flow exercises finite-window warnings explicitly.
         var fetched = new ArrayList<Long>();
         try (var c = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(DriverConfig.load(URL, p))) {
             control.hooks(new SyncWorker.Hooks() {
@@ -1254,8 +1687,13 @@ class JdbcIT {
             Admin original = (Admin) adminField.get(clients.clients());
             var forbidKafka = new AtomicBoolean(false);
             var calls = new ArrayList<String>();
+            var configLookups = new ArrayList<Set<String>>();
             adminField.set(clients.clients(), Proxy.newProxyInstance(Admin.class.getClassLoader(), new Class<?>[] {Admin.class}, (self, method, args) -> {
                 calls.add(method.getName());
+                if (method.getName().equals("describeConfigs")) {
+                    @SuppressWarnings("unchecked") var resources = (Collection<org.apache.kafka.common.config.ConfigResource>) args[0];
+                    configLookups.add(resources.stream().map(org.apache.kafka.common.config.ConfigResource::name).collect(java.util.stream.Collectors.toSet()));
+                }
                 assertFalse(forbidKafka.get(), "unexpected Kafka call: " + method.getName());
                 try { return method.invoke(original, args); }
                 catch (InvocationTargetException e) { throw e.getCause(); }
@@ -1264,6 +1702,9 @@ class JdbcIT {
                 DatabaseMetaData metadata = c.getMetaData();
                 assertSame(c, metadata.getConnection()); assertTrue(metadata.isReadOnly()); assertFalse(metadata.supportsTransactions());
                 assertEquals(URL, metadata.getURL()); assertEquals("KafCacheQL", metadata.getDriverName());
+                // PLAN §12.2: expose KafCacheQL's product identity so tools use standard JDBC introspection.
+                assertAll(() -> assertEquals("KafCacheQL", metadata.getDatabaseProductName()),
+                        () -> assertEquals(metadata.getDriverVersion(), metadata.getDatabaseProductVersion()));
                 assertEquals("\"", metadata.getIdentifierQuoteString());
                 assertEquals(control.read(r -> r.getMetaData().getSQLKeywords()), metadata.getSQLKeywords());
                 assertEquals(control.read(r -> r.getMetaData().getStringFunctions()), metadata.getStringFunctions());
@@ -1335,6 +1776,33 @@ class JdbcIT {
                         forbidKafka.set(false);
                     }
                 }
+                // PLAN §12: append keys are (_partition, _offset), compacted keys (_partition, _key).
+                // Navigator's null/pattern requests list all topics; uncached modes need one batched config call.
+                String uncachedCompact = base + "-uncached-compact";
+                TestStack.createTopic(uncachedCompact, 1, Map.of("cleanup.policy", "compact"));
+                var listed = new TreeSet<String>();
+                try (var tables = metadata.getTables(null, null, "%", null)) {
+                    while (tables.next()) listed.add(tables.getString("TABLE_NAME"));
+                }
+                var beforeKeys = cacheTables(control); int registryBeforeKeys = registryRequests.get();
+                for (String pattern : Arrays.asList("%", null, base + "-%", "_", "$%")) {
+                    calls.clear(); configLookups.clear();
+                    var keysByTable = new TreeMap<String, TreeMap<Integer, String>>();
+                    try (var keys = metadata.getPrimaryKeys(null, null, pattern)) {
+                        while (keys.next()) {
+                            assertEquals("main", keys.getString("TABLE_CAT"));
+                            assertNull(keysByTable.computeIfAbsent(keys.getString("TABLE_NAME"), ignored -> new TreeMap<>())
+                                    .put(keys.getInt("KEY_SEQ"), keys.getString("COLUMN_NAME")), "each key appears once");
+                        }
+                    }
+                    assertEquals(listed, keysByTable.keySet());
+                    keysByTable.forEach((table, keys) -> assertEquals(List.of("_partition",
+                            table.equals(compact) || table.equals(uncachedCompact) ? "_key" : "_offset"), new ArrayList<>(keys.values())));
+                    assertEquals(List.of("listTopics", "describeConfigs"), calls);
+                    assertEquals(List.of(Set.of(base + "-new", uncachedCompact)), configLookups,
+                            "one lookup for both uncached modes, never a pattern or a cached topic");
+                }
+                assertEquals(beforeKeys, cacheTables(control)); assertEquals(registryBeforeKeys, registryRequests.get());
                 assertTrue(registryRequests.get() > 0, "the recording registry served actual decoding requests");
                 Properties shown = new Properties(); shown.putAll(p); shown.setProperty("metadata.show.internal", "true");
                 calls.clear();
@@ -1585,6 +2053,32 @@ class JdbcIT {
             } finally { finish.countDown(); }
             try (var r = s.executeQuery("SELECT 7")) { assertEquals(List.of(7), values(r)); }
         } finally { release.countDown(); }
+
+        // A fatal worker error (e.g. a replaced JAR losing a class) must survive on later JDBC queries,
+        // including cache-only reads (§10.1: those do not go through the worker).
+        Properties broken = settings(); broken.setProperty("cache.path", dir.resolve("dead-worker.db").toString());
+        SQLException closeFailure = assertThrows(SQLException.class, () -> {
+            try (var control = CacheContext.acquire(DriverConfig.load(URL, broken));
+                 var c = DriverManager.getConnection(URL, broken); var s = c.createStatement()) {
+                try (var rows = s.executeQuery(sql)) { assertEquals(30, values(rows).size()); }
+                send(topic, 30, null);
+                control.hooks(new SyncWorker.Hooks() {
+                    @Override public void beforeCommit(SyncBatch batch) { throw new NoClassDefFoundError("demo.MissingJdbcClass"); }
+                });
+                assertThrows(NoClassDefFoundError.class, () -> s.executeQuery(sql));
+                Thread worker = (Thread) field(field(field(control, "context"), "worker"), "thread");
+                worker.join(10_000); assertFalse(worker.isAlive());
+                for (String next : List.of(sql, "SELECT n FROM " + StorageDdl.quote(topic) + " WHERE _offset<30", "SELECT 1")) {
+                    SQLException error = assertThrows(SQLException.class, () -> s.executeQuery(next));
+                    assertTrue(error.getMessage().contains("demo.MissingJdbcClass"), error.toString());
+                    assertNotNull(error.getCause());
+                    assertTrue(error.getCause().toString().contains("demo.MissingJdbcClass"), error.getCause().toString());
+                    Throwable root = error; while (root.getCause() != null) root = root.getCause();
+                    assertTrue(root.toString().contains("NoClassDefFoundError"), root.toString());
+                }
+            }
+        });
+        assertTrue(closeFailure.getMessage().contains("demo.MissingJdbcClass"), closeFailure.toString());
     }
     static void await(CountDownLatch latch) throws SQLException {
         try { if (!latch.await(15, TimeUnit.SECONDS)) throw new SQLException("test latch timed out"); }

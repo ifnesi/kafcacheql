@@ -38,8 +38,8 @@ final class WindowPlanner {
         boolean defaults = !bounds.hasWindowBound() && bounds.tailRecords().isEmpty();
         var window = cache.config().appendDefaultWindow(base.topic().name());
         long maxRecords = cache.config().appendDefaultWindowMaxRecords(base.topic().name());
-        if (defaults) {
-            String description = window.isAll() ? "all" : "last " + window.duration().orElseThrow().toString()
+        if (defaults && !window.isAll()) {
+            String description = "last " + window.duration().orElseThrow().toString()
                     .substring(2).toLowerCase(Locale.ROOT) + ", ≤" + maxRecords + " records/partition";
             warnings.add(new SQLWarning(base.topic().name() + ": default window applied (" + description
                     + "); add a `_timestamp`/`_offset` bound to override", "01000"));
