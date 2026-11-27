@@ -25,9 +25,9 @@ schema.registry.url=http://localhost:8081
 # cache.max.bytes=2000000000
 ```
 
-Client settings such as `security.protocol`, `sasl.*`, `ssl.*` and `basic.auth.user.info` go in the same file.
-The driver redacts credential settings from diagnostics, but the file holds them in plain text: keep it
-readable by you only.
+Credentials and the authentication mode go in the same file; see [authentication](#authentication). The driver
+redacts credential settings from diagnostics, but the file holds them in plain text: keep it readable by you
+only.
 
 ## The URL
 
@@ -49,17 +49,49 @@ so reconnect after changing them.
 
 ## Authentication
 
-Kafka and Schema Registry settings use their usual names, so the `client.properties` file Confluent Cloud
-generates for Java clients works as `config.file`. Leave the URL's host list empty if that file supplies
-`bootstrap.servers`. Driver-controlled settings are refused: consumer-group settings such as `group.id` and
-`enable.auto.commit` (it reads by offset, with no consumer group), and Schema Registry's `use.latest.version`
-and `use.schema.id` (every record is decoded with the schema it names). Keep credentials out of the URL, which
-tools show and log: put them in `config.file` or the driver properties.
+Credentials and the authentication mode go in the settings file, using the standard Kafka and Schema Registry
+client settings. There is no separate driver setting for them. For example, a cluster that uses SASL_SSL with
+an API key, and a Schema Registry that uses its own API key:
 
-Kafka's own SASL mechanisms (PLAIN, SCRAM, OAUTHBEARER) and TLS are meant to work as in any Kafka client,
-Confluent Cloud included; so far SASL/PLAIN is the one tested. Third-party Kafka extensions built against
-Kafka's own classes, such as AWS MSK IAM, are not supported: the driver's copy of Kafka is relocated inside
-its JAR, where such extensions can't load.
+```properties
+# Kafka
+bootstrap.servers=broker.example.com:9092
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \
+  username="<KAFKA_API_KEY>" password="<KAFKA_API_SECRET>";
+
+# Schema Registry
+schema.registry.url=https://registry.example.com
+basic.auth.credentials.source=USER_INFO
+basic.auth.user.info=<SR_API_KEY>:<SR_API_SECRET>
+```
+
+- `security.protocol` sets the mode: `PLAINTEXT` (the default), `SSL`, `SASL_PLAINTEXT` or `SASL_SSL`.
+- `sasl.mechanism` sets the SASL type: `PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`, with the matching login
+  module in `sasl.jaas.config`.
+- `ssl.*` settings, such as `ssl.truststore.location`, add a trust store or a client certificate when the
+  cluster needs one.
+- `basic.auth.credentials.source` and `basic.auth.user.info` give Schema Registry its key and secret.
+
+The `client.properties` file Confluent Cloud generates for Java clients uses these same names, so it works as
+`config.file` as it is. When the file sets `bootstrap.servers`, leave the URL's host list empty:
+
+```
+jdbc:kafcacheql://?config.file=~/.kafcacheql/cloud.properties
+```
+
+Keep credentials out of the URL, which tools show and log: put them in `config.file` or the driver properties.
+
+Driver-controlled settings are refused: consumer-group settings such as `group.id` and `enable.auto.commit`
+(it reads by offset, with no consumer group), and Schema Registry's `use.latest.version` and `use.schema.id`
+(every record is decoded with the schema it names).
+
+Kafka's SASL mechanisms PLAIN and SCRAM, and TLS, are meant to work as in any Kafka client, Confluent Cloud
+included; so far SASL/PLAIN is the one tested. OAuth is not yet supported: neither Kafka's `OAUTHBEARER` nor
+Schema Registry's bearer tokens (`bearer.auth.*`). Third-party Kafka extensions built against Kafka's own
+classes, such as AWS MSK IAM, are not supported: the driver's copy of Kafka is relocated inside its JAR, where
+such extensions can't load.
 
 ## Offline queries
 
