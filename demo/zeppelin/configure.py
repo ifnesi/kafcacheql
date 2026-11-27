@@ -26,5 +26,11 @@ note = json.loads(Path("/demo/store.json").read_text())
 existing_note = next((n for n in api("/notebook")
                       if n.get("path", "").lstrip("/") == note["name"]), None)
 note_id = existing_note["id"] if existing_note else api("/notebook/import", note)
+if existing_note:
+    # Keep user paragraphs; add newly shipped examples when an existing demo is upgraded.
+    present = {p.get("title") for p in api("/notebook/" + note_id)["paragraphs"]}
+    for paragraph in note["paragraphs"]:
+        if paragraph["title"] not in present:
+            api("/notebook/" + note_id + "/paragraph", paragraph)
 print("Configured store note", note_id, flush=True)
 print("JDBC interpreter store configured; shaded JAR mounted at /driver", flush=True)

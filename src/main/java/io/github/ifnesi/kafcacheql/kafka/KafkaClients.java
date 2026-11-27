@@ -22,7 +22,9 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.ConfigEntry;
+import org.apache.kafka.clients.admin.DescribeClusterOptions;
 import org.apache.kafka.clients.admin.ListOffsetsOptions;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.ListTopicsOptions;
@@ -62,6 +64,7 @@ public final class KafkaClients {
 
     private static final Map<Key, Entry> OPEN = new HashMap<>();
     private static final Duration CLOSE_TIMEOUT = Duration.ofSeconds(5);
+    private static final int DEFAULT_OPEN_TIMEOUT_MS = 15_000;
     private static final ListOffsetsOptions READ_COMMITTED = new ListOffsetsOptions(IsolationLevel.READ_COMMITTED);
     /** SQLState for a failure talking to Kafka: "connection failure". */
     static final String KAFKA_FAILURE = "08006";
@@ -182,7 +185,9 @@ public final class KafkaClients {
         Admin admin = null;
         try {
             admin = Admin.create(adminSettings);
-            String clusterId = get(admin.describeCluster().clusterId(), "Reading the cluster ID from "
+            String configuredTimeout = config.clientSettings().get(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG);
+            int openingTimeout = configuredTimeout == null ? DEFAULT_OPEN_TIMEOUT_MS : Integer.parseInt(configuredTimeout.trim());
+            String clusterId = get(admin.describeCluster(new DescribeClusterOptions().timeoutMs(openingTimeout)).clusterId(), "Reading the cluster ID from "
                     + adminSettings.get(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG), forErrors);
             return new KafkaClients(clientId, clusterId, admin, forErrors);
         } catch (SQLException e) {

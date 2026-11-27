@@ -1,10 +1,10 @@
 # KafCacheQL
 
-[![release](https://img.shields.io/github/v/release/ifnesi/kafcacheql)](https://github.com/ifnesi/kafcacheql/releases/latest)
+[![release](https://img.shields.io/github/v/release/ifnesi/kafcacheql)][latest-release]
 [![Java](https://img.shields.io/badge/Java-21%2B-blue)](pom.xml)
 [![Kafka](https://img.shields.io/badge/Kafka-3.1%2B-blue)](https://kafka.apache.org/)
 [![licence](https://img.shields.io/github/license/ifnesi/kafcacheql)](LICENSE)
-[![JAR](https://img.shields.io/badge/JAR-kafcacheql--jdbc--0.1.0.jar-blue)](https://github.com/ifnesi/kafcacheql/releases/download/v0.1.0/kafcacheql-jdbc-0.1.0.jar)
+[![JAR](https://img.shields.io/badge/JAR-kafcacheql--jdbc--0.1.0.jar-blue)][driver-jar]
 
 **Explore Kafka with SQL, in the database tool you already use.**
 
@@ -21,7 +21,8 @@ For experimentation, not recommended for production use.
 write results back to Kafka. Confluent Cloud's Flink can also answer one-off snapshot queries, through its own
 JDBC driver, on a Flink compute pool billed in CFUs. KafCacheQL needs none of that:
 
-- **Any Kafka 3.1+ / Confluent Platform 7.1+:** self-managed or on a laptop.
+- **Kafka 3.1+:** Confluent Cloud, Confluent Platform 7.1+, self-managed or on a laptop. See
+  [supported authentication](docs/configuration.md#authentication).
 - **Nothing to deploy or pay for:** one JAR inside your SQL tool, and a properties file.
 - **A local cache:** a rerun fetches only new records, and cached topics stay queryable offline.
 - **Made for debugging:** a record that fails to decode stays a row, with the error and its raw bytes, next to
@@ -37,7 +38,7 @@ In DBeaver, with schema fields exposed as columns:
 
 And in DataGrip:
 
-![DataGrip showing shop-customers and the ten shop topics](docs/datagrip-shop-customers.png)
+![DataGrip showing shop-customers and the topic list](docs/datagrip-shop-customers.png)
 
 These topics come from the [web-store demo](demo/README.md).
 
@@ -59,8 +60,8 @@ When you run a query:
    default is the whole topic. Offset or timestamp conditions, or an optional configured window, can narrow
    it. Compacted topics are read to their end before SQL filters their state.
 2. It fetches missing records and decodes them. The record's key and value remain available as JSON in `_key`
-   and `_value`. Avro, JSON Schema and Protobuf schemas also supply columns for their fields; plain JSON
-   columns are inferred from cached records.
+   and `_value`, after any configured transforms. Avro, JSON Schema and Protobuf schemas also supply columns
+   for their fields; plain JSON columns are inferred from cached records.
 3. SQLite runs your SELECT, including joins and aggregations, on the cached snapshot.
 
 The first query can take time on a large topic. Later queries reuse the cache. You can also open an **offline
@@ -69,7 +70,8 @@ cache fails instead of returning an incomplete answer.
 
 No separate query service is needed. Schema Registry is used for records that name a schema. KafCacheQL
 accepts SELECTs only; it never produces records or commits consumer offsets to Kafka. The cache is an
-unencrypted local copy; see [cache security](docs/configuration.md#cache-security).
+unencrypted local copy; see [cache security](docs/configuration.md#cache-security). Optional
+[record transforms](docs/transforms.md) drop or mask private fields before they reach that copy.
 
 ## Quick start
 
@@ -102,8 +104,9 @@ curl -fL -o ~/.kafcacheql/kafcacheql-jdbc.jar \
   https://github.com/ifnesi/kafcacheql/releases/download/v0.1.0/kafcacheql-jdbc-0.1.0.jar
 ```
 
-Saving it without the version keeps your tool's settings the same when you upgrade. To build it yourself
-instead, see [Development](#development).
+Saving it without the version keeps your tool's settings the same when you upgrade. These docs describe the
+next release. v0.1.0 lacks [record transforms](docs/transforms.md) and shows header values as base64; until
+the next release, [build the driver](#development) to get them.
 
 ### 3. Add sample data and settings
 
@@ -139,9 +142,10 @@ before trying a larger topic.
 - [Configuration](docs/configuration.md): authentication, windows, parallel fetching, cache limits and offline
   use.
 - [DBeaver and DataGrip](docs/tools.md): driver setup and replacing the JAR safely.
+- [Record transforms](docs/transforms.md): drop or mask private fields before caching, with settings or Java.
 - [JDBC behavior and permissions](docs/jdbc.md): which actions contact Kafka or Schema Registry.
 - [Sample topics](docs/sample-topics.md): Avro, plain JSON and JSON Schema data to try.
-- [Web-store demo](demo/README.md): ten related topics and charts in Apache Zeppelin.
+- [Web-store demo](demo/README.md): related topics, privacy examples and charts in Apache Zeppelin.
 - [Performance measurements](docs/performance.md): cold queries, cache reuse and parallel fetching.
 
 ## Development
@@ -167,3 +171,6 @@ containers: `docker compose down` discards it.
 ## License
 
 [Apache License 2.0](LICENSE)
+
+[latest-release]: https://github.com/ifnesi/kafcacheql/releases/latest
+[driver-jar]: https://github.com/ifnesi/kafcacheql/releases/download/v0.1.0/kafcacheql-jdbc-0.1.0.jar

@@ -1,7 +1,22 @@
 name: kafcacheql-demo
 services:
+  transforms:
+    image: eclipse-temurin:21.0.9_10-jdk-jammy
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        javac --release 21 -cp /driver/kafcacheql-jdbc.jar -d /tmp/classes /source/demo/ShopPrivacy.java &&
+        jar --create --file /transforms/shop-transforms.jar -C /tmp/classes demo
+    volumes:
+      - ../target:/driver:ro
+      - ./transforms:/source:ro
+      - transforms:/transforms
+    networks: [stack]
   zeppelin:
     build: ./zeppelin
+    depends_on:
+      transforms:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:8090:8080"
     environment:
@@ -11,6 +26,7 @@ services:
     volumes:
       - ../target:/driver:ro
       - ./kafcacheql.properties:/demo/kafcacheql.properties:ro
+      - transforms:/transforms:ro
       - cache:/cache
       - notebook:/notebook
     healthcheck:
@@ -50,6 +66,7 @@ services:
     profiles: [check]
     networks: [stack]
 volumes:
+  transforms:
   cache:
   notebook:
 networks:

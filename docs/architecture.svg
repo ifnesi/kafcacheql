@@ -2,7 +2,8 @@
   <title id="title">KafCacheQL architecture</title>
   <desc id="desc">The KafCacheQL JDBC driver runs inside DBeaver, DataGrip or a Java application. Its query side plans the
 offsets a query needs and runs the SQL on a local SQLite cache file; the sync worker, the only writer, fetches
-missing records from Kafka; the decoder turns them into JSON using schemas fetched from Schema Registry by ID.</desc>
+missing records from Kafka; the decoder turns them into JSON using schemas fetched from Schema Registry by ID; optional per-topic
+transforms then drop, mask or change fields before the sync worker writes the records to the cache.</desc>
   <style>
     .bg { fill: #ffffff; }
     .group { fill: #f4f6f8; stroke: #9aa5b1; }
@@ -73,6 +74,11 @@ missing records from Kafka; the decoder turns them into JSON using schemas fetch
   <text class="note" x="650" y="276" text-anchor="middle">Protobuf, plain JSON</text>
   <text class="note" x="650" y="292" text-anchor="middle">to JSON</text>
 
+  <rect class="box dash" x="590" y="325" width="120" height="62" rx="6" stroke-width="1.5"/>
+  <text class="name" x="650" y="345" text-anchor="middle">Transforms</text>
+  <text class="note" x="650" y="363" text-anchor="middle">optional, per topic:</text>
+  <text class="note" x="650" y="379" text-anchor="middle">drop, mask, Java</text>
+
   <!-- Stores -->
   <path class="store" stroke-width="1.5" d="M800,150 a85,12 0 0 1 170,0 v62 a85,12 0 0 1 -170,0 z"/>
   <path class="line" d="M800,150 a85,12 0 0 0 170,0"/>
@@ -104,8 +110,10 @@ missing records from Kafka; the decoder turns them into JSON using schemas fetch
   <text class="label" x="378" y="286" text-anchor="middle">offsets</text>
   <path class="line" marker-end="url(#arrow)" d="M535,245 H590"/>
   <text class="label" x="562" y="238" text-anchor="middle">records</text>
-  <path class="line" marker-end="url(#arrow)" d="M590,280 H535"/>
-  <text class="label" x="562" y="297" text-anchor="middle">JSON</text>
+  <path class="line" marker-end="url(#arrow)" d="M650,305 V325"/>
+  <text class="label" x="657" y="319">JSON</text>
+  <path class="line" marker-end="url(#arrow)" d="M590,356 H512 V305"/>
+  <text class="label" x="551" y="349" text-anchor="middle">to store</text>
 
   <!-- To Kafka -->
   <path class="line dash" marker-end="url(#arrow)" d="M325,228 H365 V142 H800"/>

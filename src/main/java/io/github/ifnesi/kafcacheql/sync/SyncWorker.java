@@ -1,5 +1,6 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import com.google.common.collect.Range;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
 import io.github.ifnesi.kafcacheql.cache.EvictionStore;
@@ -95,6 +96,7 @@ public final class SyncWorker implements AutoCloseable {
     private final Thread thread;
     private final DriverConfig config;
     private final ClientSettings settings;
+    private final RecordTransforms transforms;
     private final CompletableFuture<CacheStore> opened = new CompletableFuture<>();
     private final CompletableFuture<Void> stopped = new CompletableFuture<>();
     private volatile Hooks hooks = new Hooks() {};
@@ -110,7 +112,8 @@ public final class SyncWorker implements AutoCloseable {
     // Worker-confined; reset for each foreground sync and set only after a transaction commits.
     private boolean syncWrote;
 
-    SyncWorker(Path path, Optional<String> clusterId, DriverConfig config, ClientSettings settings) {
+    SyncWorker(Path path, Optional<String> clusterId, DriverConfig config, ClientSettings settings, RecordTransforms transforms) {
+        this.transforms = transforms;
         this.config = config;
         this.settings = settings;
         thread = Thread.ofPlatform().daemon().name("kafcacheql-sync-" + path.getFileName()).unstarted(() -> own(path, clusterId));
@@ -143,7 +146,7 @@ public final class SyncWorker implements AutoCloseable {
     private void own(Path path, Optional<String> clusterId) {
         SQLException failure = null;
         try {
-            cache = CacheStore.open(path, clusterId);
+            cache = CacheStore.open(path, clusterId, reader -> { if (config.offline()) transforms.validateOffline(reader); });
             try (Statement s = cache.writer().createStatement()) { s.execute("PRAGMA busy_timeout = 100"); }
             opened.complete(cache);
             while (true) {
@@ -231,11 +234,11 @@ public final class SyncWorker implements AutoCloseable {
         long generation;
         if (plan.generation().isEmpty() || observed.orElseThrow().deleted()
                 || observed.get().partitions() < plan.topic().partitions()
-                || TopicRegistry.rebuildReason(cache.writer(), observed.get().id(), plan.topic(), config.topic(plan.topic().name()),
+                || TopicRegistry.rebuildReason(cache.writer(), observed.get().id(), plan.topic(), transforms.settings(plan.topic().name(), config.topic(plan.topic().name())),
                         plan.logStarts()).isPresent()) {
             hooks.beforePrepare(plan);
             long before = changes();
-            generation = TopicRegistry.prepare(cache, plan.generation(), plan.deleted(), plan.topic(), config.topic(plan.topic().name()),
+            generation = TopicRegistry.prepare(cache, plan.generation(), plan.deleted(), plan.topic(), transforms.settings(plan.topic().name(), config.topic(plan.topic().name())),
                     plan.logStarts(), execution::check)
                     .orElseThrow(() -> new StaleGeneration(plan.topic().name())).id();
             syncWrote |= changes() != before;
@@ -464,7 +467,7 @@ public final class SyncWorker implements AutoCloseable {
         }
 
         void ensureConsumer() throws SQLException {
-            if (decoder == null) decoder = new BatchDecoder(settings, cache.newReader(), SyncWorker.this::registry);
+            if (decoder == null) decoder = new BatchDecoder(settings, cache.newReader(), SyncWorker.this::registry, transforms);
             if (consumer != null) return;
             id = ClientIds.reserve(ClientIds.Kind.CONSUMER, config.clientId());
             Map<String, Object> properties = new HashMap<>(settings.consumer());

@@ -159,19 +159,19 @@ public final class TopicRegistry {
     public static Optional<String> rebuildReason(Connection reader, long generation, TopicInfo topic,
             TopicSettings settings, Map<Integer, Long> logStarts) throws SQLException {
         try (PreparedStatement p = reader.prepareStatement("""
-                SELECT topic_uuid, mode, key_format, value_format, decoder_version
+                SELECT topic_uuid, mode, key_format, value_format, decoder_version, transform_fingerprint
                 FROM "$topics" WHERE id=? AND deleted_ms IS NULL
                 """)) {
             p.setLong(1, generation);
             try (ResultSet row = p.executeQuery()) {
                 if (!row.next()) return Optional.empty();
-                String[] names = {"topic ID", "mode", "key.format", "value.format", "decoder_version"};
+                String[] names = {"topic ID", "mode", "key.format", "value.format", "decoder_version", "record transform settings"};
                 String[] expected = {topic.topicId().toString(), topic.mode().value(),
                         settings.keyFormat().orElse(Format.AUTO).value(), settings.valueFormat().orElse(Format.AUTO).value(),
-                        Integer.toString(AvroJsonConverter.VERSION)};
+                        Integer.toString(AvroJsonConverter.VERSION), settings.transformFingerprint()};
                 for (int i = 0; i < names.length; i++) {
                     String before = row.getString(i + 1);
-                    if (!before.equals(expected[i])) return Optional.of(names[i] + " changed from " + before + " to " + expected[i]);
+                    if (!before.equals(expected[i])) return Optional.of(i == 5 ? "record transform settings changed" : names[i] + " changed from " + before + " to " + expected[i]);
                 }
             }
         }
@@ -323,8 +323,8 @@ public final class TopicRegistry {
                                String view) throws SQLException {
         try (PreparedStatement p = writer.prepareStatement("""
                 INSERT INTO "$topics" (topic, view_name, topic_uuid, mode, partition_count, timestamp_type,
-                                       delete_retention_ms, key_format, value_format, decoder_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+                                       delete_retention_ms, key_format, value_format, decoder_version, transform_fingerprint)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
                 """)) {
             p.setString(1, topic.name());
             p.setString(2, view);
@@ -336,6 +336,7 @@ public final class TopicRegistry {
             p.setString(8, settings.keyFormat().orElse(Format.AUTO).value());
             p.setString(9, settings.valueFormat().orElse(Format.AUTO).value());
             p.setInt(10, decoderVersion);
+            p.setString(11, settings.transformFingerprint());
             try (ResultSet rs = p.executeQuery()) {
                 if (!rs.next()) {
                     throw new SQLException("Registration of topic " + topic.name() + " returned no id");

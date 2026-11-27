@@ -61,6 +61,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.sqlite.Function;
 
 class JdbcIT {
+    private static final String PRIVATE_BIG_INTEGER = "98765432109876543210987654321";
     private static final String URL = "jdbc:kafcacheql://" + TestStack.BOOTSTRAP;
     private static final Schema VALUE = new Schema.Parser().parse("""
             {"type":"record","name":"JdbcValue","fields":[{"name":"n","type":"int"},{"name":"ok","type":["null","boolean"]}]}
@@ -90,6 +91,311 @@ class JdbcIT {
         var result = new ArrayList<Integer>();
         while (rows.next()) result.add(rows.getInt(1));
         return result;
+    }
+
+    /** PLAN §7.1: headers preserve order/duplicates, with strict UTF-8 text or base64, including masked text.
+     * §7.3: older decoder output is served unchanged offline and rebuilt on the next online use.
+     */
+    @Test void headersAreReadableAndOlderCachesRebuildOnlyOnline() throws Exception {
+        String plain = topic("delete"), maskedTopic = topic("compact");
+        var p = settings(); p.setProperty("mask.secret", "test-transform-secret");
+        p.setProperty("topic." + maskedTopic + ".mask.headers", "client-ip");
+        var headers = new RecordHeaders().add("text", TestStack.utf8("café"))
+                .add("binary", new byte[] {0, (byte) 255}).add("null", null).add("empty", new byte[0])
+                .add("tag", TestStack.utf8("first")).add("tag", TestStack.utf8("second"));
+        TestStack.send(plain, 0, null, null, TestStack.utf8("{}"), headers);
+        TestStack.send(plain, 0, null, null, TestStack.utf8("{}"), null);
+        TestStack.send(maskedTopic, 0, null, TestStack.utf8("key"), TestStack.utf8("{}"),
+                new RecordHeaders().add("client-ip", TestStack.utf8("private-ip-123")));
+        String hash = masked(TestStack.utf8("private-ip-123"));
+        assertTrue(hash.matches("[0-9a-f]{64}"));
+        var expected = Map.of(plain, """
+                [{"key":"text","value":"café"},{"key":"binary","base64":"AP8="},{"key":"null","value":null},{"key":"empty","value":""},{"key":"tag","value":"first"},{"key":"tag","value":"second"}]""",
+                maskedTopic, "[{\"key\":\"client-ip\",\"value\":\"" + hash + "\"}]");
+        var old = Map.of(plain, """
+                [{"key":"text","value":"Y2Fmw6k="},{"key":"binary","value":"AP8="},{"key":"null","value":null},{"key":"empty","value":""},{"key":"tag","value":"Zmlyc3Q="},{"key":"tag","value":"c2Vjb25k"}]""",
+                maskedTopic, "[{\"key\":\"client-ip\",\"value\":\"" + Base64.getEncoder().encodeToString(TestStack.utf8(hash)) + "\"}]");
+        var generations = new HashMap<String, Long>();
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
+             var cache = CacheContext.acquire(DriverConfig.load(URL, p)); var execution = new Execution(java.time.Duration.ofSeconds(30))) {
+            try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(plain) + " WHERE _offset=1")) {
+                assertTrue(r.next()); assertEquals("[]", r.getString(1)); assertFalse(r.next());
+            }
+            for (String topic : List.of(plain, maskedTopic)) {
+                try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
+                    assertTrue(r.next()); assertEquals(expected.get(topic), r.getString(1)); assertFalse(r.next());
+                }
+                long generation = cache.read(reader -> TopicRegistry.generation(reader, topic).orElseThrow());
+                generations.put(topic, generation);
+                // Seed the exact version-6 representation, including on a transformed topic.
+                cache.write(topic, generation, execution, writer -> {
+                    try (var update = writer.prepareStatement("UPDATE " + StorageDdl.quote(StorageDdl.tableName(generation)) + " SET _headers=? WHERE _offset=0")) {
+                        update.setString(1, old.get(topic)); assertEquals(1, update.executeUpdate());
+                    }
+                    try (var update = writer.prepareStatement("UPDATE \"$topics\" SET decoder_version=6 WHERE id=?")) {
+                        update.setLong(1, generation); assertEquals(1, update.executeUpdate());
+                    }
+                    return null;
+                });
+            }
+        }
+        p.setProperty("offline", "true");
+        try (var c = DriverManager.getConnection("jdbc:kafcacheql://", p); var s = c.createStatement()) {
+            for (String topic : List.of(plain, maskedTopic)) {
+                try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
+                    assertTrue(r.next()); assertEquals(old.get(topic), r.getString(1)); assertFalse(r.next());
+                }
+                try (var r = s.executeQuery("SELECT id,decoder_version FROM \"$topics\" WHERE topic='" + topic + "'")) {
+                    assertTrue(r.next()); assertEquals(generations.get(topic).longValue(), r.getLong(1)); assertEquals(6, r.getInt(2));
+                }
+            }
+        }
+        p.setProperty("offline", "false");
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            for (String topic : List.of(plain, maskedTopic)) {
+                try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
+                    assertTrue(r.next()); assertEquals(expected.get(topic), r.getString(1)); assertFalse(r.next());
+                }
+                try (var r = s.executeQuery("SELECT id,decoder_version FROM \"$topics\" WHERE topic='" + topic + "'")) {
+                    assertTrue(r.next()); assertTrue(r.getLong(1) > generations.get(topic)); assertEquals(7, r.getInt(2));
+                }
+            }
+        }
+    }
+
+    /** PLAN §7.4: drop/mask runs before storage; equal masked values join across topics. */
+    @Test void recordTransformsKeepPiiOutOfTheCache() throws Exception {
+        String a = topic("delete"), b = topic("compact"), big = topic("delete"), badKey = topic("compact");
+        var p = settings(); p.setProperty("mask.secret", "test-transform-secret");
+        p.setProperty("topic." + big + ".drop", "_key,_value");
+        p.setProperty("topic." + badKey + ".drop", "_key,_value");
+        p.setProperty("topic." + badKey + ".key.format", "json");
+        TestStack.sendString(big, "big-private-key", "{\"privateId\":" + PRIVATE_BIG_INTEGER + "}", null);
+        TestStack.sendString(badKey, "undecodable-private-key", "{\"private\":\"private-payload\"}", null);
+        byte[] framed = null;
+        for (String t : List.of(a, b)) {
+            p.setProperty("topic." + t + ".mask", (t.equals(a) ? "_key.email" : "_key") + ",email,n,address.zip");
+            p.setProperty("topic." + t + ".drop", "phone,address.street,_key.phone,_key.address.street,_key.address.zip");
+            p.setProperty("topic." + t + ".mask.headers", "client-ip");
+            p.setProperty("topic." + t + ".drop.headers", "authorization");
+            var schema = new Schema.Parser().parse("""
+                    {"type":"record","name":"PrivateValue","fields":[{"name":"email","type":"string"},
+                    {"name":"phone","type":"string"},{"name":"n","type":"long"},{"name":"flag","type":"boolean"},
+                    {"name":"address","type":{"type":"record","name":"Address","fields":[{"name":"street","type":"string"},{"name":"zip","type":"string"}]}}]}
+                    """);
+            var value = new GenericData.Record(schema);
+            value.put("email", "pii@example.test"); value.put("phone", "private-phone-123"); value.put("n", 42L); value.put("flag", true);
+            var address = new GenericData.Record(schema.getField("address").schema()); address.put("street", "private-street-123"); address.put("zip", "private-zip-123");
+            value.put("address", address);
+            var headers = new RecordHeaders().add("client-ip", "private-ip-123".getBytes()).add("authorization", "private-auth-123".getBytes());
+            byte[] data = TestStack.serializeAvro(t, headers, value, TestStack.SchemaIdIn.PREFIX, false);
+            if (t.equals(a)) framed = data;
+            byte[] key = t.equals(a) ? TestStack.serializeAvro(t, headers, value, TestStack.SchemaIdIn.PREFIX, true)
+                    : "private-key@example.test".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            TestStack.send(t, 0, null, key, data, headers);
+        }
+        p.setProperty("topic." + a + ".transform", PrivacyTransform.class.getName());
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var r = s.executeQuery("SELECT email,phone,address,n,_key,_headers,flag,_value FROM " + StorageDdl.quote(a))) {
+                assertTrue(r.next()); assertEquals(masked("pii@example.test"), r.getString(1));
+                assertNull(r.getObject(2)); assertEquals("{\"zip\":\"" + masked("private-zip-123") + "\"}", r.getString(3));
+                assertType(r, "n", JDBCType.VARCHAR); assertTrue(r.getString(4).matches("[0-9a-f]{64}"));
+                var key = JacksonMapper.INSTANCE.readTree(r.getString(5));
+                assertEquals(masked("pii@example.test"), key.get("email").asText()); assertFalse(key.has("phone"));
+                var headers = JacksonMapper.INSTANCE.readTree(r.getString(6));
+                assertEquals(1, headers.size()); assertEquals("client-ip", headers.get(0).get("key").asText());
+                assertEquals(masked("private-ip-123".getBytes()), headers.get(0).get("value").asText());
+                assertFalse(headers.get(0).has("base64"));
+                assertFalse(JacksonMapper.INSTANCE.readTree(r.getString("_value")).has("phone"));
+                assertNull(r.getObject("flag"), "a transformed value that does not fit its schema reads NULL");
+            }
+            try (var r = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(a) + " a JOIN " + StorageDdl.quote(b) + " b ON a.email=b.email")) {
+                assertTrue(r.next()); assertEquals(1, r.getInt(1));
+            }
+            // A second update replaces state using the HMAC of the original key, independent of visible key changes.
+            TestStack.send(b, 0, null, "private-key@example.test".getBytes(), "{\"email\":\"pii@example.test\"}".getBytes(), new RecordHeaders());
+            try (var r = s.executeQuery("SELECT count(*),max(_offset) FROM " + StorageDdl.quote(b))) {
+                assertTrue(r.next()); assertEquals(1, r.getInt(1)); assertEquals(1, r.getInt(2));
+            }
+            // A damaged Avro payload fails closed, and a throwing hook produces the same payload-free row.
+            TestStack.send(a, 0, null, "error-private-key".getBytes(), Arrays.copyOf(framed, 5), new RecordHeaders().add("pii", "private-header".getBytes()));
+            TestStack.send(a, 0, null, "throw-private-key".getBytes(), "{\"action\":\"throw\"}".getBytes(), new RecordHeaders());
+            TestStack.send(a, 0, null, "skip-private-key".getBytes(), "{\"action\":\"skip\"}".getBytes(), new RecordHeaders());
+            try (var r = s.executeQuery("SELECT _offset,_key,_value,_headers,_decode_error FROM " + StorageDdl.quote(a) + " WHERE _offset>=1 ORDER BY _offset")) {
+                for (int i = 1; i <= 2; i++) {
+                    assertTrue(r.next()); assertEquals(i, r.getInt(1));
+                    assertNull(r.getObject(2)); assertNull(r.getObject(3)); assertNull(r.getObject(4));
+                    assertNotNull(r.getString(5)); if (i == 2) assertTrue(r.getString(5).contains("deliberate transform failure"));
+                }
+                assertFalse(r.next(), "null from apply skips the row, while its offsets are covered");
+            }
+            try (var r = s.executeQuery("SELECT max(end_offset) FROM \"$ranges\" WHERE topic_ref=(SELECT id FROM \"$topics\" WHERE topic='" + a + "')")) {
+                assertTrue(r.next()); assertEquals(4, r.getInt(1));
+            }
+            TestStack.send(b, 0, null, "private-key@example.test".getBytes(), Arrays.copyOf(framed, 5), new RecordHeaders());
+            try (var r = s.executeQuery("SELECT _key,_value,_headers,_decode_error FROM " + StorageDdl.quote(b))) {
+                assertTrue(r.next()); assertNull(r.getObject(1)); assertNull(r.getObject(2)); assertNull(r.getObject(3));
+                assertNotNull(r.getString(4)); assertFalse(r.next(), "a failed update replaces old current state");
+            }
+            // PLAN §7.4: a throwing Java transform gives a payload-free error row, not a failed sync.
+            for (String action : List.of("before", "linkage", "after"))
+                TestStack.sendString(a, "{\"email\":\"pii@example.test\"}", "{\"action\":\"" + action + "\"}", null);
+            try (var r = s.executeQuery("SELECT _offset,_key,_value,_headers,_decode_error FROM " + StorageDdl.quote(a) + " WHERE _offset>=4 ORDER BY _offset")) {
+                for (int offset = 4; offset <= 6; offset++) {
+                    assertTrue(r.next()); assertEquals(offset, r.getInt(1));
+                    if (offset == 5) {
+                        assertNull(r.getObject(2)); assertNull(r.getObject(3)); assertNull(r.getObject(4));
+                        assertEquals("Record transform: missing dependency [hidden]", r.getString(5));
+                    } else {
+                        assertNotNull(r.getString(3)); assertNull(r.getString(5));
+                    }
+                }
+                assertFalse(r.next());
+            }
+            TestStack.sendString(a, "{\"email\":\"pii@example.test\"}", "{\"action\":\"later\"}", null);
+            try (var r = s.executeQuery("SELECT _value,_decode_error FROM " + StorageDdl.quote(a) + " WHERE _offset=7")) {
+                assertTrue(r.next()); assertEquals("later", JacksonMapper.INSTANCE.readTree(r.getString(1)).get("action").asText());
+                assertNull(r.getString(2)); assertFalse(r.next());
+            }
+            // PLAN §7.4: internal failures contain no payload, and original tombstones still delete state.
+            assertAll(
+                    () -> {
+                        try (var r = s.executeQuery("SELECT _key,_value,_headers,_decode_error FROM " + StorageDdl.quote(big))) {
+                            assertTrue(r.next()); assertNull(r.getObject(1)); assertNull(r.getObject(2)); assertNull(r.getObject(3));
+                            assertNotNull(r.getString(4)); assertFalse(r.getString(4).contains(PRIVATE_BIG_INTEGER));
+                            assertFalse(r.next());
+                        }
+                    },
+                    () -> {
+                        TestStack.sendString(b, "private-key@example.test", "{\"email\":\"pii@example.test\"}", null);
+                        try (var r = s.executeQuery("SELECT count(*),count(_decode_error) FROM " + StorageDdl.quote(b))) {
+                            assertTrue(r.next()); assertEquals(1, r.getInt(1)); assertEquals(0, r.getInt(2));
+                        }
+                        TestStack.sendString(b, "private-key@example.test", null, null);
+                        try (var r = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(b))) {
+                            assertTrue(r.next()); assertEquals(0, r.getInt(1), "a decoded transformed tombstone deletes its key");
+                        }
+                    },
+                    () -> {
+                        try (var r = s.executeQuery("SELECT _key,_value,_headers,_decode_error FROM " + StorageDdl.quote(badKey))) {
+                            assertTrue(r.next()); assertNull(r.getObject(1)); assertNull(r.getObject(2)); assertNull(r.getObject(3));
+                            assertNotNull(r.getString(4)); assertFalse(r.next());
+                        }
+                        TestStack.sendString(badKey, "undecodable-private-key", null, null);
+                        try (var r = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(badKey))) {
+                            assertTrue(r.next()); assertEquals(0, r.getInt(1), "a tombstone deletes even when its key cannot decode");
+                        }
+                    },
+                    // Check sidecars while the cache is open, then the checkpointed database after close.
+                    () -> assertNoPii(p));
+        }
+        assertNoPii(p);
+    }
+
+    private static String masked(Object value) throws Exception {
+        var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec("test-transform-secret".getBytes(java.nio.charset.StandardCharsets.UTF_8), "HmacSHA256"));
+        return HexFormat.of().formatHex(mac.doFinal(JacksonMapper.INSTANCE.writeValueAsBytes(value)));
+    }
+
+    private static void assertNoPii(Properties p) throws Exception {
+        for (String suffix : List.of("", "-wal", "-shm")) {
+            Path file = Path.of(p.getProperty("cache.path") + suffix);
+            if (!java.nio.file.Files.exists(file)) continue;
+            String bytes = new String(java.nio.file.Files.readAllBytes(file), java.nio.charset.StandardCharsets.ISO_8859_1);
+            for (String pii : List.of("private-key@example.test", "pii@example.test", "private-phone-123", "private-street-123", "private-ip-123", "private-auth-123", "private-zip-123", "error-private-key", "throw-private-key", "skip-private-key", "private-header", "test-transform-secret", PRIVATE_BIG_INTEGER, "big-private-key", "undecodable-private-key", "private-payload"))
+                assertFalse(bytes.contains(pii), file + " contains " + pii);
+        }
+    }
+
+    public static class PrivacyTransform implements io.github.ifnesi.kafcacheql.transform.RecordTransform {
+        static String revision = "1";
+        @Override public String version() { return revision; }
+        @Override @SuppressWarnings("unchecked") public Record apply(Record record) {
+            if (record.value() instanceof Map<?, ?>) {
+                var value = (Map<String,Object>) record.value();
+                if ("throw".equals(value.get("action"))) throw new IllegalArgumentException("deliberate transform failure");
+                if ("linkage".equals(value.get("action"))) throw new NoClassDefFoundError("missing dependency test-transform-secret");
+                if ("skip".equals(value.get("action"))) return null;
+                value.put("flag", "changed type");
+                value.put("phone", "private-phone-123"); // Built-ins run after the hook, even for a reintroduced field.
+            }
+            return record;
+        }
+    }
+
+    public static class VersionErrorTransform extends PrivacyTransform {
+        @Override public String version() { throw new AssertionError("version failure first-secret"); }
+    }
+
+    /** PLAN §7.4: changed fingerprints rebuild online, are refused offline and cannot share an open cache. */
+    @Test void transformFingerprintsGuardCacheReuse() throws Exception {
+        String topic = topic("compact"), table = StorageDdl.quote(topic);
+        TestStack.send(topic, 0, null, "pii-key".getBytes(), "{\"email\":\"private-email\"}".getBytes(), new RecordHeaders());
+        var p = settings(); p.setProperty("topic." + topic + ".mask", "_key,email");
+        assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, p)).getMessage().contains("mask.secret"));
+        p.setProperty("mask.secret", "first-secret"); p.setProperty("topic." + topic + ".transform", "missing.Transform");
+        assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, p)).getMessage().contains("missing.Transform"));
+        p.setProperty("topic." + topic + ".transform", VersionErrorTransform.class.getName());
+        var versionError = assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, p));
+        assertEquals("Configuring record transform for " + topic + ": version failure [hidden]", versionError.getMessage());
+        assertNotNull(versionError.getCause());
+        assertFalse(versionError.getCause().getMessage().contains("first-secret"));
+        p.setProperty("topic." + topic + ".transform", PrivacyTransform.class.getName());
+        String first; long generation;
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var r = s.executeQuery("SELECT email FROM " + table)) { assertTrue(r.next()); first = r.getString(1); }
+            try (var r = s.executeQuery("SELECT id FROM \"$topics\"")) { assertTrue(r.next()); generation = r.getLong(1); }
+            var other = (Properties) p.clone(); other.setProperty("mask.secret", "second-secret");
+            assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, other)).getMessage().contains("different record transform"));
+        }
+        p.setProperty("mask.secret", "second-secret"); p.setProperty("offline", "true");
+        byte[] before = java.nio.file.Files.readAllBytes(Path.of(p.getProperty("cache.path")));
+        assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection("jdbc:kafcacheql://", p)).getMessage().contains("record transform settings"));
+        assertArrayEquals(before, java.nio.file.Files.readAllBytes(Path.of(p.getProperty("cache.path"))));
+        p.setProperty("offline", "false");
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var r = s.executeQuery("SELECT email FROM " + table)) { assertTrue(r.next()); assertNotEquals(first, r.getString(1)); }
+            try (var r = s.executeQuery("SELECT id FROM \"$topics\"")) { assertTrue(r.next()); assertTrue(r.getLong(1) > generation); generation = r.getLong(1); }
+        }
+        PrivacyTransform.revision = "2";
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var r = s.executeQuery("SELECT email FROM " + table)) { assertTrue(r.next()); }
+            try (var r = s.executeQuery("SELECT id FROM \"$topics\"")) { assertTrue(r.next()); assertTrue(r.getLong(1) > generation); generation = r.getLong(1); }
+        }
+        p.setProperty("offline", "true");
+        try (var c = DriverManager.getConnection("jdbc:kafcacheql://localhost:1", p); var s = c.createStatement();
+             var r = s.executeQuery("SELECT email FROM " + table)) { assertTrue(r.next()); assertNotEquals("private-email", r.getString(1)); }
+        finally { PrivacyTransform.revision = "1"; }
+        p.setProperty("offline", "false"); p.remove("topic." + topic + ".mask"); p.remove("topic." + topic + ".transform");
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            try (var r = s.executeQuery("SELECT email FROM " + table)) { assertTrue(r.next()); assertEquals("private-email", r.getString(1)); }
+            try (var r = s.executeQuery("SELECT id FROM \"$topics\"")) { assertTrue(r.next()); assertTrue(r.getLong(1) > generation); }
+        }
+    }
+
+    /** 0019d / PLAN §5.3: opening unreachable brokers fails after 15 s by default;
+     * a user-set default.api.timeout.ms replaces the opening limit, and the error names the brokers.
+     */
+    @Test void unreachableBrokersRespectTheOpeningTimeout() throws Exception {
+        int port;
+        try (var socket = new java.net.ServerSocket(0)) { port = socket.getLocalPort(); }
+        String brokers = "127.0.0.1:" + port;
+        for (int timeout : List.of(15_000, 5_000, 30_000)) {
+            Properties p = settings();
+            if (timeout != 15_000) p.setProperty("default.api.timeout.ms", Integer.toString(timeout));
+            // Kafka requires an explicit API timeout to be at least its request timeout.
+            if (timeout == 5_000) p.setProperty("request.timeout.ms", "1000");
+            long start = System.nanoTime();
+            SQLException error = assertThrows(SQLException.class, () -> DriverManager.getConnection("jdbc:kafcacheql://" + brokers, p));
+            long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            System.out.println("Opening timeout " + timeout + " ms: failed after " + elapsed + " ms: " + error.getMessage());
+            assertAll(
+                    () -> assertEquals("08006", error.getSQLState()),
+                    () -> assertTrue(error.getMessage().contains(brokers), error.getMessage()),
+                    () -> assertTrue(elapsed >= timeout - 1000 && elapsed < timeout + 4000,
+                            "opening took " + elapsed + " ms, expected about " + timeout + " ms"));
+        }
     }
 
     /** 0016c / PLAN §10: a fixed set of consumers fetches the waiting partitions, feeding one writer;
@@ -693,6 +999,7 @@ class JdbcIT {
                   repeated int32 items = 9;
                   map<string, int64> labels = 10;
                   oneof choice { string choice_text = 11; int64 choice_n = 12; }
+                  optional int32 optional_n = 13;
                 }
                 """.formatted(file);
         try (var rest = new RestService(TestStack.REGISTRY)) {
@@ -733,6 +1040,30 @@ class JdbcIT {
             // SQL comparisons use the integer view expression, not JsonFormat's quoted digits.
             try (var rows = s.executeQuery("SELECT order_id FROM " + StorageDdl.quote(single) + " WHERE order_id=9007199254740993")) {
                 assertEquals(2, values(rows).size());
+            }
+            // 0015g / PLAN §7.2: defaults without presence are values; unset optional/message/oneof fields are NULL.
+            sendProtobuf(single, DynamicMessage.newBuilder(other.getDescriptorForType()).build(),
+                    DynamicMessage.newBuilder(order.getDescriptorForType()).build(), TestStack.SchemaIdIn.HEADER);
+            try (var rows = s.executeQuery("SELECT * FROM " + StorageDdl.quote(single) + " WHERE _offset=2")) {
+                assertTrue(rows.next()); assertNull(rows.getString("_decode_error"));
+                assertAll(() -> assertEquals(false, rows.getObject("ok")),
+                        () -> assertEquals(0L, rows.getObject("quantity")),
+                        () -> assertEquals(0L, rows.getObject("order_id")),
+                        () -> assertEquals(0.0, rows.getObject("ratio")),
+                        () -> assertEquals("", rows.getObject("text")),
+                        () -> assertEquals("OPEN", rows.getObject("state")),
+                        () -> assertEquals("", rows.getObject("raw")),
+                        () -> assertEquals("[]", rows.getObject("items")),
+                        () -> assertEquals("{}", rows.getObject("labels")),
+                        () -> assertEquals("", rows.getObject("key_note")),
+                        () -> assertNull(rows.getObject("optional_n")),
+                        () -> assertNull(rows.getObject("address")),
+                        () -> assertNull(rows.getObject("choice_text")),
+                        () -> assertNull(rows.getObject("choice_n")),
+                        () -> assertEquals(JacksonMapper.INSTANCE.readTree("""
+                                {"order_id":"0","quantity":0,"ratio":0.0,"ok":false,"text":"","state":"OPEN","raw":"","items":[],"labels":{}}
+                                """), JacksonMapper.INSTANCE.readTree(rows.getString("_value"))));
+                assertFalse(rows.next());
             }
             sendProtobuf(mixed, null, order.build(), TestStack.SchemaIdIn.PREFIX);
             try (var rows = s.executeQuery("SELECT order_id FROM " + StorageDdl.quote(mixed))) {
@@ -1705,6 +2036,33 @@ class JdbcIT {
                 // PLAN §12.2: expose KafCacheQL's product identity so tools use standard JDBC introspection.
                 assertAll(() -> assertEquals("KafCacheQL", metadata.getDatabaseProductName()),
                         () -> assertEquals(metadata.getDriverVersion(), metadata.getDatabaseProductVersion()));
+                // 0013d / PLAN §12.2: database versions are the driver's; unimplemented metadata
+                // returns empty results with the names and types in java.sql.DatabaseMetaData's contract.
+                assertAll(
+                        () -> assertEquals(metadata.getDriverMajorVersion(), metadata.getDatabaseMajorVersion()),
+                        () -> assertEquals(metadata.getDriverMinorVersion(), metadata.getDatabaseMinorVersion()),
+                        () -> emptyMetadata(metadata.getFunctions(null, null, "%"),
+                                List.of("FUNCTION_CAT", "FUNCTION_SCHEM", "FUNCTION_NAME", "REMARKS", "FUNCTION_TYPE", "SPECIFIC_NAME"),
+                                JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.SMALLINT, JDBCType.VARCHAR),
+                        () -> emptyMetadata(metadata.getFunctionColumns(null, null, "%", "%"),
+                                List.of("FUNCTION_CAT", "FUNCTION_SCHEM", "FUNCTION_NAME", "COLUMN_NAME", "COLUMN_TYPE", "DATA_TYPE", "TYPE_NAME",
+                                        "PRECISION", "LENGTH", "SCALE", "RADIX", "NULLABLE", "REMARKS", "CHAR_OCTET_LENGTH", "ORDINAL_POSITION", "IS_NULLABLE", "SPECIFIC_NAME"),
+                                JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.SMALLINT, JDBCType.INTEGER, JDBCType.VARCHAR,
+                                JDBCType.INTEGER, JDBCType.INTEGER, JDBCType.SMALLINT, JDBCType.SMALLINT, JDBCType.SMALLINT, JDBCType.VARCHAR,
+                                JDBCType.INTEGER, JDBCType.INTEGER, JDBCType.VARCHAR, JDBCType.VARCHAR),
+                        () -> emptyMetadata(metadata.getPseudoColumns(null, null, "%", "%"),
+                                List.of("TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "DATA_TYPE", "COLUMN_SIZE", "DECIMAL_DIGITS", "NUM_PREC_RADIX",
+                                        "COLUMN_USAGE", "REMARKS", "CHAR_OCTET_LENGTH", "IS_NULLABLE"),
+                                JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.INTEGER, JDBCType.INTEGER,
+                                JDBCType.INTEGER, JDBCType.INTEGER, JDBCType.VARCHAR, JDBCType.VARCHAR, JDBCType.INTEGER, JDBCType.VARCHAR),
+                        () -> emptyMetadata(metadata.getClientInfoProperties(), List.of("NAME", "MAX_LEN", "DEFAULT_VALUE", "DESCRIPTION"),
+                                JDBCType.VARCHAR, JDBCType.INTEGER, JDBCType.VARCHAR, JDBCType.VARCHAR),
+                        () -> emptyMetadata(metadata.getSchemas("missing", "%"), List.of("TABLE_SCHEM", "TABLE_CATALOG"),
+                                JDBCType.VARCHAR, JDBCType.VARCHAR),
+                        () -> assertEquals(RowIdLifetime.ROWID_UNSUPPORTED, metadata.getRowIdLifetime()),
+                        () -> assertFalse(metadata.supportsStoredFunctionsUsingCallSyntax()),
+                        () -> assertFalse(metadata.autoCommitFailureClosesAllResultSets()),
+                        () -> assertFalse(metadata.generatedKeyAlwaysReturned()));
                 assertEquals("\"", metadata.getIdentifierQuoteString());
                 assertEquals(control.read(r -> r.getMetaData().getSQLKeywords()), metadata.getSQLKeywords());
                 assertEquals(control.read(r -> r.getMetaData().getStringFunctions()), metadata.getStringFunctions());
@@ -1828,6 +2186,22 @@ class JdbcIT {
                 } finally { other.close(); }
             } finally { adminField.set(clients.clients(), original); }
         } finally { registry.stop(0); }
+    }
+
+    private static void emptyMetadata(ResultSet rows, List<String> names, JDBCType... types) throws SQLException {
+        try (rows) {
+            assertFalse(rows.next());
+            var metadata = rows.getMetaData();
+            assertEquals(names.size(), metadata.getColumnCount());
+            assertEquals(names.size(), types.length);
+            for (int i = 1; i <= names.size(); i++) {
+                assertEquals(names.get(i - 1), metadata.getColumnName(i));
+                assertEquals(names.get(i - 1), metadata.getColumnLabel(i));
+                assertEquals(types[i - 1].getVendorTypeNumber(), metadata.getColumnType(i), names.get(i - 1));
+                assertEquals(types[i - 1].getName(), metadata.getColumnTypeName(i), names.get(i - 1));
+                assertEquals(i, rows.findColumn(names.get(i - 1)));
+            }
+        }
     }
 
     private static void metadataNamesAndRefresh(DatabaseMetaData metadata, Connection c, CacheContext.Lease control,

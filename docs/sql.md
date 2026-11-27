@@ -19,8 +19,8 @@ dots or dashes, such as `"payments.v1"`.
 
 ## Columns
 
-Every row includes the decoded Kafka key and value as JSON, in `_key` and `_value`. It also keeps the record's
-partition, offset, timestamp and headers. When a record names a schema, its schema ID or GUID identifies the
+Rows expose the decoded Kafka key and value as JSON, in `_key` and `_value`, plus the record's partition,
+offset, timestamp and headers. When a record names a schema, its schema ID or GUID identifies the
 Schema Registry schema used to decode it.
 
 | Column | Meaning |
@@ -28,9 +28,13 @@ Schema Registry schema used to decode it.
 | `_partition`, `_offset` | Where the record is in Kafka |
 | `_timestamp` | Record timestamp, epoch milliseconds |
 | `_key`, `_value` | Decoded key and value, as JSON |
-| `_headers` | JSON array of `{"key": …, "value": …}`, values in base64 |
+| `_headers` | JSON array of headers in record order; see [Headers](#headers) |
 | `_key_schema_id`, `_value_schema_id` | Schema ID or GUID named by each record, when present |
-| `_decode_error` | Why a key or value could not be decoded; the failed part is stored as a base64 JSON string |
+| `_decode_error` | A decoding or transform failure; NULL when neither failed |
+
+Without transforms, a part that fails to decode is kept as a base64 JSON string. With
+[record transforms](transforms.md#what-queries-see), payload columns contain only the transformed data;
+failed rows keep no key, value or headers. The transform guide explains these failure rules.
 
 Top-level value fields become columns too. Avro, JSON Schema and Protobuf columns come from the schemas named
 by cached records. Plain JSON columns are inferred from cached data. A primitive key with a schema becomes
@@ -39,6 +43,24 @@ by cached records. Plain JSON columns are inferred from cached data. A primitive
 
 Nested values stay JSON. Read a nested field with `->>`, for example `_value ->> '$.address.city'`. See
 [column type details](#column-type-details) for mixed record types, schema changes and conversions.
+
+### Headers
+
+`_headers` is a JSON array with one object per header, in record order, including duplicate names. A text
+value, valid UTF-8, is shown as text under `value`. Any other bytes are base64 under `base64`. A null value
+is `"value": null`, and a record without headers has `[]`:
+
+```json
+[{"key": "trace-id", "value": "4bf92f35"}, {"key": "flags", "base64": "AAH/"}, {"key": "empty", "value": ""}]
+```
+
+Read one header as text:
+
+```sql
+SELECT h.value ->> '$.value' AS trace_id
+FROM "shipments" AS o, json_each(o._headers) AS h
+WHERE h.value ->> '$.key' = 'trace-id';
+```
 
 ## What a query reads
 
@@ -174,6 +196,11 @@ These rules explain why a column may change type, disappear, or remain JSON as d
   from a row are NULL.
 
 ### Protobuf
+
+Proto3 scalar fields without explicit presence cannot distinguish an unset field from its default. They
+therefore read as `0`, `false`, `""` or the first enum value, rather than NULL. Empty lists and maps stay
+empty.
+Unset `optional` fields, message fields and `oneof` members are NULL.
 
 Signed 64-bit integers are `BIGINT` columns, though `_value` holds them as JSON strings. `uint64`/`fixed64`
 stay exact `VARCHAR` text.

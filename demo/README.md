@@ -3,8 +3,8 @@
 A small online shop, simulated in Kafka, and queried with plain SQL.
 
 Customers order products. Each order is paid for, shipped and delivered, and some deliveries arrive late. Now
-and then a customer returns an item or writes a review. A Python producer writes these events into ten Kafka
-topics, about two orders per second.
+and then a customer returns an item or writes a review. A Python producer writes these events into twelve
+Kafka topics, about two orders per second.
 
 [Apache Zeppelin](https://zeppelin.apache.org/), a web notebook, queries those topics through KafCacheQL and
 charts the results. No consumer code and no stream processing: each chart is one SQL query. KafCacheQL keeps
@@ -14,16 +14,23 @@ fetched records in a local SQLite cache, so later queries can reuse them. The de
 - **Aggregations and charts:** orders per minute, revenue by product, late versus on-time deliveries.
 - **Two kinds of topic:** compacted topics read as the current state (a product's stock now); append topics
   read as a history of events (every order).
+- **Record transforms:** drop private fields, hash join keys and headers, and derive an age band before
+  caching.
 - **New records on demand:** rerun a query and it fetches only the records produced since the last run.
 
 ## The topics
 
-Ten topics, three partitions each. Keys are plain strings containing the record's ID. The `_key` column holds
-the decoded key as JSON. Values are Avro, so each value field is a column. IDs join across topics: an order's
-`customer_id` is a customer's key, and its `order_id` appears in its items, payment and shipment.
+Each topic has three partitions. Keys are plain strings: record IDs, or email addresses in the two privacy
+topics. The `_key` column holds the decoded key as JSON. Values are Avro, so each top-level value field is a
+column. IDs join across topics: an order's `customer_id` is a customer's key, and its `order_id` appears in
+its items, payment and shipment.
+
+The table describes the data in Kafka, before the [privacy transforms](#privacy-topics) change what is cached:
 
 | Topic | Cleanup | Key | Value fields |
 |---|---|---|---|
+| `shop-customer-profiles` | compact | email | `customer_id`, `email`, `phone`, `birth_date`, nested `address` |
+| `shop-customer-notes` | delete | email | `note_id`, `email`, `birth_date`, `age_band`, `text` |
 | `shop-customers` | compact | customer ID | `customer_id`, `name`, `region` |
 | `shop-products` | compact | product ID | `product_id`, `name`, `category`, `price_cents` |
 | `shop-stock` | compact | product ID | `product_id`, `quantity`, `updated_at` |
@@ -41,6 +48,23 @@ Times are epoch milliseconds; amounts are cents. A delivery is late when `delive
 The demo reads a 15-minute **window** of append history: the range of recent events used by a query. Compacted
 topics provide their current state.
 
+## Privacy topics
+
+The two customer privacy topics contain fake personal data in Kafka. They show how to remove or mask fields
+before KafCacheQL writes its local copy. **Masking** replaces a value with a repeatable hash, so matching
+values can still join without exposing the original.
+
+- `shop-customer-profiles` uses settings alone: it hashes the email key, `email` and `address.postcode`, and
+  drops `phone`, `birth_date` and `address.street`. Dropped schema columns read as NULL.
+- `shop-customer-notes` also uses [ShopPrivacy.java](transforms/demo/ShopPrivacy.java). The class derives
+  `age_band` from the birth date and removes emails from `text`. Then settings drop the key and birth date,
+  and hash `email`.
+
+Both use the same secret, so their masked email columns still join. Both remove `authorization` headers and
+mask `client-ip` header values. The notebook's last two queries show the masked join and the changed notes.
+Kafka still holds the original fake data; transforms only change the cache. See
+[record transforms](../docs/transforms.md) to apply your own policy, with or without Java.
+
 ## Running it
 
 Start the stack with step 1 of the [quick start](../README.md#quick-start). The demo loads the driver from
@@ -51,13 +75,15 @@ repository root:
 docker compose -f demo/compose.yaml up -d --build
 ```
 
-This starts the producer and Zeppelin, and installs the KafCacheQL connection and the demo's note in Zeppelin.
+Compose compiles the demo class in a Java 21 JDK container, starts the producer and Zeppelin, and installs
+the connection and notebook. No separate host compiler step is needed for the class.
 
-Open <http://localhost:8090> and select the **KafCacheQL web store** note. Run its five paragraphs: three
+Open <http://localhost:8090> and select the **KafCacheQL web store** note. Run its seven paragraphs: three
 charts (orders per minute, revenue by product, late versus on-time deliveries), a three-topic join, and the
-current stock of a product. Rerun a paragraph to see newer records.
+current stock of a product, a masked customer join and transformed customer notes. Rerun a paragraph to see
+newer records.
 
-To check that all five paragraphs run, without opening a browser:
+To check that all seven paragraphs run, without opening a browser:
 
 ```sh
 docker compose -f demo/compose.yaml run --rm check
@@ -123,7 +149,8 @@ The demo joins the root stack's fixed `kafcacheql` network and creates no broker
 [compose.yaml](compose.yaml) mounts the JAR read-only from `target/` and keeps the cache and notes in named
 volumes. The [image](zeppelin/Dockerfile) supplies Java 21 for Zeppelin's JDBC interpreter. Connection
 settings are in [interpreter.json](zeppelin/interpreter.json) and
-[kafcacheql.properties](kafcacheql.properties), which sets the 15-minute window.
+[kafcacheql.properties](kafcacheql.properties), which sets the window and transforms. Its `mask.secret` is for
+this demo only. The compiled class's JAR is mounted beside the driver and loaded by the JDBC interpreter.
 
 Stop the demo before rebuilding the JAR, then start it again to load the new classes:
 

@@ -16,6 +16,9 @@ Use `~/.kafcacheql/kafcacheql-jdbc.jar`, downloaded in the quick start (or a bui
 Tools keep the loaded JAR open; rebuilding `target/` under a tool that loads it from there breaks the
 connection. Close the tool before replacing the stable copy, then reopen it.
 
+If you use a [Java record transform](transforms.md#build-and-load-the-class), add its JAR to the same driver
+library list. Drop and mask settings alone need no extra JAR.
+
 | Setting | Value |
 |---|---|
 | Driver class | `io.github.ifnesi.kafcacheql.driver.KafCacheQLDriver` |

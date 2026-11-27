@@ -4,6 +4,7 @@ import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.DriverProperty;
 import io.github.ifnesi.kafcacheql.config.JdbcUrl;
+import io.github.ifnesi.kafcacheql.config.Secrets;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
 import java.sql.Connection;
 import java.sql.Driver;
@@ -72,7 +73,7 @@ public final class KafCacheQLDriver implements Driver {
             if (value == null) {
                 value = fromUrl.getOrDefault(p.key(), p.defaultValue());
             }
-            DriverPropertyInfo i = new DriverPropertyInfo(p.key(), value);
+            DriverPropertyInfo i = new DriverPropertyInfo(p.key(), value != null && Secrets.isSecret(p.key()) ? "[redacted]" : value);
             i.description = p.description();
             i.required = false;
             i.choices = p.choices().length == 0 ? null : p.choices();

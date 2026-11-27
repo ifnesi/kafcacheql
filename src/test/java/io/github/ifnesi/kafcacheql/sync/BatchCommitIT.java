@@ -94,7 +94,7 @@ class BatchCommitIT {
             assertEquals(List.of("1"), cache.read(c -> values(c,
                     "SELECT count(*) FROM \"$schemas\" s JOIN \"$t" + id + "\" t ON s.ref=t._value_schema_id WHERE s.type='AVRO'")));
             assertEquals(List.of("2|tag|AP8=|tag|null"), cache.read(c -> values(c,
-                    "SELECT json_array_length(_headers),json_extract(_headers,'$[0].key'),json_extract(_headers,'$[0].value'),"
+                    "SELECT json_array_length(_headers),json_extract(_headers,'$[0].key'),json_extract(_headers,'$[0].base64'),"
                             + "json_extract(_headers,'$[1].key'),json_extract(_headers,'$[1].value') FROM \"$t" + id + "\" WHERE _offset=0")));
             assertEquals(List.of("0|3"), cache.read(c -> values(c, "SELECT start_offset,end_offset FROM \"$ranges\"")));
             assertEquals(List.of(Long.toString(plan.ends().capturedAtMs())), cache.read(c -> values(c, "SELECT caught_up_at_ms FROM \"$partitions\"")));

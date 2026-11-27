@@ -44,7 +44,7 @@
     },
     "CLASSPATH": {
       "name": "CLASSPATH",
-      "value": "/driver/kafcacheql-jdbc.jar",
+      "value": "/driver/kafcacheql-jdbc.jar:/transforms/shop-transforms.jar",
       "type": "string"
     }
   },

@@ -1,5 +1,6 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import com.google.common.base.Ascii;
 import com.google.common.collect.RangeSet;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
@@ -46,6 +47,7 @@ public final class CacheContext {
     private final DriverConfig config;
     private final ClientSettings settings;
     private final SyncWorker worker;
+    private final RecordTransforms transforms;
     private volatile CacheStore cache;
     private final CompletableFuture<Void> closed = new CompletableFuture<>();
     private final ArrayDeque<Connection> readers = new ArrayDeque<>();
@@ -59,7 +61,8 @@ public final class CacheContext {
         this.path = path;
         this.config = config;
         this.settings = settings;
-        worker = new SyncWorker(path, cluster, config, settings);
+        transforms = new RecordTransforms(config);
+        worker = new SyncWorker(path, cluster, config, settings, transforms);
 
     }
 
@@ -135,7 +138,7 @@ public final class CacheContext {
             var observed = read(c -> TopicRegistry.generation(c, topic));
             var info = topics.describe(topic, execution).orElseThrow(() -> unknownTable(name));
             var registered = context.worker.submit(execution, () -> TopicRegistry.register(context.cache, observed, info,
-                    config.topic(topic), AvroJsonConverter.VERSION, execution::check, knownTopics)
+                    context.transforms.settings(topic, config.topic(topic)), AvroJsonConverter.VERSION, execution::check, knownTopics)
                     .orElseThrow(() -> new StaleGeneration(topic)));
             return new TopicRegistry.ResolvedTable(registered.viewName(), Optional.of(topic), registered.warning());
         }
@@ -231,6 +234,7 @@ public final class CacheContext {
         public void validate(Connection reader, SyncPlan plan, long generation) throws SQLException {
             try {
                 SyncWorker.requireGeneration(reader, plan.topic().name(), generation);
+                if (config.offline()) context.transforms.validateOffline(reader, plan.topic().name());
                 var missing = new TreeMap<Integer, RangeSet<Long>>();
                 for (var partition : plan.windows().entrySet()) {
                     var ranges = RangeStore.missing(reader, generation, partition.getKey(), partition.getValue());
@@ -291,7 +295,7 @@ public final class CacheContext {
                     if (!plan.deleted()) throw new StaleGeneration(plan.topic().name());
                     return false;
                 }
-                if (TopicRegistry.rebuildReason(c, current.get().id(), plan.topic(), config.topic(plan.topic().name()),
+                if (TopicRegistry.rebuildReason(c, current.get().id(), plan.topic(), context.transforms.settings(plan.topic().name(), config.topic(plan.topic().name())),
                         plan.logStarts()).isPresent()) {
                     if (!plan.checked()) throw new StaleGeneration(plan.topic().name());
                     return false;
@@ -423,6 +427,8 @@ public final class CacheContext {
         topics.addAll(other.topics().keySet());
         for (String topic : topics) {
             var a = config.topic(topic); var b = other.topic(topic);
+            if (!a.transforms().equals(b.transforms()) || (a.transforms().enabled() && !config.maskSecret().equals(other.maskSecret())))
+                different("record transform for " + topic);
             if (!a.mode().equals(b.mode())) different("topic." + topic + ".mode");
             if (a.keyFormat().orElse(Format.AUTO) != b.keyFormat().orElse(Format.AUTO)) different("topic." + topic + ".key.format");
             if (a.valueFormat().orElse(Format.AUTO) != b.valueFormat().orElse(Format.AUTO)) different("topic." + topic + ".value.format");

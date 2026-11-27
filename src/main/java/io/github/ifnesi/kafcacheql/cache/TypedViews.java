@@ -22,6 +22,8 @@ import org.everit.json.schema.EnumSchema;
 import org.everit.json.schema.ArraySchema;
 import io.confluent.kafka.schemaregistry.utils.JacksonMapper;
 import io.github.ifnesi.kafcacheql.schema.SchemaRegistry;
+import io.github.ifnesi.kafcacheql.config.TransformSettings;
+import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.JDBCType;
@@ -52,7 +54,7 @@ public final class TypedViews {
     public record Column(String name, String expression, JDBCType type, String warning) {}
     public record Layout(List<Column> columns) {}
     private record TypedSchema(SchemaStore.StoredSchema schema, String messageIndex) {}
-    private record Input(List<TypedSchema> keys, List<TypedSchema> values, List<Inferred> inferred) {}
+    private record Input(List<TypedSchema> keys, List<TypedSchema> values, List<Inferred> inferred, TransformSettings transforms) {}
     private record Inferred(String name, Schema.Type type, boolean conflict, boolean key) {}
     private record Version(String ref, Object schema) {}
     private record ViewInput(Ids ids, List<Inferred> inferred) {}
@@ -80,14 +82,14 @@ public final class TypedViews {
         String signature = ids.signature(inferred);
         // A change of IDs still regenerates a view whose projected columns happen to be identical.
         if (previous.filter(signature::equals).isPresent()) return;
-        Layout layout = describe(writer, ids, inferred);
+        Layout layout = describe(writer, ids, inferred, policy(writer, generation));
         StorageDdl.view(writer, generation, layout.columns().stream()
                 .map(c -> c.expression() + " AS " + StorageDdl.quote(c.name())).toList(), signature);
     }
 
     public static Layout describe(Connection reader, long generation) throws SQLException {
         ViewInput input = viewInput(reader, generation);
-        return describe(reader, input.ids(), input.inferred());
+        return describe(reader, input.ids(), input.inferred(), policy(reader, generation));
     }
 
     private static ViewInput viewInput(Connection reader, long generation) throws SQLException {
@@ -158,8 +160,15 @@ public final class TypedViews {
         }
     }
 
-    private static Layout describe(Connection reader, Ids ids, List<Inferred> inferred) throws SQLException {
-        Input input = new Input(schemas(reader, ids.keys()), schemas(reader, ids.values()), inferred);
+    private static TransformSettings policy(Connection reader, long generation) throws SQLException {
+        try (var p = reader.prepareStatement("SELECT transform_fingerprint FROM \"$topics\" WHERE id=?")) {
+            p.setLong(1, generation);
+            try (var row = p.executeQuery()) { return row.next() ? RecordTransforms.policy(row.getString(1)) : TransformSettings.NONE; }
+        }
+    }
+
+    private static Layout describe(Connection reader, Ids ids, List<Inferred> inferred, TransformSettings transforms) throws SQLException {
+        Input input = new Input(schemas(reader, ids.keys()), schemas(reader, ids.values()), inferred, transforms);
         Layout cached = LAYOUTS.getIfPresent(input);
         if (cached != null) return cached;
         try {
@@ -167,10 +176,10 @@ public final class TypedViews {
             var columns = new ArrayList<Column>();
             if (!multipleRecords(keys) && !multipleRecords(values)) {
                 Set<String> names = new HashSet<>(StorageDdl.METADATA);
-                append(columns, names, keys, true);
-                appendInferred(columns, names, inferred, true);
-                append(columns, names, values, false);
-                appendInferred(columns, names, inferred, false);
+                append(columns, names, keys, true, transforms);
+                appendInferred(columns, names, inferred, true, transforms);
+                append(columns, names, values, false, transforms);
+                appendInferred(columns, names, inferred, false, transforms);
             }
             Layout result = new Layout(List.copyOf(columns));
             LAYOUTS.put(input, result);
@@ -219,13 +228,13 @@ public final class TypedViews {
         }
     }
 
-    private static void appendInferred(List<Column> columns, Set<String> names, List<Inferred> fields, boolean key) throws SQLException {
+    private static void appendInferred(List<Column> columns, Set<String> names, List<Inferred> fields, boolean key, TransformSettings transforms) throws SQLException {
         for (var field : fields) {
             if (field.key() != key) continue;
             String base = key ? "key_" + field.name() : field.name();
             String warning = field.conflict() ? "Field " + base + " has conflicting types in the cached JSON sample; exposed as text without conversion" : null;
             add(columns, names, base, field.name(), key, field.conflict() ? JDBCType.VARCHAR : type(field.type()),
-                    field.conflict() || nested(field.type()), warning, false);
+                    field.conflict() || nested(field.type()), warning, false, transforms);
         }
     }
 
@@ -266,7 +275,7 @@ public final class TypedViews {
         }).filter(java.util.Objects::nonNull).distinct().limit(2).count() > 1;
     }
 
-    private static void append(List<Column> columns, Set<String> names, List<Version> versions, boolean key) throws SQLException {
+    private static void append(List<Column> columns, Set<String> names, List<Version> versions, boolean key, TransformSettings transforms) throws SQLException {
         Map<String, List<Version>> fields = new LinkedHashMap<>();
         for (Version version : versions) {
             Object schema = version.schema();
@@ -301,23 +310,41 @@ public final class TypedViews {
             // Conversion follows every contributing representation, not just the widest descriptor.
             boolean numericString = (type == JDBCType.BIGINT || type == JDBCType.DOUBLE)
                     && types.stream().anyMatch(t -> numericString(t.schema()));
-            add(columns, names, base, field.isEmpty() ? null : field, key, type, conflict || nested(kind(widest)), warning, numericString);
+            add(columns, names, base, field.isEmpty() ? null : field, key, type, conflict || nested(kind(widest)), warning, numericString, transforms);
         }
     }
 
     private static void add(List<Column> columns, Set<String> names, String base, String field, boolean key,
-                            JDBCType type, boolean json, String warning, boolean numericString) throws SQLException {
+                            JDBCType type, boolean json, String warning, boolean numericString, TransformSettings transforms) throws SQLException {
+        String transformPath = key ? field == null ? "_key" : "_key." + field : field == null ? "_value" : field;
+        if (transforms.mask().contains(transformPath)) { type = JDBCType.VARCHAR; json = false; numericString = false; }
         String name = base;
         for (int suffix = 1; !names.add(Ascii.toLowerCase(name)); suffix++) name = base + '_' + suffix;
         String path;
         try { path = field == null ? "$" : "$." + JacksonMapper.INSTANCE.writeValueAsString(field); }
         catch (IOException e) { throw new SQLException("Encoding JSON field path", e); }
         String expression = (key ? "_key" : "_value") + (json ? " -> " : " ->> ") + "'" + path.replace("'", "''") + "'";
+        String value = (key ? "_key" : "_value") + " ->> '" + path.replace("'", "''") + "'";
+        String jsonType = "json_type(" + (key ? "_key" : "_value") + ", '" + path.replace("'", "''") + "')";
         if (type == JDBCType.NUMERIC) expression = "CAST(" + expression + " AS NUMERIC)";
         else if (numericString) {
             if (type == JDBCType.BIGINT) expression = "CAST(" + expression + " AS INTEGER)";
             else expression = "CASE " + expression + " WHEN 'NaN' THEN 'NaN' WHEN 'Infinity' THEN 'Infinity'"
                     + " WHEN '-Infinity' THEN '-Infinity' ELSE CAST(" + expression + " AS REAL) END";
+        }
+        if (transforms.enabled()) {
+            String accepted = switch (type) {
+                case BIGINT -> jsonType + "='integer'";
+                case DOUBLE, NUMERIC -> jsonType + " IN ('integer','real')";
+                case BOOLEAN -> jsonType + " IN ('true','false')";
+                default -> json ? null : jsonType + "='text'";
+            };
+            if (accepted != null) {
+                if (numericString || type == JDBCType.NUMERIC) accepted += " OR CASE WHEN json_valid(" + value
+                        + ") THEN json_type(" + value + ") IN (" + (type == JDBCType.BIGINT ? "'integer'" : "'integer','real'") + ") ELSE 0 END";
+                if (type == JDBCType.DOUBLE) accepted += " OR " + value + " IN ('NaN','Infinity','-Infinity')";
+                expression = "CASE WHEN " + accepted + " THEN " + expression + " END";
+            }
         }
         columns.add(new Column(name, expression, type, warning));
     }

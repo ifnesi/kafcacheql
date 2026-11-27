@@ -10,6 +10,7 @@ import java.util.Optional;
 public enum DriverProperty {
     CONFIG_FILE("config.file", null,
             "Properties file loaded before URL parameters and the Properties object, e.g. Confluent Cloud's client.properties."),
+    MASK_SECRET("mask.secret", null, "Secret for record transform HMACs; required for every transformed topic"),
     CACHE_PATH("cache.path", null,
             "SQLite cache file. Defaults to ~/.kafcacheql/<cluster-id>.db; required when offline=true."),
     CACHE_MAX_BYTES("cache.max.bytes", null,

@@ -48,7 +48,7 @@ public final class CacheStore implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(CacheStore.class);
 
     /** The cache layout, including topic indexes; a cache in any other version is refused. */
-    public static final int FORMAT_VERSION = 8;
+    public static final int FORMAT_VERSION = 9;
 
     static final int BUSY_TIMEOUT_MS = 5_000;
     public static final long JOURNAL_SIZE_LIMIT = 64L * 1024 * 1024;
@@ -108,18 +108,20 @@ public final class CacheStore implements AutoCloseable {
      *     exist and its own cluster ID is used
      */
     public static CacheStore open(Path path, Optional<String> clusterId) throws SQLException {
+        return open(path, clusterId, reader -> {});
+    }
+
+    @FunctionalInterface public interface Inspection { void check(Connection reader) throws SQLException; }
+
+    public static CacheStore open(Path path, Optional<String> clusterId, Inspection inspection) throws SQLException {
         // Not normalised: removing ".." before the file system follows a link would name another file.
         Path file = canonicalPath(path, clusterId.isPresent());
 
         // Checked on a read-only connection before anything writes: refusing a cache leaves it as it was.
-        Optional<Contents> found = contents(file);
+        Optional<Contents> found = contents(file, clusterId, inspection);
         if (found.isEmpty() && clusterId.isEmpty()) {
             throw ConfigErrors.problem("The cache " + file + " is empty; offline needs a cache that has been filled");
         }
-        if (found.isPresent()) {
-            check(file, found.get(), clusterId);
-        }
-
         Connection writer = connect(file, Role.WRITER);
         try {
             verifyIdentity(writer, file);
@@ -278,7 +280,7 @@ public final class CacheStore implements AutoCloseable {
      * Another connection may be creating the same new file at that moment: a read that fails is tried once
      * more before the cache is refused. The writer checks again, under the write lock, before using it.
      */
-    private static Optional<Contents> contents(Path file) throws SQLException {
+    private static Optional<Contents> contents(Path file, Optional<String> clusterId, Inspection inspection) throws SQLException {
         SQLException failure = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             boolean hadWal = Files.exists(Path.of(file + SIDECARS.get(0)));
@@ -287,8 +289,13 @@ public final class CacheStore implements AutoCloseable {
                 // Immutable readers ignore a WAL. Check after reading too: it may have appeared since
                 // connect's existence check. A WAL-aware reader sees the committing writer's snapshot.
                 if (!hadWal && Files.exists(Path.of(file + SIDECARS.get(0)))) {
-                    try (Connection wal = connect(file, Role.INSPECT, true)) { return contents(wal, file); }
+                    try (Connection wal = connect(file, Role.INSPECT, true)) {
+                        var current = contents(wal, file);
+                        if (current.isPresent()) { check(file, current.get(), clusterId); inspection.check(wal); }
+                        return current;
+                    }
                 }
+                if (found.isPresent()) { check(file, found.get(), clusterId); inspection.check(c); }
                 return found;
             } catch (SQLException e) {
                 if (ConfigErrors.SQLSTATE.equals(e.getSQLState())) {

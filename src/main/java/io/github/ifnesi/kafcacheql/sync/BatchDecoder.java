@@ -1,5 +1,6 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import io.github.ifnesi.kafcacheql.config.Format;
 import io.github.ifnesi.kafcacheql.kafka.ClientSettings;
 import io.github.ifnesi.kafcacheql.schema.RecordDecoder;
@@ -13,8 +14,10 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 final class BatchDecoder implements AutoCloseable {
     private final Connection reader;
     private final RecordDecoder decoder;
+    private final RecordTransforms transforms;
 
-    BatchDecoder(ClientSettings settings, Connection reader, RecordDecoder.RegistrySource schemas) {
+    BatchDecoder(ClientSettings settings, Connection reader, RecordDecoder.RegistrySource schemas, RecordTransforms transforms) {
+        this.transforms = transforms;
         this.reader = reader;
         decoder = new RecordDecoder(settings, reader, schemas);
     }
@@ -25,8 +28,8 @@ final class BatchDecoder implements AutoCloseable {
         // Finish the poll even after cancellation; the caller drops it, retaining fetched schemas.
         for (var record : records) {
             if (record.offset() >= end) break;
-            decoded.add(new SyncBatch.Record(record.offset(), record.timestamp(), record.key(), record.headers(),
-                    decoder.decode(topic, record.headers(), record.key(), record.value(), key, value)));
+            var result = transforms.apply(record, decoder.decode(topic, record.headers(), record.key(), record.value(), key, value));
+            if (result != null) decoded.add(result);
         }
         return decoded;
     }

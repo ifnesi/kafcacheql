@@ -9,6 +9,10 @@ import io.github.ifnesi.kafcacheql.schema.RecordDecoder;
 import io.github.ifnesi.kafcacheql.sync.SyncBatch;
 import java.io.IOException;
 import java.io.StringWriter;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -53,7 +57,7 @@ public final class RecordStore {
                 for (var record : batch.records()) {
                     if (!eligible.contains(record.offset())) continue;
                     var decoded = record.decoded();
-                    if (compacted && decoded.value().json() == null) {
+                    if (compacted && record.tombstone()) {
                         delete.setInt(1, batch.partition()); delete.setBytes(2, record.key());
                         delete.setLong(3, record.offset()); delete.executeUpdate();
                     } else {
@@ -85,17 +89,30 @@ public final class RecordStore {
         if (part.schema() != null) schemas.putIfAbsent(part.schema().ref(), part.schema());
     }
 
-    /** An array preserves duplicate header names and null values; bytes are JSON base64 strings. */
+    /** Preserve header order/duplicates; strictly decoded UTF-8 is text, other bytes are base64. */
     private static String headers(Headers headers) throws SQLException {
+        if (headers == null) return null;
         var iterator = headers.iterator();
         if (!iterator.hasNext()) return "[]";
+        var utf8 = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT);
         StringWriter text = new StringWriter();
         try (JsonGenerator json = JacksonMapper.INSTANCE.getFactory().createGenerator(text)) {
             json.writeStartArray();
             do {
                 var header = iterator.next();
-                json.writeStartObject(); json.writeStringField("key", header.key()); json.writeFieldName("value");
-                if (header.value() == null) json.writeNull(); else json.writeBinary(header.value());
+                json.writeStartObject(); json.writeStringField("key", header.key());
+                byte[] bytes = header.value();
+                if (bytes == null) json.writeNullField("value");
+                else {
+                    try {
+                        var value = utf8.decode(ByteBuffer.wrap(bytes));
+                        json.writeFieldName("value");
+                        json.writeString(value.array(), value.arrayOffset() + value.position(), value.remaining());
+                    } catch (CharacterCodingException e) {
+                        json.writeFieldName("base64"); json.writeBinary(bytes);
+                    }
+                }
                 json.writeEndObject();
             } while (iterator.hasNext());
             json.writeEndArray();

@@ -6,7 +6,8 @@ data are separate operations.
 
 ## From connection to results
 
-1. **Connect:** the driver identifies the Kafka cluster and opens its cache.
+1. **Connect:** the driver identifies the Kafka cluster and opens its cache. See the
+   [connection-opening timeout](configuration.md#the-url) if the brokers cannot be reached.
 2. **Browse:** the tool asks for metadata, meaning topic names and column descriptions. These calls never
    fetch topic records. Before a topic is cached, only its built-in columns are known.
 3. **Query:** the driver works out the query's window, the range of records it needs, and fetches what is
@@ -33,6 +34,10 @@ lifecycle](configuration.md#cache-lifecycle-and-sharing).
 
 This table maps tool actions to JDBC methods, network calls and cache changes. For tool setup, see [DBeaver
 and DataGrip](tools.md).
+
+JDBC metadata reports the product as KafCacheQL and the database version as the driver's version, so tools
+should use Generic SQL. Unsupported function and pseudo-column listings return empty results with standard
+JDBC columns.
 
 | JDBC call (in DBeaver, for example) | Kafka and Schema Registry calls | In the cache | Topic permission |
 |---|---|---|---|

@@ -47,6 +47,10 @@ JDBC `Properties` object (in DBeaver, the connection's *Driver properties*). The
 URL's hosts or `bootstrap.servers`, not both with different values. Settings are read when a connection opens,
 so reconnect after changing them.
 
+If the brokers cannot be reached, the cluster-ID lookup fails after 15 s by default.
+`default.api.timeout.ms` replaces that limit when set. The driver's opening limit does not change Kafka's
+timeouts for later calls.
+
 ## Authentication
 
 Credentials and the authentication mode go in the settings file, using the standard Kafka and Schema Registry
@@ -83,15 +87,15 @@ jdbc:kafcacheql://?config.file=~/.kafcacheql/cloud.properties
 
 Keep credentials out of the URL, which tools show and log: put them in `config.file` or the driver properties.
 
-Driver-controlled settings are refused: consumer-group settings such as `group.id` and `enable.auto.commit`
-(it reads by offset, with no consumer group), and Schema Registry's `use.latest.version` and `use.schema.id`
-(every record is decoded with the schema it names).
+The driver reads by offset without a consumer group: `group.id` is refused, and `enable.auto.commit` must
+remain `false`. Schema Registry's `use.latest.version` and `use.schema.id` are refused because each record
+must be decoded with the schema it names.
 
-Kafka's SASL mechanisms PLAIN and SCRAM, and TLS, are meant to work as in any Kafka client, Confluent Cloud
-included; so far SASL/PLAIN is the one tested. OAuth is not yet supported: neither Kafka's `OAUTHBEARER` nor
-Schema Registry's bearer tokens (`bearer.auth.*`). Third-party Kafka extensions built against Kafka's own
-classes, such as AWS MSK IAM, are not supported: the driver's copy of Kafka is relocated inside its JAR, where
-such extensions can't load.
+Kafka's SASL mechanisms PLAIN and SCRAM, and TLS, are meant to work as in any Kafka client. Tested so far:
+SASL/PLAIN, and Confluent Cloud over SASL_SSL with a Schema Registry API key, as in the example above. OAuth
+is not yet supported: neither Kafka's `OAUTHBEARER` nor Schema Registry's bearer tokens (`bearer.auth.*`).
+Third-party Kafka extensions built against Kafka's own classes, such as AWS MSK IAM, are not supported: the
+driver's copy of Kafka is relocated inside its JAR, where such extensions can't load.
 
 ## Offline queries
 
@@ -106,6 +110,13 @@ For a second, offline connection, use a separate settings file:
 offline=true
 cache.path=~/.kafcacheql/local.db
 ```
+
+If the cache uses record transforms, keep the same transform settings, secret and any Java class in the
+offline connection. See [changing a transform](transforms.md#changing-a-transform).
+
+An offline connection shows each topic as it was cached. When a newer driver changes how records are stored,
+such as how headers appear in `_headers`, a topic cached by an older driver keeps its older form offline. Its
+next online query rebuilds it.
 
 You can also point `cache.path` at an existing cache. The navigator then lists its cached topics, and your SQL
 runs against that saved data. Results carry a warning with the cache's as-of time. Missing ranges fail with a
@@ -129,8 +140,9 @@ snapshot can hold back cleanup of SQLite's write-ahead log, the file recording r
 disk usage. Deleting rows frees pages for reuse but does not shrink the main file.
 
 All users of a cache must agree on `cache.max.bytes`, `cache.retention.hours`, and each topic's `mode`,
-`key.format` and `value.format`. In one Java process (JVM), connections must also use the same Kafka and
-Schema Registry client settings; incompatible connections are refused. Separate applications must keep
+`key.format` and `value.format`, plus any [record transforms](transforms.md#changing-a-transform). In one Java
+process (JVM), connections must also use the same Kafka and Schema Registry client settings; incompatible
+connections are refused. Separate applications must keep
 settings that change the cached data aligned themselves. Query settings such as windows, how often to check
 Kafka, and listing filters may differ.
 
@@ -143,6 +155,9 @@ The cache is an unencrypted local copy outside Kafka's access controls. Revoking
 it. On POSIX filesystems the driver restricts the cache files to their owner; on other filesystems, set
 equivalent permissions yourself. Protect the cache and settings file as you would any copy of the data and
 credentials.
+
+[Record transforms](transforms.md) can remove or mask chosen fields before they are cached. Configure them
+before querying sensitive topics; they do not erase earlier copies or replace Kafka's access controls.
 
 `topics.include` and `topics.exclude` only filter navigator listings. They do not prevent queries or erase
 excluded topics from the cache.
@@ -160,6 +175,8 @@ config can't be read (no DescribeConfigs permission); otherwise the broker's val
 permission, `mode` is required. For a compacted topic, also set `delete.retention.ms` to the broker's value;
 the fallback is 86400000 (24 hours).
 
+For removing or masking fields before storage, see the [transform settings](transforms.md#settings-reference).
+
 ## The driver's own settings
 
 The complete property reference is below. Settings not supplied use these defaults.
@@ -167,6 +184,7 @@ The complete property reference is below. Settings not supplied use these defaul
 | Property | Default | Meaning |
 |---|---|---|
 | `config.file` | | Properties file loaded before URL parameters and the Properties object |
+| `mask.secret` | none | Secret required for [record transforms](transforms.md); keep it in the settings file or Properties, outside the URL |
 | `cache.path` | `~/.kafcacheql/<cluster-id>.db` | The SQLite cache file; required when `offline=true` |
 | `cache.max.bytes` | none | Positive limit on SQLite pages in use, not file length. Evicts oldest append records first, then whole compacted topics, least recently queried first. Eviction is queued after the query has its reader snapshot, so the cache can temporarily exceed the limit |
 | `cache.retention.hours` | none | Positive whole hours to keep append records, by record timestamp, whatever Kafka's retention. Compacted topics are excluded. A query can fetch older data again; eviction follows its reader snapshot |

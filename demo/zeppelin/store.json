@@ -160,6 +160,22 @@
           }
         ]
       }
+    },
+    {
+      "title": "Masked customer join",
+      "text": "%store\nSELECT p.customer_id, p.email AS masked_email, p._key AS masked_key, p.phone, p.birth_date, p.address, p._headers, count(*) AS notes\nFROM \"shop-customer-profiles\" p JOIN \"shop-customer-notes\" n ON p.email=n.email\nGROUP BY p.customer_id,p.email,p._key,p.phone,p.birth_date,p.address,p._headers ORDER BY p.customer_id LIMIT 10",
+      "config": {
+        "title": true,
+        "colWidth": 12
+      }
+    },
+    {
+      "title": "Transformed customer notes",
+      "text": "%store\nSELECT note_id, email AS masked_email, age_band, text, birth_date, _key, _headers\nFROM \"shop-customer-notes\" ORDER BY _offset DESC LIMIT 10",
+      "config": {
+        "title": true,
+        "colWidth": 12
+      }
     }
   ],
   "notePath": "/KafCacheQL web store",

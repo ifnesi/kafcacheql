@@ -370,6 +370,13 @@
                     <exclude>META-INF/versions/*/kotlin/**</exclude>
                   </excludes>
                 </filter>
+                <!-- Keep Wire's schema-loader resources; protobuf-java uses compiled descriptors. -->
+                <filter>
+                  <artifact>com.google.protobuf:protobuf-java</artifact>
+                  <excludes>
+                    <exclude>google/protobuf/*.proto</exclude>
+                  </excludes>
+                </filter>
                 <!-- The driver opens SQLite directly; only KafCacheQL registers with DriverManager. -->
                 <filter>
                   <artifact>org.xerial:sqlite-jdbc</artifact>

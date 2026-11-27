@@ -139,7 +139,7 @@ class CacheStoreTest {
                     query(cache.writer(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"));
             Map<String, String> meta = meta(cache.writer());
             assertEquals("cluster-A_1", meta.get("cluster_id"));
-            assertEquals("8", meta.get("cache_format_version"));
+            assertEquals("9", meta.get("cache_format_version"));
             assertTrue(Long.parseLong(meta.get("created_ms")) >= before);
             assertEquals(List.of("wal"), query(cache.writer(), "PRAGMA journal_mode"));
             assertEquals(List.of("1"), query(cache.writer(), "PRAGMA foreign_keys"));

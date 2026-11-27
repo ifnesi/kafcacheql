@@ -37,6 +37,7 @@ public record DriverConfig(
         Optional<Path> cachePath,
         OptionalLong cacheMaxBytes,
         OptionalLong cacheRetentionHours,
+        Optional<String> maskSecret,
         Window appendDefaultWindow,
         long appendDefaultWindowMaxRecords,
         long maxStalenessMs,
@@ -83,6 +84,13 @@ public record DriverConfig(
                 + ", metadataShowInternal=" + metadataShowInternal + ", clientId=" + clientId
                 + ", syncBatchRecords=" + syncBatchRecords + ", syncFetchParallelism=" + syncFetchParallelism + ", topics=" + topics
                 + ", clientSettings=" + Secrets.masked(clientSettings) + "]";
+    }
+
+    /** All secrets for exception redaction, including driver-only settings never passed to clients. */
+    public Map<String, String> redactions() {
+        var all = new TreeMap<>(clientSettings);
+        maskSecret.ifPresent(secret -> all.put("mask.secret", secret));
+        return all;
     }
 
     // ------------------------------------------------------------------ loading
@@ -144,6 +152,10 @@ public record DriverConfig(
             throw ConfigErrors.invalid(DriverProperty.CLIENT_ID.key(), clientId, "a non-empty name");
         }
 
+        if (topics.values().stream().anyMatch(t -> t.transforms().enabled())
+                && (own.get(DriverProperty.MASK_SECRET) == null || own.get(DriverProperty.MASK_SECRET).isEmpty()))
+            throw ConfigErrors.problem("mask.secret is required when any topic has a record transform");
+
         return new DriverConfig(
                 bootstrap,
                 cachePath,
@@ -151,6 +163,7 @@ public record DriverConfig(
                         own.get(DriverProperty.CACHE_MAX_BYTES), 1, Long.MAX_VALUE)) : OptionalLong.empty(),
                 own.containsKey(DriverProperty.CACHE_RETENTION_HOURS) ? OptionalLong.of(atLeast(DriverProperty.CACHE_RETENTION_HOURS.key(),
                         own.get(DriverProperty.CACHE_RETENTION_HOURS), 1, Long.MAX_VALUE / Duration.ofHours(1).toMillis())) : OptionalLong.empty(),
+                Optional.ofNullable(own.get(DriverProperty.MASK_SECRET)),
                 window(DriverProperty.APPEND_DEFAULT_WINDOW.key(), own.get(DriverProperty.APPEND_DEFAULT_WINDOW)),
                 atLeast(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS.key(),
                         own.get(DriverProperty.APPEND_DEFAULT_WINDOW_MAX_RECORDS), 1, Long.MAX_VALUE),
@@ -203,6 +216,9 @@ public record DriverConfig(
                     case APPEND_DEFAULT_WINDOW -> window(key, value);
                     case APPEND_DEFAULT_WINDOW_MAX_RECORDS -> atLeast(key, value, 1, Long.MAX_VALUE);
                     case DELETE_RETENTION_MS -> atLeast(key, value, 0, Long.MAX_VALUE);
+                    case DROP, MASK -> TransformSettings.list(key, value, true);
+                    case DROP_HEADERS, MASK_HEADERS -> TransformSettings.list(key, value, false);
+                    case TRANSFORM -> value.trim();
                 };
                 topics.put(topic, topics.getOrDefault(topic, TopicSettings.NONE).with(setting, parsed));
                 return;

@@ -10,5 +10,6 @@ import org.apache.kafka.common.header.Headers;
  */
 public record SyncBatch(SyncPlan plan, long generation, int partition, long start, long end,
                         boolean reachedEnd, List<Record> records) {
-    public record Record(long offset, long timestamp, byte[] key, Headers headers, RecordDecoder.Decoded decoded) {}
+    public record Record(long offset, long timestamp, byte[] key, Headers headers,
+                         RecordDecoder.Decoded decoded, boolean tombstone) {}
 }

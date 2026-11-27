@@ -30,6 +30,7 @@ final class InternalTables {
               key_format          TEXT NOT NULL,
               value_format        TEXT NOT NULL,
               decoder_version     INTEGER NOT NULL,
+              transform_fingerprint TEXT NOT NULL DEFAULT '',
               created_ms          INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER)),
               last_query_ms       INTEGER NOT NULL DEFAULT 0,
               deleted_ms          INTEGER

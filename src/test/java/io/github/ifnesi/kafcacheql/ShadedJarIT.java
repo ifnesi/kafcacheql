@@ -60,6 +60,33 @@ class ShadedJarIT {
         assertTrue(Files.isRegularFile(jar), "shaded JAR exists: " + jar);
     }
 
+    /** PLAN §7.4: the public hook stays unrelocated and can be built against just the shaded driver. */
+    @Test void publicTransformCompilesAndRunsAgainstTheShadedJar(@org.junit.jupiter.api.io.TempDir Path dir) throws Exception {
+        Path source = dir.resolve("UserTransform.java");
+        Files.writeString(source, """
+                import io.github.ifnesi.kafcacheql.transform.RecordTransform;
+                public class UserTransform implements RecordTransform {
+                    public Record apply(Record record) {
+                        record.value(java.util.Map.of("safe", true));
+                        record.headers(java.util.List.of(new Header("safe", new byte[]{1})));
+                        return record;
+                    }
+                }
+                """);
+        assertEquals(0, javax.tools.ToolProvider.getSystemJavaCompiler().run(null, System.out, System.err,
+                "--release", "21", "-cp", jar.toString(), "-d", dir.toString(), source.toString()));
+        try (var loader = new URLClassLoader(new URL[]{jar.toUri().toURL(), dir.toUri().toURL()}, ClassLoader.getPlatformClassLoader())) {
+            var api = loader.loadClass("io.github.ifnesi.kafcacheql.transform.RecordTransform");
+            var record = loader.loadClass(api.getName() + "$Record");
+            Object input = record.getConstructors()[0].newInstance("orders", 0, 1L, 2L, null, null, "key", null, List.of());
+            Object hook = loader.loadClass("UserTransform").getConstructor().newInstance();
+            Object output = api.getMethod("apply", record).invoke(hook, input);
+            assertEquals(java.util.Map.of("safe", true), record.getMethod("value").invoke(output));
+            assertEquals("key", record.getMethod("key").invoke(output));
+            assertEquals("1", api.getMethod("version").invoke(hook));
+        }
+    }
+
     @Test
     void everyClassIsRelocatedOrKeptOnPurpose() throws IOException {
         List<String> strays = new ArrayList<>();

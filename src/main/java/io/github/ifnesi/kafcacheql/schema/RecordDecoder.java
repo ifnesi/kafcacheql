@@ -41,7 +41,7 @@ public final class RecordDecoder implements AutoCloseable {
 
     private static final Part NULL = new Part(null, null, null, null, null);
     private static final JsonFormat.Printer PROTOBUF_JSON = JsonFormat.printer()
-            .preservingProtoFieldNames().omittingInsignificantWhitespace();
+            .alwaysPrintFieldsWithNoPresence().preservingProtoFieldNames().omittingInsignificantWhitespace();
     // Confluent's JacksonMapper accepts non-JSON numbers such as NaN. Payload detection must be strict.
     private static final JsonFactory JSON = new JsonFactory();
 

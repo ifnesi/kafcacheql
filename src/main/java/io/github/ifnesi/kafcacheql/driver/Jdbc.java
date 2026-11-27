@@ -164,7 +164,9 @@ final class Jdbc {
                 case "supportsTransactions", "supportsSavepoints", "supportsBatchUpdates", "supportsGetGeneratedKeys",
                         "supportsMultipleTransactions", "supportsDataDefinitionAndDataManipulationTransactions",
                         "supportsDataManipulationTransactionsOnly", "dataDefinitionCausesTransactionCommit",
-                        "dataDefinitionIgnoredInTransactions": return false;
+                        "dataDefinitionIgnoredInTransactions", "supportsStoredFunctionsUsingCallSyntax",
+                        "autoCommitFailureClosesAllResultSets", "generatedKeyAlwaysReturned": return false;
+                case "getRowIdLifetime": return RowIdLifetime.ROWID_UNSUPPORTED;
                 case "getDefaultTransactionIsolation": return Connection.TRANSACTION_NONE;
                 case "supportsTransactionIsolationLevel": return (int) args[0] == Connection.TRANSACTION_NONE;
                 case "supportsResultSetType": return (int) args[0] == ResultSet.TYPE_FORWARD_ONLY;
@@ -173,8 +175,8 @@ final class Jdbc {
                 case "supportsResultSetHoldability": return (int) args[0] == ResultSet.CLOSE_CURSORS_AT_COMMIT;
                 case "getIdentifierQuoteString", "getSearchStringEscape": return name.equals("getIdentifierQuoteString") ? "\"" : "\\";
                 case "getDriverName", "getDatabaseProductName": return "KafCacheQL";
-                case "getDriverMajorVersion": return KafCacheQLDriver.MAJOR_VERSION;
-                case "getDriverMinorVersion": return KafCacheQLDriver.MINOR_VERSION;
+                case "getDriverMajorVersion", "getDatabaseMajorVersion": return KafCacheQLDriver.MAJOR_VERSION;
+                case "getDriverMinorVersion", "getDatabaseMinorVersion": return KafCacheQLDriver.MINOR_VERSION;
                 case "getDriverVersion", "getDatabaseProductVersion": return KafCacheQLDriver.MAJOR_VERSION + "." + KafCacheQLDriver.MINOR_VERSION;
                 default: break;
             }
@@ -190,7 +192,7 @@ final class Jdbc {
                             var rows = copy(sqlite.getCatalogs()); add(rows, Map.of("TABLE_CAT", "main")); yield rows;
                         }
                         case "getSchemas" -> {
-                            var rows = copy(sqlite.getSchemas());
+                            var rows = empty(new Column("TABLE_SCHEM", JDBCType.VARCHAR), new Column("TABLE_CATALOG", JDBCType.VARCHAR));
                             if (args.length == 0 || namespace(match, args[0], args[1])) add(rows, Map.of("TABLE_SCHEM", "main", "TABLE_CATALOG", "main"));
                             yield rows;
                         }
@@ -217,6 +219,32 @@ final class Jdbc {
                         }
                         case "getIndexInfo" -> copy(sqlite.getIndexInfo(null, null, ABSENT, false, false));
                         case "getImportedKeys", "getExportedKeys", "getCrossReference" -> copy(sqlite.getImportedKeys(null, null, ABSENT));
+                        // sqlite-jdbc 3.54.1.0 leaves these unimplemented. Layouts are the JDK
+                        // DatabaseMetaData contract; no functions, pseudo columns or client info are advertised.
+                        case "getFunctions" -> empty(
+                                new Column("FUNCTION_CAT", JDBCType.VARCHAR), new Column("FUNCTION_SCHEM", JDBCType.VARCHAR),
+                                new Column("FUNCTION_NAME", JDBCType.VARCHAR), new Column("REMARKS", JDBCType.VARCHAR),
+                                new Column("FUNCTION_TYPE", JDBCType.SMALLINT), new Column("SPECIFIC_NAME", JDBCType.VARCHAR));
+                        case "getFunctionColumns" -> empty(
+                                new Column("FUNCTION_CAT", JDBCType.VARCHAR), new Column("FUNCTION_SCHEM", JDBCType.VARCHAR),
+                                new Column("FUNCTION_NAME", JDBCType.VARCHAR), new Column("COLUMN_NAME", JDBCType.VARCHAR),
+                                new Column("COLUMN_TYPE", JDBCType.SMALLINT), new Column("DATA_TYPE", JDBCType.INTEGER),
+                                new Column("TYPE_NAME", JDBCType.VARCHAR), new Column("PRECISION", JDBCType.INTEGER),
+                                new Column("LENGTH", JDBCType.INTEGER), new Column("SCALE", JDBCType.SMALLINT),
+                                new Column("RADIX", JDBCType.SMALLINT), new Column("NULLABLE", JDBCType.SMALLINT),
+                                new Column("REMARKS", JDBCType.VARCHAR), new Column("CHAR_OCTET_LENGTH", JDBCType.INTEGER),
+                                new Column("ORDINAL_POSITION", JDBCType.INTEGER), new Column("IS_NULLABLE", JDBCType.VARCHAR),
+                                new Column("SPECIFIC_NAME", JDBCType.VARCHAR));
+                        case "getPseudoColumns" -> empty(
+                                new Column("TABLE_CAT", JDBCType.VARCHAR), new Column("TABLE_SCHEM", JDBCType.VARCHAR),
+                                new Column("TABLE_NAME", JDBCType.VARCHAR), new Column("COLUMN_NAME", JDBCType.VARCHAR),
+                                new Column("DATA_TYPE", JDBCType.INTEGER), new Column("COLUMN_SIZE", JDBCType.INTEGER),
+                                new Column("DECIMAL_DIGITS", JDBCType.INTEGER), new Column("NUM_PREC_RADIX", JDBCType.INTEGER),
+                                new Column("COLUMN_USAGE", JDBCType.VARCHAR), new Column("REMARKS", JDBCType.VARCHAR),
+                                new Column("CHAR_OCTET_LENGTH", JDBCType.INTEGER), new Column("IS_NULLABLE", JDBCType.VARCHAR));
+                        case "getClientInfoProperties" -> empty(
+                                new Column("NAME", JDBCType.VARCHAR), new Column("MAX_LEN", JDBCType.INTEGER),
+                                new Column("DEFAULT_VALUE", JDBCType.VARCHAR), new Column("DESCRIPTION", JDBCType.VARCHAR));
                         default -> {
                             Object answer = call(method, sqlite, args);
                             yield answer instanceof ResultSet rows ? copy(rows) : answer;
@@ -236,6 +264,23 @@ final class Jdbc {
 
         private record Table(String topic, String view, long generation, String mode, int partitions) {}
         private record Key(String topic, String view, String mode) {}
+        private record Column(String name, JDBCType type) {}
+
+        private static CachedRowSet empty(Column... columns) throws SQLException {
+            var metadata = new RowSetMetaDataImpl();
+            metadata.setColumnCount(columns.length);
+            for (int i = 1; i <= columns.length; i++) {
+                Column column = columns[i - 1];
+                metadata.setColumnName(i, column.name());
+                metadata.setColumnLabel(i, column.name());
+                metadata.setColumnType(i, column.type().getVendorTypeNumber());
+                metadata.setColumnTypeName(i, column.type().getName());
+                metadata.setNullable(i, ResultSetMetaData.columnNullableUnknown);
+            }
+            var rows = RowSetProvider.newFactory().createCachedRowSet();
+            rows.setMetaData(metadata);
+            return rows;
+        }
 
         private Map<String, String> primaryKeys(String table) throws SQLException {
             boolean pattern = table == null || table.contains("%") || table.contains("_");

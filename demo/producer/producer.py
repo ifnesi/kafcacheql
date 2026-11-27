@@ -12,6 +12,8 @@ from confluent_kafka.schema_registry.avro import AvroSerializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 
 FIELDS = {
+    "customer-profiles": "customer_id:string email:string phone:string birth_date:string address:string",
+    "customer-notes": "note_id:string email:string birth_date:string age_band:string text:string",
     "customers": "customer_id:string name:string region:string",
     "products": "product_id:string name:string category:string price_cents:long",
     "stock": "product_id:string quantity:long updated_at:long",
@@ -36,7 +38,7 @@ def main():
     bootstrap = os.environ.get("BOOTSTRAP_SERVERS", "broker:29092")
     admin = AdminClient({"bootstrap.servers": bootstrap})
     topics = [NewTopic("shop-" + name, num_partitions=3, replication_factor=1,
-                      config={"cleanup.policy": "compact" if name in ("customers", "products", "stock") else "delete"})
+                      config={"cleanup.policy": "compact" if name in ("customers", "products", "stock", "customer-profiles") else "delete"})
               for name in FIELDS]
     for future in admin.create_topics(topics).values():
         try:
@@ -49,6 +51,9 @@ def main():
     for name, fields in FIELDS.items():
         schema = {"type": "record", "name": name.replace("-", "_") + "_value", "namespace": "demo.store",
                   "fields": [dict(zip(("name", "type"), field.split(":"))) for field in fields.split()]}
+        if name == "customer-profiles":
+            schema["fields"][-1]["type"] = {"type": "record", "name": "Address", "fields": [
+                {"name": "street", "type": "string"}, {"name": "postcode", "type": "string"}]}
         serializers[name] = AvroSerializer(registry, json.dumps(schema))
     producer = Producer({"bootstrap.servers": bootstrap, "acks": "all", "linger.ms": 5})
     failures = []
@@ -60,7 +65,9 @@ def main():
     def send(entity, key, timestamp, **value):
         topic = "shop-" + entity
         producer.produce(topic, key=key.encode(), value=serializers[entity](value, SerializationContext(topic, MessageField.VALUE)),
-                         timestamp=timestamp, on_delivery=delivered)
+                         timestamp=timestamp, on_delivery=delivered,
+                         headers=[("client-ip", b"192.0.2.15"), ("authorization", b"demo-private-token")]
+                         if entity in ("customer-profiles", "customer-notes") else None)
 
     running = True
 
@@ -74,6 +81,9 @@ def main():
     for n in range(20):
         cid = f"c{n + 1:02}"
         send("customers", cid, now, customer_id=cid, name=f"Customer {n + 1:02}", region=REGIONS[n % 4])
+        email = f"customer{n + 1:02}@example.test"
+        send("customer-profiles", email, now, customer_id=cid, email=email, phone=f"+1-555-010{n % 10}",
+             birth_date=f"{1970 + n}-06-15", address={"street": f"{n + 1} Example Street", "postcode": "DEMO 123"})
     quantities = [1000] * len(PRODUCTS)
     for n, (name, category, price) in enumerate(PRODUCTS):
         pid = f"p{n + 1:02}"
@@ -83,13 +93,17 @@ def main():
     run = uuid.uuid4().hex[:8]
     sequence = 0
     tick = time.monotonic()
-    print(f"Producing ten shop-* topics at {rate:g} orders/s; run={run}", flush=True)
+    print(f"Producing twelve shop-* topics at {rate:g} orders/s; run={run}", flush=True)
     try:
         while running:
             now = int(time.time() * 1000)
             ordered = now - 120_000
             oid = f"o-{run}-{sequence:08}"
             cid = f"c{sequence % 20 + 1:02}"
+            email = f"customer{sequence % 20 + 1:02}@example.test"
+            send("customer-notes", email, now, note_id="note-" + oid, email=email,
+                 birth_date=f"{1970 + sequence % 20}-06-15", age_band="",
+                 text=f"Please contact {email} about delivery")
             indices = [sequence % 8, (sequence + 3) % 8]
             total = sum(PRODUCTS[n][2] * (n % 2 + 1) for n in indices)
             send("orders", oid, ordered, order_id=oid, customer_id=cid, ordered_at=ordered, total_cents=total, status="paid")
