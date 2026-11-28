@@ -69,7 +69,7 @@ class CliIT {
         assertEquals("", table.err(), "§14.1: no log output");
         assertFalse(table.err().contains("No SLF4J providers"));
         assertFalse(table.err().contains("no providers"));
-        var json = run("", "--json", url,
+        var json = run("", "--mode", "json", url,
                 "SELECT n, NULL AS \"absent\", _key, _value, _headers, 'plain' AS text FROM \"" + topic + "\"",
                 "SELECT 2 AS second");
         assertEquals(0, json.status(), json.err());
@@ -86,7 +86,7 @@ class CliIT {
         // §14.1: nesting applies only to exactly one complete JSON value; other text is unchanged.
         for (String text : List.of("123 trailing", "", "   ", "plain text", "123 456", "{} []")) {
             String sql = "SELECT '" + text + "' AS _value, '" + text + "' AS _key, '" + text + "' AS _headers";
-            var literal = run("", "--json", url, sql);
+            var literal = run("", "--mode", "json", url, sql);
             assertEquals(0, literal.status(), literal.err()); assertEquals("", literal.err());
             var object = JSON.readTree(literal.out()).get(0);
             for (String column : List.of("_value", "_key", "_headers")) {
@@ -94,7 +94,7 @@ class CliIT {
                 assertEquals(text, object.get(column).textValue());
             }
         }
-        var nested = run("", "--json", url,
+        var nested = run("", "--mode", "json", url,
                 "SELECT ' 123 ' AS _value, 'true' AS _key, 'null' AS _headers UNION ALL SELECT '[1]' AS _value, '{}' AS _key, '\"text\"' AS _headers");
         assertEquals(0, nested.status(), nested.err()); assertEquals("", nested.err());
         var complete = JSON.readTree(nested.out());
@@ -141,18 +141,18 @@ class CliIT {
                     String heading = "head\\x1b[2J\\r\\x85", value = "before\\x1b[2Jafter\\r\\n\\t\\x00\\x7f\\x85";
                     int width = Math.max(heading.length(), value.length());
                     assertEquals(heading + " ".repeat(width-heading.length()) + "\n" + "-".repeat(width) + "\n" + value + "\n", cells.out());
-                    var escaped = run("", "--json", schemaUrl, query);
+                    var escaped = run("", "--mode", "json", schemaUrl, query);
                     assertEquals(0, escaped.status(), escaped.err()); assertEquals("", escaped.err());
                     assertEquals(control, JSON.readTree(escaped.out()).get(0).get(label).textValue());
                     assertFalse(escaped.out().contains("\u001b")); assertFalse(escaped.out().contains("\r"));
                 },
                 () -> {
-                    var backed = run("", "--json", schemaUrl, "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0");
+                    var backed = run("", "--mode", "json", schemaUrl, "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0");
                     assertEquals(0, backed.status(), backed.err()); assertEquals("", backed.err());
                     assertEquals(42, JSON.readTree(backed.out()).get(0).get("ms").longValue());
                     String direct = "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0", literal = "SELECT 1.5 AS ms";
                     for (String query : List.of(direct + " UNION ALL " + literal, literal + " UNION ALL " + direct)) {
-                        var union = run("", "--json", schemaUrl, query);
+                        var union = run("", "--mode", "json", schemaUrl, query);
                         assertEquals(0, union.status(), union.err()); assertEquals("", union.err());
                         var values = JSON.readTree(union.out());
                         assertEquals(query.startsWith(direct) ? 42 : 1.5, values.get(0).get("ms").doubleValue());
@@ -172,9 +172,73 @@ class CliIT {
             TestStack.send(protobufTopic, 0, null, null, serializer.serialize(protobufTopic, message), null);
         }
         String protobufUrl = url(protobufTopic) + "&topic." + protobufTopic + ".value.format=auto&schema.registry.url=" + TestStack.REGISTRY;
-        var protobuf = run("", "--json", protobufUrl, "SELECT id FROM \"" + protobufTopic + "\"");
+        var protobuf = run("", "--mode", "json", protobufUrl, "SELECT id FROM \"" + protobufTopic + "\"");
         assertEquals(0, protobuf.status(), protobuf.err()); assertEquals("", protobuf.err());
         assertEquals(42, JSON.readTree(protobuf.out()).get(0).get("id").longValue());
+    }
+
+    /** §14.1 Output modes: line prints aligned names, NULL and escaped controls, with only a blank
+     * line between rows; --mode selects table/line/json and rejects missing/unknown names and --json.
+     */
+    @Test void outputModesAndRejectedOptions() throws Exception {
+        String topic = TestStack.uniqueTopic("cli-line");
+        TestStack.createTopic(topic, 1, Map.of());
+        for (String text : List.of("before\u001b[2Jafter\r\n\t\u0000\u007f\u0085", "João")) {
+            TestStack.send(topic, 0, null, null, JSON.writeValueAsBytes(Map.of("text", text)), null);
+        }
+        String url = url(topic);
+        String query = "SELECT _offset, _value ->> '$.text' AS \"漢字\", NULL AS café FROM \"" + topic + "\" ORDER BY _offset";
+        String usage = "Usage: java -jar kafcacheql-jdbc.jar [--mode table|line|json] <jdbc-url> [statement ...]\n";
+        String invalidMode = "ERROR: Mode must be table, line or json.\n" + usage;
+        assertAll(
+                () -> {
+                    var line = run("", "--mode", "line", url, query);
+                    assertEquals(0, line.status(), line.err()); assertEquals("", line.err());
+                    assertEquals("_offset: 0\n   漢字: before\\x1b[2Jafter\\r\\n\\t\\x00\\x7f\\x85\n   café: NULL\n\n"
+                            + "_offset: 1\n   漢字: João\n   café: NULL\n", line.out());
+                    var empty = run("", "--mode", "line", url, query + " LIMIT 0");
+                    assertEquals(0, empty.status(), empty.err()); assertEquals("", empty.err()); assertEquals("", empty.out());
+                    var table = run("", "--mode", "table", url, query);
+                    var defaults = run("", url, query);
+                    assertEquals(0, table.status(), table.err()); assertEquals("", table.err());
+                    assertEquals(0, defaults.status(), defaults.err()); assertEquals("", defaults.err());
+                    assertEquals(defaults.out(), table.out());
+                },
+                () -> {
+                    // §14.1: line rows stay separated across statements; empty results add nothing.
+                    String first = "SELECT _offset AS n FROM \"" + topic + "\" WHERE _offset=0";
+                    String second = "SELECT _offset AS n FROM \"" + topic + "\" WHERE _offset=1";
+                    var statements = List.of(query + " LIMIT 0", first, second, query + " LIMIT 0", first, query + " LIMIT 0");
+                    var arguments = new ArrayList<>(List.of("--mode", "line", url)); arguments.addAll(statements);
+                    var consecutive = run("", arguments.toArray(String[]::new));
+                    assertEquals(0, consecutive.status(), consecutive.err()); assertEquals("", consecutive.err());
+                    assertEquals("n: 0\n\nn: 1\n\nn: 0\n", consecutive.out());
+                    var script = run(String.join(";\n", statements) + ";\n", "--mode", "line", url);
+                    assertEquals(0, script.status(), script.err()); assertEquals("", script.err());
+                    assertEquals(consecutive.out(), script.out());
+                },
+                () -> {
+                    // §14.1 Running it: --mode belongs before the URL, never among SQL arguments.
+                    for (String[] args : List.of(new String[] {url, "--mode", "line", query},
+                            new String[] {"--mode", "line", url, query, "--mode", "json"})) {
+                        var late = run("", args);
+                        assertEquals(1, late.status()); assertEquals("", late.out());
+                        assertEquals("ERROR: Put --mode before the URL.\n" + usage, late.err());
+                    }
+                },
+                () -> {
+                    var bogus = run("", "--mode", "bogus", url, query);
+                    assertEquals(1, bogus.status()); assertEquals("", bogus.out()); assertEquals(invalidMode, bogus.err());
+                },
+                () -> {
+                    var missing = run("", "--mode");
+                    assertEquals(1, missing.status()); assertEquals("", missing.out()); assertEquals(invalidMode, missing.err());
+                },
+                () -> {
+                    var removed = run("", "--json", url, query);
+                    assertEquals(1, removed.status()); assertEquals("", removed.out());
+                    assertEquals("ERROR: Unknown option: --json.\n" + usage, removed.err());
+                });
     }
 
     /** §14.1: stdin ends statements at a semicolon ending a line; first failure stops with status 1. */
@@ -183,15 +247,15 @@ class CliIT {
         // §14.1: stdin or stdout redirected means script mode, even with a terminal present.
         pty(topic, url, "pipe");
         var result = run("SELECT\n 'a;b' AS text;\nSELECT n FROM \"" + topic + "\";\n"
-                + "SELECT missing FROM \"" + topic + "\";\nSELECT 999 AS never;\n", "--json", url);
+                + "SELECT missing FROM \"" + topic + "\";\nSELECT 999 AS never;\n", "--mode", "json", url);
         assertEquals(1, result.status());
         assertEquals("[{\"text\":\"a;b\"}]\n[{\"n\":7}]\n", result.out());
         assertTrue(result.err().contains("missing"), result.err());
         assertEquals(0, run("SELECT n FROM \"" + topic + "\";\n", url).status());
         // §14.1 Help: scripts and arguments print neither greeting nor help; help is sent as SQL.
-        var help = run("help;\nSELECT 999 AS never;\n", "--json", url);
+        var help = run("help;\nSELECT 999 AS never;\n", "--mode", "json", url);
         assertEquals(1, help.status()); assertEquals("", help.out());
-        var argument = run("", "--json", url, "help;");
+        var argument = run("", "--mode", "json", url, "help;");
         assertEquals(1, argument.status()); assertEquals("", argument.out());
         assertTrue(help.err().startsWith("ERROR: "), help.err());
         assertEquals(argument.err(), help.err(), "the driver's SQL rejection, as for an argument");
@@ -200,7 +264,7 @@ class CliIT {
     /** §14.1: cache statements work as anywhere else; DROP prints its warning on stderr. */
     @Test void cacheStatementsAndWarnings() throws Exception {
         String topic = topic(), url = url(topic);
-        var result = run("", "--json", url, "SYNC " + topic, "DROP TABLE \"" + topic + "\"");
+        var result = run("", "--mode", "json", url, "SYNC " + topic, "DROP TABLE \"" + topic + "\"");
         assertEquals(0, result.status(), result.err());
         var row = JSON.readTree(result.out()).get(0);
         assertEquals(topic, row.get("table_name").textValue());

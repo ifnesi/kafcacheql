@@ -28,17 +28,22 @@ JDBC driver, on a Flink compute pool billed in CFUs. KafCacheQL needs none of th
 - **Made for debugging:** a record that fails to decode stays a row, with the error and its raw bytes, next to
   its partition, offset and headers.
 
+From a terminal: build the driver, start the [web-store demo](demo/README.md), then query its topics with the
+[command line](docs/cli.md):
+
+![Building the driver, starting the demo, its topics in Control Center, then kafcacheql running help, SHOW TABLES, DESCRIBE, mode line, SELECT and SYNC](docs/imgs/kafcacheql-cli-demo.gif)
+
 The same `shop-customers` topic in three tools. In Confluent Control Center:
 
-![Confluent Control Center showing shop-customers keys and values](docs/control-center-shop-customers.png)
+![Confluent Control Center showing shop-customers keys and values](docs/imgs/control-center-shop-customers.png)
 
 In DBeaver, with schema fields exposed as columns:
 
-![DBeaver showing shop-customers with customer_id, name and region columns](docs/dbeaver-shop-customers.png)
+![DBeaver showing shop-customers with customer_id, name and region columns](docs/imgs/dbeaver-shop-customers.png)
 
 And in DataGrip:
 
-![DataGrip showing shop-customers and the topic list](docs/datagrip-shop-customers.png)
+![DataGrip showing shop-customers and the topic list](docs/imgs/datagrip-shop-customers.png)
 
 These topics come from the [web-store demo](demo/README.md).
 
@@ -46,7 +51,7 @@ These topics come from the [web-store demo](demo/README.md).
 
 The driver runs inside your tool. Kafka holds the source data; SQLite stores the local copy and runs your SQL.
 
-![The driver fetches Kafka records into a local SQLite cache, then runs SQL](docs/architecture.svg)
+![The driver fetches Kafka records into a local SQLite cache, then runs SQL](docs/imgs/architecture.svg)
 
 A topic appears as a table, but its rows depend on the kind of topic:
 

@@ -15,7 +15,7 @@ import termios
 import time
 
 java, tmpdir, jar, url, topic, version, bad_inputs_file, brokers, cache, *mode = sys.argv[1:]
-command = [java, "-Xmx1g", "-Djava.io.tmpdir=" + tmpdir, "-jar", jar, "--json", url]
+command = [java, "-Xmx1g", "-Djava.io.tmpdir=" + tmpdir, "-jar", jar, "--mode", "json", url]
 
 class Session:
     def __init__(self, offline=False):
@@ -132,6 +132,35 @@ if mode == ['pipe']:
 s = None
 try:
     s = Session()
+    # §14.1: mode is a session command only with an empty SQL buffer; here it is the SQL alias.
+    s.send('SELECT 7 AS\n')
+    assert s.read('       ...> ') == 'SELECT 7 AS\n'
+    s.send('mode;\n')
+    assert s.read('> ') == 'mode;\n[{"mode":7}]\nkafcacheql'
+    # §14.1 Output modes: the option starts the session in JSON; commands never reach JDBC.
+    for mode_command in ['mOdE;', 'mode']:
+        s.send(mode_command + '\n')
+        assert s.read('kafcacheql> ') == mode_command + '\nMode: json\n'
+    s.send('MoDe LiNe;\n')
+    assert s.read('kafcacheql> ') == 'MoDe LiNe;\nMode: line\n'
+    query = 'SELECT n, NULL AS "absent" FROM "' + topic + '";'
+    s.send(query + '\n')
+    assert s.read('kafcacheql> ') == query + '\n     n: 7\nabsent: NULL\n'
+    # §14.1: prompts separate results, so even a later line-mode result starts with its first row.
+    s.send(query + '\n')
+    assert s.read('kafcacheql> ') == query + '\n     n: 7\nabsent: NULL\n'
+    # An empty result adds nothing and the next result still starts directly with its first row.
+    empty_query = query[:-1] + ' LIMIT 0;'
+    s.send(empty_query + '\n')
+    assert s.read('kafcacheql> ') == empty_query + '\n'
+    s.send(query + '\n')
+    assert s.read('kafcacheql> ') == query + '\n     n: 7\nabsent: NULL\n'
+    s.send('mode bogus\n')
+    assert s.read('kafcacheql> ') == 'mode bogus\nERROR: Mode must be table, line or json.\n'
+    s.send('mode;\n')
+    assert s.read('kafcacheql> ') == 'mode;\nMode: line\n'
+    s.send('mode json\n')
+    assert s.read('kafcacheql> ') == 'mode json\nMode: json\n'
     # §14.1 Help: exact session help, with or without a semicolon, only at an empty SQL buffer.
     help_text = """Statements end with ';' at the end of a line. Quote names that contain '-' or '.'.
 
@@ -142,6 +171,7 @@ try:
   DROP TABLE "<table>";      Remove a topic from the local cache; Kafka is unchanged
 
   help                       This list (no ';' needed)
+  mode [table|line|json]     Show or change how results print
   quit, exit                 Leave (or Ctrl-D)
   Ctrl-C                     Cancel the running statement
   Up and down arrows         Earlier statements

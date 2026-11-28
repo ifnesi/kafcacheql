@@ -112,15 +112,15 @@ docker compose run --rm check
 
 The note after about five minutes of producing, its charts first:
 
-![Zeppelin charts: orders, revenue and late deliveries](images/zeppelin-charts.png)
+![Zeppelin charts: orders, revenue and late deliveries](../docs/imgs/zeppelin-charts.png)
 
 Then its tables: orders joined to customers and payments, and a compacted lookup of current stock:
 
-![Zeppelin tables: joined orders and current stock](images/zeppelin-tables.png)
+![Zeppelin tables: joined orders and current stock](../docs/imgs/zeppelin-tables.png)
 
 The same `shop-orders` records, as Kafka holds them, in Control Center at <http://localhost:9021>:
 
-![Control Center: the shop-orders topic's messages](images/control-center.png)
+![Control Center: the shop-orders topic's messages](../docs/imgs/control-center.png)
 
 ## A five-topic join
 
@@ -179,7 +179,7 @@ kafcacheql "$URL" 'SYNC shop-order*'
 The masked customer profiles as JSON, ready for `jq`:
 
 ```sh
-kafcacheql --json "$URL" 'SELECT _key, _value FROM "shop-customer-profiles" LIMIT 2'
+kafcacheql --mode json "$URL" 'SELECT _key, _value FROM "shop-customer-profiles" LIMIT 2'
 ```
 
 Run `kafcacheql "$URL"` alone for an interactive session: type statements ending with `;`, such as the

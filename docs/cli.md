@@ -6,6 +6,8 @@ same cache and settings as your SQL editor. It needs only Java 21 or newer.
 The command line and the [cache statements](sql.md#cache-statements) come with the next release; v0.1.0
 doesn't have them. Until then, [build the driver](../README.md#development) from the repository.
 
+![Building the driver, starting the web-store demo, then kafcacheql running help, SHOW TABLES, DESCRIBE, mode line, SELECT and SYNC](imgs/kafcacheql-cli-demo.gif)
+
 ```sh
 alias kafcacheql='java -jar ~/.kafcacheql/kafcacheql-jdbc.jar'
 URL='jdbc:kafcacheql://localhost:9092?config.file=~/.kafcacheql/local.properties'
@@ -105,6 +107,7 @@ Statements end with ';' at the end of a line. Quote names that contain '-' or '.
   DROP TABLE "<table>";      Remove a topic from the local cache; Kafka is unchanged
 
   help                       This list (no ';' needed)
+  mode [table|line|json]     Show or change how results print
   quit, exit                 Leave (or Ctrl-D)
   Ctrl-C                     Cancel the running statement
   Up and down arrows         Earlier statements
@@ -120,16 +123,39 @@ Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
 - The line editor uses the same keys as bash. Besides those in the list: Ctrl-K and Ctrl-U delete to the end
   or start of the line, Alt-B and Alt-F move by word, and Ctrl-L clears the screen.
 - History is kept in memory only, never written to a file, since queries can contain customer data.
-- `help`, `quit` and `exit` are session commands, not SQL: a script or argument sends them to the driver,
+- `mode` shows how results print, and `mode line` (or `table`, `json`) changes it for the rest of the
+  session. The session starts in the mode given with `--mode`.
+- `help`, `mode`, `quit` and `exit` are session commands, not SQL: a script or argument sends them to the driver,
   which refuses them.
 
 ## Output
 
-Results print as a table by default. NULL prints as `NULL`. With `--json` before the URL, each result prints
-as a JSON array of objects, one per row:
+Results print as a table by default. Put `--mode` before the URL to choose another layout:
+
+| Mode | Prints |
+|---|---|
+| `table` | Aligned columns under a header row (the default) |
+| `line` | One `name: value` line per column, with a blank line between rows. Easier to read when rows are wide |
+| `json` | A JSON array of objects, one per row |
+
+NULL prints as `NULL` in `table` and `line`.
 
 ```sh
-kafcacheql --json "$URL" 'SELECT _offset, _key, _value FROM "customers" LIMIT 1'
+kafcacheql --mode line "$URL" 'SELECT _offset, _key, _value FROM "customers" LIMIT 2'
+```
+
+```text
+_offset: 0
+   _key: "c1"
+ _value: {"name":"Ada","country":"UK"}
+
+_offset: 1
+   _key: "c2"
+ _value: {"name":"Linus","country":"FI"}
+```
+
+```sh
+kafcacheql --mode json "$URL" 'SELECT _offset, _key, _value FROM "customers" LIMIT 1'
 ```
 
 ```json

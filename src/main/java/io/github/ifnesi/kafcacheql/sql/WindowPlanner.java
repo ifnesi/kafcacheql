@@ -53,10 +53,9 @@ public final class WindowPlanner {
         var window = cache.config().appendDefaultWindow(base.topic().name());
         long maxRecords = cache.config().appendDefaultWindowMaxRecords(base.topic().name());
         if (defaults && !window.isAll()) {
-            String description = "last " + window.duration().orElseThrow().toString()
-                    .substring(2).toLowerCase(Locale.ROOT) + ", ≤" + maxRecords + " records/partition";
-            warnings.add(new SQLWarning(sentence(base.topic().name() + ": default window applied (" + description
-                    + "); add a `_timestamp`/`_offset` bound to override"), "01000"));
+            String duration = window.duration().orElseThrow().toString().substring(2).toLowerCase(Locale.ROOT);
+            warnings.add(new SQLWarning(sentence(base.topic().name() + ": only records from the last " + duration
+                    + " are read, up to " + maxRecords + " per partition; add a _timestamp or _offset condition to read more"), "01000"));
         }
         // Apply offset/partition bounds and the record cap before using cached timestamps. These are
         // the candidate intervals whose coverage must be proved before time can narrow them offline.

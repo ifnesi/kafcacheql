@@ -1200,17 +1200,17 @@ class JdbcIT {
                         "SELECT _offset FROM " + table + " ORDER BY _offset DESC,_partition LIMIT 2",
                         "SELECT a._offset FROM " + table + " a JOIN " + table + " b ON a._offset=b._offset ORDER BY a._offset DESC LIMIT 2")) {
                     try (var rows = statement.executeQuery(fallback)) { assertFalse(rows.next(), fallback); }
-                    assertTrue(warnings(statement).contains("default window applied"), fallback + ": " + warnings(statement));
+                    assertTrue(warnings(statement).contains("only records from the last 30s are read, up to 1 per partition"), fallback + ": " + warnings(statement));
                 }
                 try (var prepared = c.prepareStatement("SELECT _offset FROM " + table + " ORDER BY _offset DESC LIMIT ?")) {
                     prepared.setInt(1, 2);
                     try (var rows = prepared.executeQuery()) { assertFalse(rows.next()); }
-                    assertTrue(warnings(prepared).contains("default window applied"));
+                    assertTrue(warnings(prepared).contains("only records from the last 30s are read, up to 1 per partition"));
                 }
                 try (var rows = statement.executeQuery("SELECT count(*) FROM " + table + " ORDER BY _offset DESC LIMIT 2")) {
                     assertTrue(rows.next()); assertEquals(0, rows.getLong(1)); assertFalse(rows.next());
                 }
-                assertTrue(warnings(statement).contains("default window applied"));
+                assertTrue(warnings(statement).contains("only records from the last 30s are read, up to 1 per partition"));
                 assertTrue(fetched.isEmpty(), fetched.toString());
             }
         }

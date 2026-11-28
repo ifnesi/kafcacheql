@@ -10,22 +10,36 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import org.jline.utils.AttributedString;
 
 /** Rendering belongs to the JDBC client, not the driver. */
 final class Results {
+    enum Mode {
+        TABLE, LINE, JSON;
+
+        static Mode parse(String name) {
+            try { return valueOf(name.toUpperCase(Locale.ROOT)); }
+            catch (IllegalArgumentException invalid) {
+                throw new IllegalArgumentException("Mode must be table, line or json.");
+            }
+        }
+
+        @Override public String toString() { return name().toLowerCase(Locale.ROOT); }
+    }
+
     private static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private static final java.util.HexFormat HEX = java.util.HexFormat.of();
     private static final Set<String> JSON_COLUMNS = Set.of("_key", "_value", "_headers");
-    private Results() {}
+    private boolean lineRowPrinted;
 
-    static void print(ResultSet rows, boolean json) throws SQLException, IOException {
+    void print(ResultSet rows, Mode mode, boolean interactive) throws SQLException, IOException {
         var metadata = rows.getMetaData();
         int count = metadata.getColumnCount();
         var columns = new ArrayList<String>(count);
         for (int i = 1; i <= count; i++) columns.add(metadata.getColumnLabel(i));
-        if (json) {
+        if (mode == Mode.JSON) {
             try (var out = JSON.getFactory().createGenerator(System.out)
                     .disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET)) {
                 out.writeStartArray();
@@ -48,12 +62,24 @@ final class Results {
         } else {
             columns.replaceAll(Results::cell);
             int[] widths = columns.stream().mapToInt(Results::width).toArray();
+            if (mode == Mode.LINE) {
+                if (interactive) lineRowPrinted = false;
+                int widest = java.util.Arrays.stream(widths).max().orElse(0);
+                while (rows.next()) {
+                    if (lineRowPrinted) System.out.println();
+                    lineRowPrinted = true;
+                    for (int i = 1; i <= count; i++) {
+                        System.out.println(" ".repeat(widest - widths[i - 1]) + columns.get(i - 1)
+                                + ": " + cell(rows.getString(i)));
+                    }
+                }
+                return;
+            }
             var values = new ArrayList<List<String>>();
             while (rows.next()) {
                 var row = new ArrayList<String>(count);
                 for (int i = 1; i <= count; i++) {
-                    String value = rows.getString(i);
-                    value = value == null ? "NULL" : cell(value);
+                    String value = cell(rows.getString(i));
                     widths[i - 1] = Math.max(widths[i - 1], width(value));
                     row.add(value);
                 }
@@ -75,6 +101,7 @@ final class Results {
     }
 
     private static String cell(String value) {
+        if (value == null) return "NULL";
         var escaped = new StringBuilder(value.length());
         value.codePoints().forEach(c -> {
             switch (c) {

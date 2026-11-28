@@ -109,12 +109,12 @@ class WindowsIT {
                      "topic." + defaults + ".append.default.window", "all"))) {
             var timeResult = query(time, sql);
             assertEquals(List.of("0|1", "0|2", "1|1", "1|2"), rows(timeResult));
-            assertEquals(defaults + ": default window applied (last 30s, ≤100 records/partition); add a `_timestamp`/`_offset` bound to override.",
+            assertEquals(defaults + ": only records from the last 30s are read, up to 100 per partition; add a _timestamp or _offset condition to read more.",
                     timeResult.warnings().getFirst().getMessage());
             assertEquals(List.of("0|2", "1|2"), rows(query(records, sql)));
             var partitionOnly = query(records, "SELECT _partition,_offset FROM " + q(defaults) + " WHERE _partition=1 ORDER BY _offset");
             assertEquals(List.of("1|2"), rows(partitionOnly));
-            assertTrue(partitionOnly.warnings().getFirst().getMessage().contains("last 1h, ≤1 records/partition"));
+            assertTrue(partitionOnly.warnings().getFirst().getMessage().contains("last 1h are read, up to 1 per partition"));
             var allResult = query(all, sql);
             assertEquals(List.of("0|0", "0|1", "0|2", "1|0", "1|1", "1|2"), rows(allResult));
             assertTrue(allResult.warnings().isEmpty());
