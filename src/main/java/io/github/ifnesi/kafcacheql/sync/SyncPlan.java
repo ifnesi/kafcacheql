@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.sync;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
@@ -42,8 +43,8 @@ public record SyncPlan(TopicInfo topic, OptionalLong generation, boolean deleted
                     ? ImmutableRangeSet.of(available) : wanted.get(partition);
             if (ranges != null) {
                 if (source != Source.OFFLINE && topic.mode() == Mode.APPEND && !ranges.subRangeSet(Range.lessThan(starts.get(partition))).isEmpty()) {
-                    warnings.add(new SQLWarning(sentence("Topic " + topic.name() + " partition " + partition
-                            + ": requested data below offset " + starts.get(partition) + " has expired"), "01000"));
+                    warnings.add(new SQLWarning(sentence(escape("Topic " + topic.name() + " partition " + partition
+                            + ": requested data below offset " + starts.get(partition) + " has expired")), "01000"));
                 }
                 windows.put(partition, ImmutableRangeSet.copyOf(source == Source.OFFLINE ? ranges : ranges.subRangeSet(available)));
             }

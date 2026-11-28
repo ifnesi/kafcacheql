@@ -3,9 +3,6 @@
 The driver's JAR is also a command-line tool. It runs SQL against Kafka from a terminal or a script, using the
 same cache and settings as your SQL editor. It needs only Java 21 or newer.
 
-The command line and the [cache statements](sql.md#cache-statements) come with the next release; v0.1.0
-doesn't have them. Until then, [build the driver](../README.md#development) from the repository.
-
 ![Building the driver, starting the web-store demo, then kafcacheql running help, SHOW TABLES, DESCRIBE, mode line, SELECT and SYNC](imgs/kafcacheql-cli-demo.gif)
 
 ```sh
@@ -100,19 +97,20 @@ Type `help` for the statements and keys:
 kafcacheql> help
 Statements end with ';' at the end of a line. Quote names that contain '-' or '.'.
 
-  SELECT ... ;               Query topics as tables; fetches what the query needs first
-  SHOW TABLES;               Topics, with cached rows and bytes
-  DESCRIBE "<table>";        A table's columns and types
-  SYNC [<pattern>, ...];     Fetch everything new: cached topics, or names with * and ?
-  DROP TABLE "<table>";      Remove a topic from the local cache; Kafka is unchanged
+  SELECT ... ;                  Query topics as tables; fetches what the query needs first
+  SHOW TABLES [<pattern>, ...]; Topics, with cached rows and bytes
+  DESCRIBE "<table>";           A table's columns and types
+  SYNC [<pattern>, ...];        Fetch everything new: cached topics, or names with * and ?
+  DROP TABLE "<table>";         Remove a topic from the local cache; Kafka is unchanged
 
-  help                       This list (no ';' needed)
-  mode [table|line|json]     Show or change how results print
-  quit, exit                 Leave (or Ctrl-D)
-  Ctrl-C                     Cancel the running statement
-  Up and down arrows         Earlier statements
-  Ctrl-R                     Search earlier statements
-  Ctrl-A, Ctrl-E             Start, end of the line
+  help                          This list (no ';' needed)
+  mode [table|line|json]        Show or change how results print
+  quit, exit                    Leave (or Ctrl-D)
+  Ctrl-C                        Cancel the running statement
+  TAB                           Complete keywords, topics and modes
+  Up and down arrows            Earlier statements
+  Ctrl-R                        Search earlier statements
+  Ctrl-A, Ctrl-E                Start, end of the line
 
 Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
 ```
@@ -120,6 +118,8 @@ Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
 - One connection stays open for the whole session, so queries after the first reuse it and start faster.
 - An error is printed and the prompt returns.
 - Ctrl-C cancels the running statement, not the session.
+- TAB completes statement keywords, topic names (quoted when they need it) and, after `mode`, the mode
+  names. Press it twice to list every match. New topics show up within a minute.
 - The line editor uses the same keys as bash. Besides those in the list: Ctrl-K and Ctrl-U delete to the end
   or start of the line, Alt-B and Alt-F move by word, and Ctrl-L clears the screen.
 - History is kept in memory only, never written to a file, since queries can contain customer data.
@@ -217,6 +217,9 @@ Matching is case-sensitive, as Kafka topic names are: `orders` doesn't match `Or
 topics the navigator lists, so a topic hidden by `topics.include` or `topics.exclude` is never synced. Topic names need no
 quotes here, even with `-` or `.`. A pattern that matches no topic fails the statement before anything is
 fetched, so a typo in a scheduled job shows up as an error.
+
+The same patterns filter `SHOW TABLES`, for example `SHOW TABLES shop-order*;`. There, a pattern that
+matches nothing just returns no rows.
 
 A systemd timer works the same way.
 

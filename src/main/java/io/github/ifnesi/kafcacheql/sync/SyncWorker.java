@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.sync;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import com.google.common.collect.Range;
@@ -440,7 +441,7 @@ public final class SyncWorker implements AutoCloseable {
             long now = hooks.nanoTime();
             if (now - lastReport < PROGRESS_INTERVAL_NANOS) return;
             lastReport = now;
-            log.info("{} partition {}: {} records fetched, {} offsets remaining", topic, partition, fetched, remaining);
+            log.info("{} partition {}: {} records fetched, {} offsets remaining", escape(topic), partition, fetched, remaining);
         }
     }
 
@@ -580,15 +581,15 @@ public final class SyncWorker implements AutoCloseable {
             if (result.contended()) {
                 if (size > 1024L * 1024 * 1024) {
                     log.warn("WAL checkpoint contention for {}: {} frames, {} checkpointed, busy={}",
-                            cache.path(), result.frames(), result.checkpointed(), result.busy());
+                            escape(cache.path().toString()), result.frames(), result.checkpointed(), result.busy());
                 } else {
                     log.debug("WAL checkpoint contention for {}: {} frames, {} checkpointed, busy={}",
-                            cache.path(), result.frames(), result.checkpointed(), result.busy());
+                            escape(cache.path().toString()), result.frames(), result.checkpointed(), result.busy());
                 }
             }
             hooks.afterCheckpoint(result);
         } catch (SQLException | IOException e) {
-            log.warn("WAL checkpoint failed: {}", failure("Checkpoint", e).getMessage());
+            log.warn("WAL checkpoint failed: {}", escape(failure("Checkpoint", e).getMessage()));
         }
     }
 
@@ -697,7 +698,7 @@ public final class SyncWorker implements AutoCloseable {
         // Background copies are disposable; a busy lock or any other failure is logged and dropped.
         try {
             write.work().run();
-        } catch (SQLException | RuntimeException e) { log.warn("Dropped background cache write: {}", failure("Background write", e).getMessage()); }
+        } catch (SQLException | RuntimeException e) { log.warn("Dropped background cache write: {}", escape(failure("Background write", e).getMessage())); }
     }
 
     private SQLException failure(String what, Throwable cause) {

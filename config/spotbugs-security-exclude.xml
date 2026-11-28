@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+  <!-- Reviewed findings only: exact patterns, classes and method signatures; new locations remain checked. -->
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.CacheStore" />
+    <Method name="enableWal" params="java.sql.Connection,java.nio.file.Path" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.CacheStore" />
+    <Method name="lambda$initialiseOrCheck$3" params="java.sql.Connection,java.nio.file.Path,java.util.Optional" returns="java.lang.String" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.EvictionStore" />
+    <Method name="oldestAppend" params="java.sql.Connection" returns="java.util.Optional" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.PartitionStore" />
+    <Method name="deleteChunk" params="java.sql.Connection,long,java.lang.String,java.util.List,boolean" returns="int" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.PartitionStore" />
+    <Method name="needsPruning" params="java.sql.Connection,long,java.util.Map" returns="boolean" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.RecordStore" />
+    <Method name="write" params="java.sql.Connection,io.github.ifnesi.kafcacheql.sync.SyncBatch" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.StorageDdl" />
+    <Method name="create" params="java.sql.Connection,long,io.github.ifnesi.kafcacheql.config.Mode,java.lang.String" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.StorageDdl" />
+    <Method name="drop" params="java.sql.Connection,long,java.lang.String" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.StorageDdl" />
+    <Method name="view" params="java.sql.Connection,long,java.util.List,java.lang.String" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.TopicRegistry" />
+    <Method name="removeStorage" params="java.sql.Connection,io.github.ifnesi.kafcacheql.cache.TopicRegistry$Row" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.TypedViews" />
+    <Method name="infer" params="java.sql.Connection,long,io.github.ifnesi.kafcacheql.cache.TypedViews$Ids" returns="java.util.List" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.cache.TypedViews" />
+    <Method name="retainPresent" params="java.sql.Connection,long,java.lang.String,java.util.Set" returns="void" />
+  </Match>
+  <!-- The patterns' character classes exclude their separators, preventing catastrophic backtracking. -->
+  <Match>
+    <Bug pattern="REDOS" />
+    <Class name="io.github.ifnesi.kafcacheql.cli.Main" />
+    <Method name="&lt;clinit&gt;" params="" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC" />
+    <Class name="io.github.ifnesi.kafcacheql.cli.Main" />
+    <Method name="execute" params="java.sql.Connection,java.lang.String" returns="boolean" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cli.Main" />
+    <Method name="interactive" params="java.sql.Connection" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cli.Main" />
+    <Method name="run" params="java.lang.String[]" returns="int" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.cli.Main" />
+    <Method name="script" params="java.sql.Connection" returns="void" />
+  </Match>
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.config.DriverConfig" />
+    <Method name="bool" params="java.util.Map,io.github.ifnesi.kafcacheql.config.DriverProperty" returns="boolean" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$MetadataHandler" />
+    <Method name="cached" params="java.sql.Connection" returns="java.util.Map" />
+  </Match>
+  <!-- The monitor can also be locked by host code; synchronization is not a security boundary inside the user's own JVM. -->
+  <Match>
+    <Bug pattern="USO_UNSAFE_OBJECT_SYNCHRONIZATION" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$MetadataHandler" />
+    <Method name="invoke" params="java.lang.reflect.Method,java.lang.Object[]" returns="java.lang.Object" />
+  </Match>
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$MetadataHandler" />
+    <Method name="lambda$describe$11" params="java.lang.String,java.lang.String" returns="boolean" />
+  </Match>
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$MetadataHandler" />
+    <Method name="lambda$primaryKeys$2" params="java.lang.String,java.util.Map$Entry" returns="boolean" />
+  </Match>
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$MetadataHandler" />
+    <Method name="lambda$primaryKeys$4" params="java.lang.String,java.util.Map$Entry" returns="boolean" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$MetadataHandler" />
+    <Method name="lambda$showTables$10" params="java.util.Set,java.util.List,io.github.ifnesi.kafcacheql.sync.Execution,java.sql.Connection" returns="javax.sql.rowset.CachedRowSet" />
+  </Match>
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.driver.Jdbc$ResultHandler" />
+    <Method name="typedValue" params="int,java.sql.JDBCType" returns="java.lang.Object" />
+  </Match>
+  <!-- The monitor can also be locked by host code; synchronization is not a security boundary inside the user's own JVM. -->
+  <Match>
+    <Bug pattern="USO_UNSAFE_STATIC_METHOD_SYNCHRONIZATION" />
+    <Class name="io.github.ifnesi.kafcacheql.kafka.ClientIds" />
+    <Method name="release" params="io.github.ifnesi.kafcacheql.kafka.ClientIds$Kind,java.lang.String" returns="void" />
+  </Match>
+  <!-- The monitor can also be locked by host code; synchronization is not a security boundary inside the user's own JVM. -->
+  <Match>
+    <Bug pattern="USO_UNSAFE_STATIC_METHOD_SYNCHRONIZATION" />
+    <Class name="io.github.ifnesi.kafcacheql.kafka.ClientIds" />
+    <Method name="release" params="java.lang.String" returns="void" />
+  </Match>
+  <!-- The monitor can also be locked by host code; synchronization is not a security boundary inside the user's own JVM. -->
+  <Match>
+    <Bug pattern="USO_UNSAFE_STATIC_METHOD_SYNCHRONIZATION" />
+    <Class name="io.github.ifnesi.kafcacheql.kafka.ClientIds" />
+    <Method name="reserve" params="io.github.ifnesi.kafcacheql.kafka.ClientIds$Kind,java.lang.String" returns="java.lang.String" />
+  </Match>
+  <!-- The monitor can also be locked by host code; synchronization is not a security boundary inside the user's own JVM. -->
+  <Match>
+    <Bug pattern="USO_UNSAFE_STATIC_METHOD_SYNCHRONIZATION" />
+    <Class name="io.github.ifnesi.kafcacheql.kafka.ClientIds" />
+    <Method name="reserve" params="java.lang.String" returns="java.lang.String" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.Bounds$Extraction" />
+    <Method name="evaluate" params="java.util.List" returns="java.util.List" />
+  </Match>
+  <!-- Case-insensitive comparison of fixed ASCII words and topic names, not an authentication or authorization boundary. -->
+  <Match>
+    <Bug pattern="IMPROPER_UNICODE" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.Query" />
+    <Method name="parseAndResolve" params="java.lang.String,io.github.ifnesi.kafcacheql.sql.Query$Resolver" returns="io.github.ifnesi.kafcacheql.sql.Query" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.QueryPipeline" />
+    <Method name="lambda$open$8" params="io.github.ifnesi.kafcacheql.sql.Query,java.util.Map,io.github.ifnesi.kafcacheql.sql.QueryPipeline$Bindings,io.github.ifnesi.kafcacheql.sync.CacheContext$Lease,io.github.ifnesi.kafcacheql.sync.Execution,long,io.github.ifnesi.kafcacheql.sql.QueryPipeline$Hooks,int,long" returns="io.github.ifnesi.kafcacheql.sql.QueryPipeline$Cursor" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.ResultTypes" />
+    <Method name="describe" params="io.github.ifnesi.kafcacheql.sql.Query,java.sql.Connection,java.util.Map" returns="java.util.Map" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.ResultTypes" />
+    <Method name="names" params="java.lang.String" returns="java.util.List" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.ResultTypes" />
+    <Method name="select" params="net.sf.jsqlparser.statement.select.Select,io.github.ifnesi.kafcacheql.sql.ResultTypes$Scope" returns="java.util.List" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.ResultTypes" />
+    <Method name="source" params="net.sf.jsqlparser.statement.select.FromItem,io.github.ifnesi.kafcacheql.sql.ResultTypes$Scope,java.util.List" returns="void" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sql.WindowPlanner" />
+    <Method name="lambda$extendTail$0" params="io.github.ifnesi.kafcacheql.sync.SyncPlan,long,long,java.sql.Connection" returns="io.github.ifnesi.kafcacheql.sync.SyncPlan" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE" />
+    <Class name="io.github.ifnesi.kafcacheql.sync.CacheContext$Lease" />
+    <Method name="lambda$newestTimestamps$13" params="io.github.ifnesi.kafcacheql.sync.SyncPlan,java.sql.Connection" returns="java.util.TreeMap" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC,SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING" />
+    <Class name="io.github.ifnesi.kafcacheql.sync.CacheContext$Lease" />
+    <Method name="lambda$offsetsForTimes$12" params="io.github.ifnesi.kafcacheql.sync.SyncPlan,long,java.sql.Connection" returns="java.util.TreeMap" />
+  </Match>
+  <!-- Only internal SQL names are generated ($t<id>, $topics and other cache objects), quoted with StorageDdl.quote(); values use bound parameters. User SQL is intentional and reaches a query_only reader after SELECT/WITH and cache-statement validation. -->
+  <Match>
+    <Bug pattern="SQL_INJECTION_JDBC" />
+    <Class name="io.github.ifnesi.kafcacheql.sync.CacheContext$Reader" />
+    <Method name="prepare" params="java.lang.String" returns="java.sql.PreparedStatement" />
+  </Match>
+</FindBugsFilter>

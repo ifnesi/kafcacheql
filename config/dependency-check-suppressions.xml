@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+  <suppress>
+    <notes>These CVEs concern the Wire messenger application, not Square's Wire schema library; name matches only.</notes>
+    <packageUrl>pkg:maven/com.squareup.wire/wire-schema-jvm@6.4.7</packageUrl>
+    <cve>CVE-2018-8909</cve>
+    <cve>CVE-2023-22737</cve>
+  </suppress>
+  <suppress>
+    <notes>The same Wire messenger application name matches also affect Square's Wire runtime library, which does not contain the messenger application.</notes>
+    <packageUrl>pkg:maven/com.squareup.wire/wire-runtime-jvm@6.4.7</packageUrl>
+    <cve>CVE-2018-8909</cve>
+    <cve>CVE-2023-22737</cve>
+  </suppress>
+  <suppress>
+    <notes>This vulnerability is in the Kotlin compiler's build cache, not the kotlin-reflect runtime library.</notes>
+    <packageUrl>pkg:maven/org.jetbrains.kotlin/kotlin-reflect@2.1.21</packageUrl>
+    <cve>CVE-2026-53914</cve>
+  </suppress>
+  <suppress until="2027-05-28Z">
+    <notes>Requires Java deserialization of untrusted data, which this driver never performs. Accepted until Confluent ships a fix; review within six months.</notes>
+    <packageUrl>pkg:maven/com.google.guava/guava@32.1.3-jre</packageUrl>
+    <cve>CVE-2026-102554</cve>
+  </suppress>
+  <suppress until="2027-05-28Z">
+    <notes>org.json only parses schemas from the user's configured Schema Registry. Accepted until Confluent ships a fix; review within six months.</notes>
+    <packageUrl>pkg:maven/org.json/json@20250107</packageUrl>
+    <cve>CVE-2026-59171</cve>
+  </suppress>
+</suppressions>

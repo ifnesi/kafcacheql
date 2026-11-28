@@ -16,7 +16,6 @@ import org.jline.reader.EndOfFileException;
 import org.jline.reader.LineReader;
 import org.jline.reader.LineReaderBuilder;
 import org.jline.reader.UserInterruptException;
-import org.jline.reader.impl.DefaultParser;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.terminal.spi.SystemStream;
@@ -30,19 +29,20 @@ public final class Main {
     private static final String HELP = """
             Statements end with ';' at the end of a line. Quote names that contain '-' or '.'.
 
-              SELECT ... ;               Query topics as tables; fetches what the query needs first
-              SHOW TABLES;               Topics, with cached rows and bytes
-              DESCRIBE "<table>";        A table's columns and types
-              SYNC [<pattern>, ...];     Fetch everything new: cached topics, or names with * and ?
-              DROP TABLE "<table>";      Remove a topic from the local cache; Kafka is unchanged
+              SELECT ... ;                  Query topics as tables; fetches what the query needs first
+              SHOW TABLES [<pattern>, ...]; Topics, with cached rows and bytes
+              DESCRIBE "<table>";           A table's columns and types
+              SYNC [<pattern>, ...];        Fetch everything new: cached topics, or names with * and ?
+              DROP TABLE "<table>";         Remove a topic from the local cache; Kafka is unchanged
 
-              help                       This list (no ';' needed)
-              mode [table|line|json]     Show or change how results print
-              quit, exit                 Leave (or Ctrl-D)
-              Ctrl-C                     Cancel the running statement
-              Up and down arrows         Earlier statements
-              Ctrl-R                     Search earlier statements
-              Ctrl-A, Ctrl-E             Start, end of the line
+              help                          This list (no ';' needed)
+              mode [table|line|json]        Show or change how results print
+              quit, exit                    Leave (or Ctrl-D)
+              Ctrl-C                        Cancel the running statement
+              TAB                           Complete keywords, topics and modes
+              Up and down arrows            Earlier statements
+              Ctrl-R                        Search earlier statements
+              Ctrl-A, Ctrl-E                Start, end of the line
 
             Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
             """;
@@ -157,7 +157,9 @@ public final class Main {
         System.out.println("KafCacheQL " + connection.getMetaData().getDriverVersion() + ", " + connected);
         System.out.println("Cache: " + shown);
         System.out.println("Type help for commands, quit to leave.");
-        try (Terminal terminal = TerminalBuilder.builder().system(true).provider("jni").dumb(false).build()) {
+        var sql = new StringBuilder();
+        try (var completions = new Completions(connection, sql::isEmpty);
+             Terminal terminal = TerminalBuilder.builder().system(true).provider("jni").dumb(false).build()) {
             terminal.handle(Terminal.Signal.INT, signal -> {
                 Statement active = running;
                 if (active != null) {
@@ -166,10 +168,13 @@ public final class Main {
                 }
             });
             LineReader reader = LineReaderBuilder.builder().terminal(terminal)
-                    .parser(new DefaultParser().quoteChars(new char[0]).escapeChars(new char[0]))
+                    .parser(completions).completer(completions)
+                    .option(LineReader.Option.CASE_INSENSITIVE, true)
+                    .option(LineReader.Option.AUTO_LIST, true)
+                    .option(LineReader.Option.LIST_AMBIGUOUS, true)
+                    .option(LineReader.Option.AUTO_MENU, false)
                     .option(LineReader.Option.DISABLE_EVENT_EXPANSION, true)
                     .build(); // No HISTORY_FILE: DefaultHistory stays in memory.
-            var sql = new StringBuilder();
             while (true) {
                 try {
                     String line = reader.readLine(sql.isEmpty() ? "kafcacheql> " : "       ...> ");

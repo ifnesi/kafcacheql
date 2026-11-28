@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cli;
 
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
+
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -30,7 +32,6 @@ final class Results {
     }
 
     private static final ObjectMapper JSON = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
-    private static final java.util.HexFormat HEX = java.util.HexFormat.of();
     private static final Set<String> JSON_COLUMNS = Set.of("_key", "_value", "_headers");
     private boolean lineRowPrinted;
 
@@ -102,19 +103,7 @@ final class Results {
 
     private static String cell(String value) {
         if (value == null) return "NULL";
-        var escaped = new StringBuilder(value.length());
-        value.codePoints().forEach(c -> {
-            switch (c) {
-                case '\r' -> escaped.append("\\r");
-                case '\n' -> escaped.append("\\n");
-                case '\t' -> escaped.append("\\t");
-                default -> {
-                    if (Character.isISOControl(c)) escaped.append("\\x").append(HEX.toHexDigits((byte) c));
-                    else escaped.appendCodePoint(c);
-                }
-            }
-        });
-        return escaped.toString();
+        return escape(value);
     }
 
     private static int width(String value) { return new AttributedString(value).columnLength(); }

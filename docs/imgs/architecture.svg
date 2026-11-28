@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 570" width="1000" height="570" role="img" aria-labelledby="title desc">
   <title id="title">KafCacheQL architecture</title>
-  <desc id="desc">The KafCacheQL JDBC driver runs inside DBeaver, DataGrip or a Java application. Its query side plans the
+  <desc id="desc">The KafCacheQL JDBC driver runs inside DBeaver, DataGrip, the kafcacheql command line or a Java application. Its query side plans the
 offsets a query needs and runs the SQL on a local SQLite cache file; the sync worker, the only writer, fetches
 missing records from Kafka; the decoder turns them into JSON using schemas fetched from Schema Registry by ID; optional per-topic
 transforms then drop, mask or change fields before the sync worker writes the records to the cache.</desc>
@@ -47,15 +47,15 @@ transforms then drop, mask or change fields before the sync worker writes the re
 
   <!-- The tool's process -->
   <rect class="group" x="125" y="20" width="620" height="395" rx="12" stroke-width="1.5"/>
-  <text class="title" x="145" y="45">DBeaver, DataGrip or your Java app (one process)</text>
+  <text class="title" x="145" y="45">DBeaver, DataGrip, the kafcacheql CLI or your Java app (one process)</text>
 
-  <rect class="box" x="155" y="65" width="200" height="55" rx="6" stroke-width="1.5"/>
-  <text class="name" x="255" y="90" text-anchor="middle">SQL editor or app code</text>
-  <text class="note" x="255" y="108" text-anchor="middle">JDBC</text>
+  <rect class="box" x="155" y="65" width="230" height="55" rx="6" stroke-width="1.5"/>
+  <text class="name" x="270" y="90" text-anchor="middle">SQL editor, CLI or app code</text>
+  <text class="note" x="270" y="108" text-anchor="middle">JDBC</text>
 
   <!-- The driver -->
   <rect class="driver" x="145" y="165" width="580" height="235" rx="10" stroke-width="1.5"/>
-  <text class="title" x="165" y="190">KafCacheQL JDBC driver</text>
+  <text class="title" x="262" y="390">KafCacheQL JDBC driver</text>
 
   <rect class="box" x="165" y="215" width="160" height="90" rx="6" stroke-width="1.5"/>
   <text class="name" x="245" y="240" text-anchor="middle">Query side</text>
@@ -106,8 +106,8 @@ transforms then drop, mask or change fields before the sync worker writes the re
 
   <!-- Inside the driver -->
   <path class="line" marker-end="url(#arrow)" d="M325,268 H395"/>
-  <text class="label" x="378" y="260" text-anchor="middle">missing</text>
-  <text class="label" x="378" y="286" text-anchor="middle">offsets</text>
+  <text class="label" x="360" y="260" text-anchor="middle">missing</text>
+  <text class="label" x="360" y="286" text-anchor="middle">offsets</text>
   <path class="line" marker-end="url(#arrow)" d="M535,245 H590"/>
   <text class="label" x="562" y="238" text-anchor="middle">records</text>
   <path class="line" marker-end="url(#arrow)" d="M650,305 V325"/>

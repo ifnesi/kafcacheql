@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.kafka;
 
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
+
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClientConfig;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.github.ifnesi.kafcacheql.config.ConfigErrors;
@@ -165,7 +167,7 @@ public final class ClientSettings {
                     || key.endsWith(".class") || key.endsWith(".classes");
             if (!known) {
                 log.warn("Setting '{}' isn't a KafCacheQL property or a known Kafka or Schema Registry client "
-                        + "setting; check it for a typo", key);
+                        + "setting; check it for a typo", escape(key));
             }
         }
     }

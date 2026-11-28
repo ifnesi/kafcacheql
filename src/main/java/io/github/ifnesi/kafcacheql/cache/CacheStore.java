@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
+
 import io.github.ifnesi.kafcacheql.config.ConfigErrors;
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import java.io.IOException;
@@ -426,7 +428,7 @@ public final class CacheStore implements AutoCloseable {
                     Path.of(file + SIDECARS.get(2)))) {
                 if (Files.exists(p) && !Files.getPosixFilePermissions(p).equals(OWNER_FILE)) {
                     Files.setPosixFilePermissions(p, OWNER_FILE);
-                    log.info("Restricted {} to its owner (rw-------)", p);
+                    log.info("Restricted {} to its owner (rw-------)", escape(p.toString()));
                 }
             }
         } catch (IOException e) {

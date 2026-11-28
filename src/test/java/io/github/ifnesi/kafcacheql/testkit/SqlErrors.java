@@ -40,6 +40,9 @@ public final class SqlErrors {
                 new BadInput("SELECT count(* FROM \"orders\"", "SQL syntax error at line 1, column 16: unexpected token 'FROM'."),
                 new BadInput("SYNC \"orders\" \"customers\"", sync()),
                 new BadInput("SYNC ,", sync()),
+                new BadInput("SHOW TABLES orders,", "SHOW TABLES expects topic names or patterns separated by commas, such as SHOW TABLES orders, shop-*."),
+                new BadInput("SHOW TABLES \"orders\" \"customers\"", "SHOW TABLES expects topic names or patterns separated by commas, such as SHOW TABLES orders, shop-*."),
+                new BadInput("SHOW TABLES ,", "SHOW TABLES expects topic names or patterns separated by commas, such as SHOW TABLES orders, shop-*."),
                 new BadInput("SELECT nosuchcol", "no such column: nosuchcol.", null),
                 new BadInput("SELECT 1; SELECT 2", "Only one statement at a time is supported."));
     }

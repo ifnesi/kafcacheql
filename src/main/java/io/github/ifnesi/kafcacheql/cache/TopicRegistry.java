@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import io.github.ifnesi.kafcacheql.config.Format;
 import io.github.ifnesi.kafcacheql.config.Mode;
@@ -151,7 +152,7 @@ public final class TopicRegistry {
             return Optional.of(new Change(new Row(id, view, topic.topicId().toString(), false), reason));
         });
         return committed.map(change -> {
-            if (change.reason() != null) log.warn("Rebuilding topic {}: {}", topic.name(), change.reason());
+            if (change.reason() != null) log.warn("Rebuilding topic {}: {}", escape(topic.name()), escape(change.reason()));
             Row row = change.row();
             return new Registration(row.id(), row.viewName(), namingWarning(topic.name(), row.viewName()));
         });
@@ -318,7 +319,7 @@ public final class TopicRegistry {
         }
         String reason = hasReservedPrefix(topic) ? "SQLite reserves names starting with sqlite_"
                 : "SQLite identifiers are case-insensitive";
-        return Optional.of(new SQLWarning(sentence("Topic " + topic + " uses view \"" + view + "\" because " + reason), "01000"));
+        return Optional.of(new SQLWarning(sentence(escape("Topic " + topic + " uses view \"" + view + "\" because " + reason)), "01000"));
     }
 
     private static long insert(Connection writer, TopicInfo topic, TopicSettings settings, int decoderVersion,

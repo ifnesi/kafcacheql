@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.driver;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import io.github.ifnesi.kafcacheql.cache.StorageDdl;
 import io.github.ifnesi.kafcacheql.cache.TopicRegistry;
@@ -163,10 +164,12 @@ final class Jdbc {
         private static final String ABSENT = "$metadata$template$";
         final ConnectionHandler connection;
         final DatabaseMetaData proxy = proxy(DatabaseMetaData.class, this);
-        Set<String> topics = Set.of();
+        private Set<String> topics = Set.of();
+        private long refreshSequence;
+        private long publishedSequence;
         MetadataHandler(ConnectionHandler connection) { this.connection = connection; }
 
-        @Override synchronized Object invoke(Method method, Object[] args) throws SQLException {
+        @Override Object invoke(Method method, Object[] args) throws SQLException {
             connection.check();
             String name = method.getName();
             switch (name) {
@@ -192,9 +195,7 @@ final class Jdbc {
                 case "getDriverVersion", "getDatabaseProductVersion": return KafCacheQLDriver.VERSION;
                 default: break;
             }
-            if (name.equals("getTables")) {
-                refreshTopics(null);
-            }
+            Set<String> listed = name.equals("getTables") ? refreshTopics(null) : topicSnapshot();
             Map<String, String> keys = name.equals("getPrimaryKeys") ? primaryKeys((String) args[2]) : Map.of();
             Object result = connection.cache.read(reader -> {
                 DatabaseMetaData sqlite = reader.getMetaData();
@@ -211,8 +212,8 @@ final class Jdbc {
                         case "getTableTypes" -> {
                             try (var s = reader.createStatement()) { yield copy(s.executeQuery("SELECT 'TABLE' AS TABLE_TYPE")); }
                         }
-                        case "getTables" -> tables(reader, sqlite, match, args);
-                        case "getColumns" -> columns(reader, sqlite, match, args);
+                        case "getTables" -> tables(reader, sqlite, match, args, listed, List.of(), null);
+                        case "getColumns" -> columns(reader, sqlite, match, args, listed);
                         case "getPrimaryKeys" -> {
                             CachedRowSet rows;
                             try (var template = copy(sqlite.getPrimaryKeys(null, null, "$meta"))) { rows = template.createCopySchema(); }
@@ -298,13 +299,14 @@ final class Jdbc {
             boolean pattern = table == null || table.contains("%") || table.contains("_");
             if (table != null && table.startsWith("$")
                     && (!pattern || connection.cache.read(r -> internalNames(r).contains(table)))) return Map.of();
-            String exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r)).entrySet().stream()
+            var snapshot = topicSnapshot();
+            String exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r), snapshot).entrySet().stream()
                     .filter(e -> e.getValue().equalsIgnoreCase(table)).map(Map.Entry::getKey).findFirst().orElse(null));
             boolean all = exact == null && pattern;
+            var topicNames = all ? refreshTopics(null) : snapshot;
             if (all) {
-                refreshTopics(null);
                 // A real name containing '_' still names one topic, rather than being a navigator pattern.
-                exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r)).entrySet().stream()
+                exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r), topicNames).entrySet().stream()
                         .filter(e -> e.getValue().equalsIgnoreCase(table)).map(Map.Entry::getKey).findFirst().orElse(null));
                 if (exact != null) all = false;
             }
@@ -312,9 +314,9 @@ final class Jdbc {
             String named = exact == null ? table : exact;
             var selected = connection.cache.read(r -> {
                 var stored = cached(r);
-                var views = knownViews(r, stored);
+                var views = knownViews(r, stored, topicNames);
                 var result = new ArrayList<Key>();
-                for (String topic : listed ? topics : Set.of(named)) {
+                for (String topic : listed ? topicNames : Set.of(named)) {
                     if (!visible(topic)) continue;
                     Table cached = stored.get(topic);
                     result.add(new Key(topic, listed ? views.get(topic) : table, cached == null ? null : cached.mode()));
@@ -338,19 +340,33 @@ final class Jdbc {
             }
             return result;
         }
-        private void refreshTopics(Execution execution) throws SQLException {
+        private Set<String> refreshTopics(Execution execution) throws SQLException {
             if (execution != null) execution.check();
-            topics = Set.copyOf(connection.cache.listTopics(execution));
+            long sequence;
+            synchronized (this) { sequence = ++refreshSequence; }
+            // No metadata monitor is held across Kafka. The cache captures generations before
+            // listing and queues guarded background drops after a successful reply, as for Refresh.
+            var listed = Set.copyOf(connection.cache.listTopics(execution));
+            synchronized (this) {
+                if (sequence > publishedSequence) {
+                    topics = listed;
+                    publishedSequence = sequence;
+                }
+            }
+            // This call answers from its own Kafka snapshot; later getColumns calls use the newest published list.
+            return listed;
         }
 
-        synchronized CachedRowSet showTables(Execution execution) throws SQLException {
-            refreshTopics(execution);
+        private synchronized Set<String> topicSnapshot() { return topics; }
+
+        CachedRowSet showTables(List<String> patterns, Execution execution) throws SQLException {
+            var listed = refreshTopics(execution);
             return connection.cache.read(execution, reader -> {
                 var result = empty(new Column("table_name", JDBCType.VARCHAR), new Column("mode", JDBCType.VARCHAR),
                         new Column("partitions", JDBCType.INTEGER), new Column("cached_rows", JDBCType.BIGINT), new Column("cached_bytes", JDBCType.BIGINT));
                 var stored = cached(reader);
                 try (var match = reader.prepareStatement("SELECT ? LIKE ? ESCAPE '\\'");
-                     var tables = tables(reader, reader.getMetaData(), match, new Object[]{null, null, null, null})) {
+                     var tables = tables(reader, reader.getMetaData(), match, new Object[]{null, null, null, null}, listed, patterns, execution)) {
                     var byView = new HashMap<String, Table>(); stored.values().forEach(t -> byView.put(t.view(), t));
                     tables.beforeFirst();
                     while (tables.next()) {
@@ -375,17 +391,17 @@ final class Jdbc {
             });
         }
 
-        synchronized CachedRowSet describe(String name, Execution execution) throws SQLException {
-            if (!connection.cache.config().offline() && !connection.cache.read(execution, reader ->
-                    knownViews(reader, cached(reader)).values().stream().anyMatch(view -> view.equalsIgnoreCase(name))
-                    || connection.cache.config().metadataShowInternal() && internalNames(reader).contains(name))) {
-                refreshTopics(execution);
-            }
+        CachedRowSet describe(String name, Execution execution) throws SQLException {
+            var snapshot = topicSnapshot();
+            boolean known = connection.cache.config().offline() || connection.cache.read(execution, reader ->
+                    knownViews(reader, cached(reader), snapshot).values().stream().anyMatch(view -> view.equalsIgnoreCase(name))
+                    || connection.cache.config().metadataShowInternal() && internalNames(reader).contains(name));
+            var listed = known ? snapshot : refreshTopics(execution);
             return connection.cache.read(execution, reader -> {
                 var result = empty(new Column("column_name", JDBCType.VARCHAR), new Column("type", JDBCType.VARCHAR));
                 String exact = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
                 try (var match = reader.prepareStatement("SELECT ? LIKE ? ESCAPE '\\'");
-                     var columns = columns(reader, reader.getMetaData(), match, new Object[]{null, null, exact, null})) {
+                     var columns = columns(reader, reader.getMetaData(), match, new Object[]{null, null, exact, null}, listed)) {
                     columns.beforeFirst();
                     while (columns.next()) { execution.check(); add(result, Map.of("column_name", columns.getString("COLUMN_NAME"), "type", columns.getString("TYPE_NAME"))); }
                 }
@@ -395,32 +411,40 @@ final class Jdbc {
         }
 
         /** Resolve all patterns against the same filtered list before any sync is allowed to fetch. */
-        synchronized Map<String, String> syncTopics(List<String> patterns, Execution execution) throws SQLException {
-            refreshTopics(execution);
+        Map<String, String> syncTopics(List<String> patterns, Execution execution) throws SQLException {
+            var listed = refreshTopics(execution);
             return connection.cache.read(execution, reader -> {
                 var names = new TreeMap<String, String>();
-                var views = TopicRegistry.viewNames(reader, topics);
+                var views = TopicRegistry.viewNames(reader, listed);
                 var stored = cached(reader);
                 for (var entry : views.entrySet()) if (visible(entry.getKey()) && (patterns.size() > 0 || stored.containsKey(entry.getKey())))
                     names.put(entry.getValue(), entry.getKey());
-                if (patterns.isEmpty()) return names;
-                var selected = new TreeMap<String, String>();
-                try (var match = reader.prepareStatement("SELECT ? GLOB ?")) {
-                    for (String pattern : patterns) {
-                        boolean found = false;
-                        for (var entry : names.entrySet()) {
-                            execution.check(); match.setString(1, entry.getKey()); match.setString(2, pattern);
-                            try (var r = match.executeQuery()) { if (r.next() && r.getBoolean(1)) { selected.put(entry.getKey(), entry.getValue()); found = true; } }
-                        }
-                        if (!found) throw new SQLException(sentence("SYNC pattern matches no topic: " + pattern), "42S02");
-                    }
-                }
-                return selected;
+                return matchingTopics(reader, names, patterns, execution, true);
             });
         }
 
-        private Map<String, String> knownViews(Connection reader, Map<String, Table> stored) throws SQLException {
-            var known = new java.util.HashSet<>(topics);
+        /** SHOW and SYNC share SQLite's case-sensitive GLOB; only SYNC requires every pattern to match. */
+        private static Map<String, String> matchingTopics(Connection reader, Map<String, String> names,
+                List<String> patterns, Execution execution, boolean requireMatch) throws SQLException {
+            if (patterns.isEmpty()) return names;
+            var selected = new TreeMap<String, String>();
+            try (var match = reader.prepareStatement("SELECT ? GLOB ?")) {
+                for (String pattern : patterns) {
+                    boolean found = false;
+                    for (var entry : names.entrySet()) {
+                        if (execution != null) execution.check();
+                        if (matches(match, entry.getKey(), pattern)) {
+                            selected.put(entry.getKey(), entry.getValue()); found = true;
+                        }
+                    }
+                    if (requireMatch && !found) throw new SQLException(sentence("SYNC pattern matches no topic: " + pattern), "42S02");
+                }
+            }
+            return selected;
+        }
+
+        private static Map<String, String> knownViews(Connection reader, Map<String, Table> stored, Set<String> listed) throws SQLException {
+            var known = new java.util.HashSet<>(listed);
             known.addAll(stored.keySet());
             return TopicRegistry.viewNames(reader, known);
         }
@@ -450,13 +474,14 @@ final class Jdbc {
             }
             return names;
         }
-        private CachedRowSet tables(Connection reader, DatabaseMetaData sqlite, PreparedStatement match, Object[] args) throws SQLException {
+        private CachedRowSet tables(Connection reader, DatabaseMetaData sqlite, PreparedStatement match, Object[] args,
+                                    Set<String> listed, List<String> patterns, Execution execution) throws SQLException {
             var rows = copy(sqlite.getTables(null, null, ABSENT, null));
             if (!namespace(match, args[0], args[1]) || args[3] != null && !List.of((String[]) args[3]).contains("TABLE")) return rows;
             var stored = cached(reader);
             var names = new TreeMap<String, String>();
-            var views = TopicRegistry.viewNames(reader, topics);
-            for (String topic : topics) {
+            var views = TopicRegistry.viewNames(reader, listed);
+            for (String topic : listed) {
                 if (!visible(topic)) continue;
                 Table table = stored.get(topic);
                 names.put(views.get(topic),
@@ -465,17 +490,17 @@ final class Jdbc {
             if (connection.cache.config().metadataShowInternal()) {
                 for (String name : internalNames(reader)) names.put(name, "");
             }
-            for (var entry : names.entrySet()) if (matches(match, entry.getKey(), args[2])) add(rows,
+            for (var entry : matchingTopics(reader, names, patterns, execution, false).entrySet()) if (matches(match, entry.getKey(), args[2])) add(rows,
                     Map.of("TABLE_CAT", "main", "TABLE_SCHEM", "main", "TABLE_NAME", entry.getKey(), "TABLE_TYPE", "TABLE", "REMARKS", entry.getValue()));
             return rows;
         }
 
-        private CachedRowSet columns(Connection reader, DatabaseMetaData sqlite, PreparedStatement match, Object[] args) throws SQLException {
+        private CachedRowSet columns(Connection reader, DatabaseMetaData sqlite, PreparedStatement match, Object[] args, Set<String> listed) throws SQLException {
             var result = copy(sqlite.getColumns(null, null, ABSENT, null));
             if (!namespace(match, args[0], args[1])) return result;
             var tables = new TreeMap<String, Table>(String.CASE_INSENSITIVE_ORDER);
             var stored = cached(reader);
-            var views = knownViews(reader, stored);
+            var views = knownViews(reader, stored, listed);
             for (String topic : views.keySet()) {
                 if (!visible(topic)) continue;
                 Table table = stored.get(topic);
@@ -674,11 +699,11 @@ final class Jdbc {
                         if (operation.equals("executeQuery")) throw new SQLException(sentence("DROP TABLE returns an update count"), "42000");
                         boolean dropped = active.run(connection.cache.config().offline(), () -> connection.cache.dropTable(command.table(), active));
                         if (!dropped && !command.ifExists()) throw new SQLException(sentence("Unknown cached table " + command.table()), "42S02");
-                        warnings = new SQLWarning(sentence("Topic " + command.table() + " dropped from the local cache; Kafka is unchanged"), "01000");
+                        warnings = new SQLWarning(sentence(escape("Topic " + command.table() + " dropped from the local cache; Kafka is unchanged")), "01000");
                         updateCount = 0; finish(active); return;
                     }
                     cursor = switch (command.kind()) {
-                        case SHOW -> QueryPipeline.Cursor.detached(connection.metadata.showTables(active), active, List.of());
+                        case SHOW -> QueryPipeline.Cursor.detached(connection.metadata.showTables(command.patterns(), active), active, List.of());
                         case DESCRIBE -> QueryPipeline.Cursor.detached(connection.metadata.describe(command.table(), active), active, List.of());
                         case SYNC -> sync(command, active);
                         case DROP -> throw new AssertionError();

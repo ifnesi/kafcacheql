@@ -4,7 +4,7 @@
 [![Java](https://img.shields.io/badge/Java-21%2B-blue)](pom.xml)
 [![Kafka](https://img.shields.io/badge/Kafka-3.1%2B-blue)](https://kafka.apache.org/)
 [![licence](https://img.shields.io/github/license/ifnesi/kafcacheql)](LICENSE)
-[![JAR](https://img.shields.io/badge/JAR-kafcacheql--jdbc--0.1.0.jar-blue)][driver-jar]
+[![JAR](https://img.shields.io/badge/JAR-kafcacheql--jdbc--0.2.0.jar-blue)][driver-jar]
 
 **Explore Kafka with SQL, in the database tool you already use.**
 
@@ -16,36 +16,6 @@ Built for **ad-hoc SQL exploration, debugging, and offline querying of Kafka top
 consistent snapshot of the cached data; rerun it to fetch new records. This is not real-time streaming.
 
 For experimentation, not recommended for production use.
-
-**Why not Flink SQL or ksqlDB?** Use them to build pipelines: continuous queries that run on a cluster and
-write results back to Kafka. Confluent Cloud's Flink can also answer one-off snapshot queries, through its own
-JDBC driver, on a Flink compute pool billed in CFUs. KafCacheQL needs none of that:
-
-- **Kafka 3.1+:** Confluent Cloud, Confluent Platform 7.1+, self-managed or on a laptop. See
-  [supported authentication](docs/configuration.md#authentication).
-- **Nothing to deploy or pay for:** one JAR inside your SQL tool, and a properties file.
-- **A local cache:** a rerun fetches only new records, and cached topics stay queryable offline.
-- **Made for debugging:** a record that fails to decode stays a row, with the error and its raw bytes, next to
-  its partition, offset and headers.
-
-From a terminal: build the driver, start the [web-store demo](demo/README.md), then query its topics with the
-[command line](docs/cli.md):
-
-![Building the driver, starting the demo, its topics in Control Center, then kafcacheql running help, SHOW TABLES, DESCRIBE, mode line, SELECT and SYNC](docs/imgs/kafcacheql-cli-demo.gif)
-
-The same `shop-customers` topic in three tools. In Confluent Control Center:
-
-![Confluent Control Center showing shop-customers keys and values](docs/imgs/control-center-shop-customers.png)
-
-In DBeaver, with schema fields exposed as columns:
-
-![DBeaver showing shop-customers with customer_id, name and region columns](docs/imgs/dbeaver-shop-customers.png)
-
-And in DataGrip:
-
-![DataGrip showing shop-customers and the topic list](docs/imgs/datagrip-shop-customers.png)
-
-These topics come from the [web-store demo](demo/README.md).
 
 ## How it works
 
@@ -79,6 +49,38 @@ statements](docs/sql.md#cache-statements) that list, describe, sync or drop topi
 unencrypted local copy; see [cache security](docs/configuration.md#cache-security). Optional
 [record transforms](docs/transforms.md) drop or mask private fields before they reach that copy.
 
+## Why KafCacheQL
+
+**Why not Flink SQL or ksqlDB?** Use them to build pipelines: continuous queries that run on a cluster and
+write results back to Kafka. Confluent Cloud's Flink can also answer one-off snapshot queries, through its own
+JDBC driver, on a Flink compute pool. KafCacheQL needs none of that:
+
+- **Kafka 3.1+:** Confluent Cloud, Confluent Platform 7.1+, self-managed or on a laptop. See
+  [supported authentication](docs/configuration.md#authentication).
+- **Nothing to deploy or pay for:** one JAR inside your SQL tool, and a properties file.
+- **A local cache:** a rerun fetches only new records, and cached topics stay queryable offline.
+- **Made for debugging:** a record that fails to decode stays a row, with the error and its raw bytes, next to
+  its partition, offset and headers.
+
+From a terminal: build the driver, start the [web-store demo](demo/README.md), then query its topics with the
+[command line](docs/cli.md):
+
+![Building the driver, starting the demo, its topics in Control Center, then kafcacheql running help, SHOW TABLES, DESCRIBE, mode line, SELECT and SYNC](docs/imgs/kafcacheql-cli-demo.gif)
+
+The same `shop-customers` topic in three tools. In Confluent Control Center:
+
+![Confluent Control Center showing shop-customers keys and values](docs/imgs/control-center-shop-customers.png)
+
+In DBeaver, with schema fields exposed as columns:
+
+![DBeaver showing shop-customers with customer_id, name and region columns](docs/imgs/dbeaver-shop-customers.png)
+
+And in DataGrip:
+
+![DataGrip showing shop-customers and the topic list](docs/imgs/datagrip-shop-customers.png)
+
+These topics come from the [web-store demo](demo/README.md).
+
 ## Quick start
 
 This sets up a small customer-and-order dataset and answers an order summary in your SQL editor.
@@ -104,19 +106,18 @@ Wait for Kafka on `localhost:9092` and Schema Registry on <http://localhost:8081
 ### 2. Download the driver
 
 The driver is one self-contained JAR, with native libraries for Linux, macOS and Windows on x86-64 and ARM64.
-Download version 0.1.0, `kafcacheql-jdbc-0.1.0.jar`, from the [v0.1.0
-release](https://github.com/ifnesi/kafcacheql/releases/tag/v0.1.0), and save it where your tool can load it:
+Download version 0.2.0, `kafcacheql-jdbc-0.2.0.jar`, from the [v0.2.0
+release](https://github.com/ifnesi/kafcacheql/releases/tag/v0.2.0), and save it where your tool can load it:
 
 ```sh
 mkdir -p ~/.kafcacheql
 curl -fL -o ~/.kafcacheql/kafcacheql-jdbc.jar \
-  https://github.com/ifnesi/kafcacheql/releases/download/v0.1.0/kafcacheql-jdbc-0.1.0.jar
+  https://github.com/ifnesi/kafcacheql/releases/download/v0.2.0/kafcacheql-jdbc-0.2.0.jar
 ```
 
-Saving it without the version keeps your tool's settings the same when you upgrade. These docs describe the
-next release. v0.1.0 lacks [record transforms](docs/transforms.md), the [command line](docs/cli.md) and the
-[cache statements](docs/sql.md#cache-statements), and shows header values as base64; until the next release,
-[build the driver](#development) to get them.
+Saving it without the version keeps your tool's settings the same when you upgrade. Upgrading from 0.1.0?
+Its cache format is older: close your tools and delete the cache file, by default
+`~/.kafcacheql/<cluster-id>.db`; the next query fetches the data again.
 
 ### 3. Add sample data and settings
 
@@ -159,6 +160,15 @@ before trying a larger topic.
 - [Web-store demo](demo/README.md): related topics, privacy examples and charts in Apache Zeppelin.
 - [Performance measurements](docs/performance.md): cold queries, cache reuse and parallel fetching.
 
+### Ask an AI agent
+
+The repository carries a skill for AI coding agents, `kafcacheql-ask`, in two copies:
+`.claude/skills/` for Claude Code and `.agents/skills/` for agents that read that folder, such as Codex. Open
+a session in your clone and ask, for example, "how do I connect to Confluent Cloud?" or "write me a settings
+file that masks the email field". It answers from these documents, names the section behind each claim, and
+says when the documentation doesn't cover something. It changes no files, and drafts settings files with
+placeholders instead of real credentials. Check its answers as you would a colleague's.
+
 ## Development
 
 Building needs Java 21+ and Maven 3.9+. From the repository's top folder, `kafcacheql`, build the JAR and copy
@@ -179,9 +189,23 @@ mvn verify -DskipITs        # unit tests only; no Docker needed
 Integration tests create uniquely named topics and may leave them behind. The stack's Kafka data lives in its
 containers: `docker compose down` discards it.
 
+Before a release, add the security checks: [OWASP Dependency-Check](https://owasp.org/www-project-dependency-check/)
+compares the libraries with known vulnerabilities, and [SpotBugs](https://spotbugs.github.io/) with
+[Find Security Bugs](https://find-sec-bugs.github.io/) reads the driver's own code:
+
+```sh
+mvn -Psecurity verify
+```
+
+The first run downloads the vulnerability database from the
+[NVD](https://nvd.nist.gov/developers/request-an-api-key), which takes about 40 minutes without an API key;
+later runs fetch only updates. With a free key, set `NVD_API_KEY` in your environment and the download takes
+minutes. Findings already reviewed, and why each one doesn't apply or is accepted, are in
+[config/](config/).
+
 ## License
 
 [Apache License 2.0](LICENSE)
 
 [latest-release]: https://github.com/ifnesi/kafcacheql/releases/latest
-[driver-jar]: https://github.com/ifnesi/kafcacheql/releases/download/v0.1.0/kafcacheql-jdbc-0.1.0.jar
+[driver-jar]: https://github.com/ifnesi/kafcacheql/releases/download/v0.2.0/kafcacheql-jdbc-0.2.0.jar

@@ -21,4 +21,8 @@ docs/execution/
 # OS clutter and logs
 .DS_Store
 *.log
-.claude/
+# Claude Code: local settings and internal skills stay local; the public skill is shared
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/kafcacheql-ask/

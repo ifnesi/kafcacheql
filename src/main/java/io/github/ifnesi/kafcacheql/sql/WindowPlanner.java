@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.sql;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import com.google.common.collect.DiscreteDomain;
 import com.google.common.collect.ImmutableRangeSet;
@@ -54,8 +55,8 @@ public final class WindowPlanner {
         long maxRecords = cache.config().appendDefaultWindowMaxRecords(base.topic().name());
         if (defaults && !window.isAll()) {
             String duration = window.duration().orElseThrow().toString().substring(2).toLowerCase(Locale.ROOT);
-            warnings.add(new SQLWarning(sentence(base.topic().name() + ": only records from the last " + duration
-                    + " are read, up to " + maxRecords + " per partition; add a _timestamp or _offset condition to read more"), "01000"));
+            warnings.add(new SQLWarning(sentence(escape(base.topic().name() + ": only records from the last " + duration
+                    + " are read, up to " + maxRecords + " per partition; add a _timestamp or _offset condition to read more")), "01000"));
         }
         // Apply offset/partition bounds and the record cap before using cached timestamps. These are
         // the candidate intervals whose coverage must be proved before time can narrow them offline.

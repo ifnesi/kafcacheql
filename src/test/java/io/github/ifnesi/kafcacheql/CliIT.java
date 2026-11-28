@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.junit.jupiter.api.BeforeAll;
@@ -300,11 +301,47 @@ class CliIT {
         assertEquals(1, result.messages().lines().count(), "only the driver warning");
         assertTrue(result.messages().startsWith("WARN: "), result.messages());
         assertTrue(TestStack.topicExists(topic));
+        // PLAN §8.7: SHOW patterns share SYNC syntax and matching; filters and offline visibility apply.
+        String other = TestStack.uniqueTopic("cli-other"), filtered = TestStack.uniqueTopic("cli-filtered");
+        TestStack.createTopic(other, 1, Map.of()); TestStack.createTopic(filtered, 1, Map.of());
+        String listed = url + "&topics.include=" + topic + "|" + other + "|" + filtered + "&topics.exclude=" + filtered;
+        try (var c = DriverManager.getConnection(listed); var statement = c.createStatement();
+             var rows = statement.executeQuery("SELECT n FROM \"" + topic + "\"")) { assertTrue(rows.next()); }
+        for (boolean offline : List.of(false, true)) {
+            String target = listed + "&offline=" + offline;
+            Set<String> all = offline ? Set.of(topic) : Set.of(topic, other);
+            var cases = List.of(
+                    Map.entry("*" + topic.substring(0, topic.length() - 1) + "?", Set.of(topic)),
+                    Map.entry(topic + ", " + other, all),
+                    Map.entry("\"" + topic + "\"", Set.of(topic)),
+                    Map.entry("`" + topic + "`", Set.of(topic)),
+                    Map.entry("[" + topic + "]", Set.of(topic)),
+                    Map.entry(topic + ", *", all),
+                    Map.entry(topic.toUpperCase(java.util.Locale.ROOT), Set.<String>of()),
+                    Map.entry("no-such-" + topic, Set.<String>of()),
+                    Map.entry(filtered, Set.<String>of()),
+                    Map.entry(other, offline ? Set.<String>of() : Set.of(other)));
+            var commands = new ArrayList<>(List.of("--mode", "json", target));
+            cases.forEach(test -> commands.add("SHOW TABLES " + test.getKey()));
+            var show = run("", commands.toArray(String[]::new));
+            assertEquals(0, show.status(), show.messages()); assertEquals("", show.messages());
+            var results = show.out().lines().toList(); assertEquals(cases.size(), results.size());
+            for (int i = 0; i < cases.size(); i++) {
+                var names = new java.util.HashSet<String>();
+                var rows = JSON.readTree(results.get(i)); rows.forEach(table -> names.add(table.get("table_name").textValue()));
+                assertEquals(cases.get(i).getValue(), names, cases.get(i).getKey());
+                assertEquals(names.size(), rows.size(), "patterns must not duplicate rows");
+            }
+        }
     }
 
     /** §14.1: real terminal, prompt/quit/exit/EOF, errors continue, Ctrl-C cancels, in-memory history. */
     @Test void interactiveSessionThroughARealPty() throws Exception {
-        String topic = topic(), url = url(topic);
+        String topic = topic(), url = url(topic) + "&topics.include=" + topic + ".*|shop-" + topic;
+        TestStack.createTopic("shop-" + topic, 1, Map.of());
+        TestStack.createTopic(topic + "-north-a", 1, Map.of());
+        TestStack.createTopic(topic + "-north-b", 1, Map.of());
+        TestStack.createTopic(topic + "-south", 1, Map.of());
         pty(topic, url);
     }
 
@@ -315,10 +352,20 @@ class CliIT {
         try (var connection = DriverManager.getConnection(url)) { version = connection.getMetaData().getDriverVersion(); }
         Path badInputs = dir.resolve("bad-inputs.json");
         JSON.writeValue(badInputs.toFile(), io.github.ifnesi.kafcacheql.testkit.SqlErrors.badInputs());
-        var command = new ArrayList<>(List.of("python3", probe.toString(), java(), System.getProperty("java.io.tmpdir"), jar(), url, topic, version, badInputs.toString(), TestStack.BOOTSTRAP, dir.resolve("cache.db").toRealPath().toString()));
+        Path refreshProbe = Path.of(CliIT.class.getResource("/probe/CliRefreshProbe.java").toURI());
+        var command = new ArrayList<>(List.of("python3", probe.toString(), java(), System.getProperty("java.io.tmpdir"),
+                jar(), url, topic, version, badInputs.toString(), TestStack.BOOTSTRAP,
+                dir.resolve("cache.db").toRealPath().toString(), dir.toString(), refreshProbe.toString()));
         command.addAll(List.of(mode));
         Process process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(transcript.toFile()).start();
         try {
+            if (mode.length == 0) {
+                // §14.1: a topic created after the prompt appears is picked up by the background refresh.
+                TestStack.await(() -> Files.exists(dir.resolve("completion-ready")) || !process.isAlive(), "completion session starts");
+                assertTrue(process.isAlive(), Files.readString(transcript));
+                TestStack.createTopic(topic + "-later", 1, Map.of());
+                Files.writeString(dir.resolve("completion-created"), "");
+            }
             assertTrue(process.waitFor(100, TimeUnit.SECONDS), "PTY probe finishes");
             String output = Files.readString(transcript); System.out.print(output);
             assertEquals(0, process.exitValue(), output);

@@ -1,0 +1,4 @@
+interface:
+  display_name: "KafCacheQL Ask"
+  short_description: "Answer questions from the KafCacheQL docs"
+  default_prompt: "Use $kafcacheql-ask to answer this question from the KafCacheQL documentation."

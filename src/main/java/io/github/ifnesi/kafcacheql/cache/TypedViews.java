@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import com.google.common.base.Ascii;
 import com.google.common.cache.Cache;
@@ -143,7 +144,7 @@ public final class TypedViews {
         var warnings = new ArrayList<SQLWarning>();
         for (Column column : layout.columns()) {
             if (column.warning() == null) continue;
-            String message = "Topic " + topic + ": " + column.warning();
+            String message = escape("Topic " + topic + ": " + column.warning());
             log.warn("{}", message);
             warnings.add(new SQLWarning(sentence(message), "01000"));
         }

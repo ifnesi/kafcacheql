@@ -84,6 +84,7 @@ These statements act on the local cache only. None of them changes anything in K
 | Statement | Result |
 |---|---|
 | `SHOW TABLES` | One row per topic: `table_name`, `mode`, `partitions`, `cached_rows`, `cached_bytes`. The last four are NULL for a topic with nothing cached |
+| `SHOW TABLES shop-order*, customers` | The same, for topics matching any of the [patterns](#patterns) |
 | `DESCRIBE "orders"` | One row per column: `column_name`, `type`. Before a topic's first query, only the built-in columns |
 | `DROP TABLE "orders"` | Deletes the topic's cached records and offsets. **The Kafka topic is not deleted.** The next online query fetches it again |
 | `SYNC "orders", "customers"` | Brings topics up to date, and returns `table_name` and `fetched_records` for each |
@@ -99,18 +100,24 @@ cached offset to Kafka's current end; a topic with nothing cached is read in ful
 record cap or `WHERE` clause plays no part. To fetch less, use a `SELECT`: its window and cap apply even to
 `SELECT *`. `SYNC` doesn't fill older gaps, such as offsets a past query skipped.
 
-Topic names can be written without quotes, with `*` matching any run of characters and `?` one character:
+`SYNC` on its own syncs every cached topic the navigator still lists; `SYNC *` syncs every listed topic,
+which can be a lot of data. Only one `SYNC` runs on a cache at a time: a second one, from any program, fails
+at once instead of fetching the same records again. A query whose records are already cached doesn't wait
+for a `SYNC`; one that must fetch waits its turn, as behind any other sync. `SYNC` needs Kafka, so an offline
+connection refuses it.
+
+### Patterns
+
+`SYNC` and `SHOW TABLES` take topic names, written with or without quotes, with `*` matching any run of
+characters and `?` one character:
 
 ```sql
 SYNC demo-*, *-shop*, orders-20??;
+SHOW TABLES "*emo-20??";
 ```
 
-Patterns are case-sensitive and match the topics the navigator lists. A pattern that matches no topic fails
-the statement before anything is fetched. `SYNC` on its own syncs every cached topic the navigator still lists; `SYNC *` syncs every
-listed topic, which can be a lot of data. Only one `SYNC` runs on a cache at a time: a second one, from any
-program, fails at once instead of fetching the same records again. A query whose records are already cached
-doesn't wait for a `SYNC`; one that must fetch waits its turn, as behind any other sync. `SYNC`
-needs Kafka, so an offline connection refuses it.
+Patterns are case-sensitive and match the topics the navigator lists. For `SYNC`, a pattern that matches no
+topic fails the statement before anything is fetched; `SHOW TABLES` just returns no rows.
 
 ## Examples
 

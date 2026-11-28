@@ -14,14 +14,16 @@ import sys
 import termios
 import time
 
-java, tmpdir, jar, url, topic, version, bad_inputs_file, brokers, cache, *mode = sys.argv[1:]
-command = [java, "-Xmx1g", "-Djava.io.tmpdir=" + tmpdir, "-jar", jar, "--mode", "json", url]
+java, tmpdir, jar, url, topic, version, bad_inputs_file, brokers, cache, syncdir, refresh_probe, *mode = sys.argv[1:]
+command = [java, "-Xmx1g", "-Djava.io.tmpdir=" + tmpdir, "-Dkafcacheql.test.completion.refresh.ms=500", "-jar", jar, "--mode", "json", url]
 
 class Session:
-    def __init__(self, offline=False):
+    def __init__(self, offline=False, stalled=False):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.environ['TERM'] = 'xterm'
+            if stalled:
+                os.execv(java, command[:4] + ['--enable-native-access=ALL-UNNAMED', '-cp', jar, refresh_probe, url, syncdir])
             os.execv(java, command[:-1] + [url + "&offline=true"] if offline else command)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 200, 0, 0))
         self.pending = ''
@@ -42,20 +44,32 @@ class Session:
         while expected not in self.pending:
             remaining = end - time.monotonic()
             assert remaining > 0, (expected, self.pending)
-            if not select.select([self.fd], [], [], remaining)[0]:
-                raise AssertionError(('timeout', expected, self.pending))
-            try:
-                data = os.read(self.fd, 65536)
-            except OSError as error:
-                if error.errno == errno.EIO: data = b''
-                else: raise
-            assert data, ('terminal closed', expected, self.pending)
-            text = data.decode(errors='replace')
-            print(text, end='', flush=True)
-            # Remove terminal control sequences for assertions, not from the printed transcript.
-            self.pending += re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b[=>]', '', text).replace('\r', '')
+            assert self.collect(remaining), ('timeout', expected, self.pending)
         before, self.pending = self.pending.split(expected, 1)
         return before
+
+    def collect(self, timeout):
+        if not select.select([self.fd], [], [], timeout)[0]: return False
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO: data = b''
+            else: raise
+        assert data, ('terminal closed', self.pending)
+        text = data.decode(errors='replace')
+        print(text, end='', flush=True)
+        # Strip terminal control sequences only for assertions; print the raw transcript above.
+        self.pending += re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b[=>]', '', text).replace('\r', '')
+        return True
+
+    def candidates(self, names):
+        end = time.monotonic() + 20
+        while not all(name in self.pending for name in names):
+            remaining = end - time.monotonic()
+            assert remaining > 0 and self.collect(remaining), (names, self.pending)
+        while self.collect(.2): pass
+        listing, self.pending = self.pending, ''
+        return listing
 
     def finish(self, status):
         end = time.monotonic() + 10
@@ -132,6 +146,42 @@ if mode == ['pipe']:
 s = None
 try:
     s = Session()
+    # §14.1 TAB: JLine completes keywords without regard to case, quoted topics, modes;
+    # a second TAB lists ambiguous candidates, and a background refresh sees newly created topics.
+    open(os.path.join(syncdir, 'completion-ready'), 'w').close()
+    end = time.monotonic() + 10
+    while not os.path.exists(os.path.join(syncdir, 'completion-created')):
+        assert time.monotonic() < end, 'parent creates the later topic'
+        time.sleep(.05)
+    # §14.1: only statement starters at the first word, even with a matching shop-* topic.
+    s.send('sho\tno-match-*;\n')
+    output = s.read('[]'); s.read('kafcacheql> ')
+    assert 'SHOW TABLES' in output and 'shop-' + topic not in output, output
+    s.send('sElEc\t2718 AS completion;\n')
+    s.read('[{"completion":2718}]'); s.read('kafcacheql> ')
+    s.send('SELECT count(*) AS n FROM ' + topic + '-s\t;\n')
+    s.read('[{"n":0}]'); s.read('kafcacheql> ')
+    # A continuation line is not the statement's first word: topic completion still applies.
+    s.send('SELECT count(*) AS continued FROM\n')
+    s.read('       ...> ')
+    s.send(topic + '-s\t;\n')
+    s.read('[{"continued":0}]'); s.read('kafcacheql> ')
+    prefix = 'DESCRIBE ' + topic + '-n'
+    s.send(prefix + '\t')
+    s.read(prefix)
+    while s.collect(.2): pass
+    assert topic + '-north-a' not in s.pending and topic + '-north-b' not in s.pending, s.pending
+    s.send('\t')
+    s.candidates([topic + '-north-a', topic + '-north-b'])
+    s.send('\x15mode \t')
+    listing = s.candidates(['table', 'line', 'json'])
+    assert 'SELECT' not in listing and 'DESCRIBE' not in listing, listing
+    s.send('\x15mode j\t\n')
+    s.read('Mode: json\n'); s.read('kafcacheql> ')
+    # The test-only refresh interval is 500 ms; TAB itself must not trigger the refresh.
+    time.sleep(1)
+    s.send('SELECT count(*) AS refreshed FROM ' + topic + '-l\t;\n')
+    s.read('[{"refreshed":0}]'); s.read('kafcacheql> ')
     # §14.1: mode is a session command only with an empty SQL buffer; here it is the SQL alias.
     s.send('SELECT 7 AS\n')
     assert s.read('       ...> ') == 'SELECT 7 AS\n'
@@ -164,19 +214,20 @@ try:
     # §14.1 Help: exact session help, with or without a semicolon, only at an empty SQL buffer.
     help_text = """Statements end with ';' at the end of a line. Quote names that contain '-' or '.'.
 
-  SELECT ... ;               Query topics as tables; fetches what the query needs first
-  SHOW TABLES;               Topics, with cached rows and bytes
-  DESCRIBE "<table>";        A table's columns and types
-  SYNC [<pattern>, ...];     Fetch everything new: cached topics, or names with * and ?
-  DROP TABLE "<table>";      Remove a topic from the local cache; Kafka is unchanged
+  SELECT ... ;                  Query topics as tables; fetches what the query needs first
+  SHOW TABLES [<pattern>, ...]; Topics, with cached rows and bytes
+  DESCRIBE "<table>";           A table's columns and types
+  SYNC [<pattern>, ...];        Fetch everything new: cached topics, or names with * and ?
+  DROP TABLE "<table>";         Remove a topic from the local cache; Kafka is unchanged
 
-  help                       This list (no ';' needed)
-  mode [table|line|json]     Show or change how results print
-  quit, exit                 Leave (or Ctrl-D)
-  Ctrl-C                     Cancel the running statement
-  Up and down arrows         Earlier statements
-  Ctrl-R                     Search earlier statements
-  Ctrl-A, Ctrl-E             Start, end of the line
+  help                          This list (no ';' needed)
+  mode [table|line|json]        Show or change how results print
+  quit, exit                    Leave (or Ctrl-D)
+  Ctrl-C                        Cancel the running statement
+  TAB                           Complete keywords, topics and modes
+  Up and down arrows            Earlier statements
+  Ctrl-R                        Search earlier statements
+  Ctrl-A, Ctrl-E                Start, end of the line
 
 Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
 """
@@ -220,7 +271,7 @@ Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
     s.send('\x1bOA\n')
     s.read('[{"history":314159}]'); s.read('kafcacheql> ')
     s.send('exit;\n'); s.finish(1)  # A prior statement failed, even though the session continued.
-    for ending in ['quit', 'quit;', 'exit', 'exit;', '\x04']:
+    for ending in ['quit', 'quit;', 'exit', 'exit;', 'qu\t', '\x04']:
         s = Session()
         # A new session has no previous session's history.
         s.send('\x1bOA' + 'SELECT 2718 AS fresh;\n')
@@ -228,9 +279,33 @@ Docs: https://github.com/ifnesi/kafcacheql/blob/main/docs/cli.md
         s.send(ending + ('\n' if ending != '\x04' else ''))
         s.finish(0)
     s = Session(offline=True)
+    s.send('SELECT count(*) AS offline_completed FROM ' + topic + '-s\t;\n')
+    s.read('[{"offline_completed":0}]'); s.read('kafcacheql> ')
     s.send('SELECT n FROM "' + topic + '";\n')
     s.read('[{"n":7}]'); s.read('kafcacheql> ')
     s.send('quit\n'); s.finish(0)
+    # §14.1: a stalled background refresh cannot hold up a statement or its Ctrl-C cancellation.
+    s = Session(stalled=True)
+    open(os.path.join(syncdir, 'stall-refresh'), 'w').close()
+    end = time.monotonic() + 10
+    while not os.path.exists(os.path.join(syncdir, 'refresh-stalled')):
+        assert time.monotonic() < end, 'background topic-list reply is stalled'
+        time.sleep(.02)
+    s.send('sElEc\t7 AS refresh_alive;\n')
+    s.read('[{"refresh_alive":7}]', timeout=3); s.read('kafcacheql> ')
+    s.send('SYNC ' + topic + ';\n')
+    s.read(topic + ';')
+    end = time.monotonic() + 3
+    while not os.path.exists(os.path.join(syncdir, 'sync-stalled')) and time.monotonic() < end:
+        time.sleep(.02)
+    s.send('\x03')
+    s.read('cancel', timeout=3); s.read('kafcacheql> ', timeout=3)
+    assert os.path.exists(os.path.join(syncdir, 'sync-stalled')), 'SYNC reached its own cancellable lookup'
+    assert not os.path.exists(os.path.join(syncdir, 'release-refresh')), 'prompt returns before Kafka answers'
+    open(os.path.join(syncdir, 'release-refresh'), 'w').close()
+    s.send('SELECT 42 AS after_cancel;\n')
+    s.read('[{"after_cancel":42}]'); s.read('kafcacheql> ')
+    s.send('quit\n'); s.finish(1)
     print('PTY checks passed')
 finally:
     if s: s.close()

@@ -1,6 +1,7 @@
 package io.github.ifnesi.kafcacheql.sync;
 
 import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+import static io.github.ifnesi.kafcacheql.util.ControlCharacters.escape;
 
 import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import com.google.common.base.Ascii;
@@ -268,7 +269,7 @@ public final class CacheContext {
                             + (rows.getObject(2) == null ? "unknown (no complete sync)" : Instant.ofEpochMilli(rows.getLong(2))));
                 }
             }
-            return new SQLWarning(sentence("Topic " + plan.topic().name() + ": offline cache, " + String.join(", ", times)), "01000");
+            return new SQLWarning(sentence(escape("Topic " + plan.topic().name() + ": offline cache, " + String.join(", ", times))), "01000");
         }
 
         public long sync(SyncPlan plan, Execution execution) throws SQLException {

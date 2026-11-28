@@ -35,9 +35,10 @@ public record Query(Select select, List<Reference> references, Set<Integer> para
     public record Command(Kind kind, String table, boolean ifExists, List<String> patterns) {}
     private static final Set<String> START_WORDS = Set.of("SELECT", "WITH", "SHOW", "DESCRIBE", "DROP", "SYNC");
     private static final String GLOB = "[A-Za-z0-9._?*\\-]+";
-    private static final String PATTERN = "(?:" + GLOB + "|\"" + GLOB + "\"|`" + GLOB + "`|\\[" + GLOB + "\\])";
-    private static final java.util.regex.Pattern SYNC = java.util.regex.Pattern.compile(
-            "(?i)\\s*SYNC(?:\\s+(" + PATTERN + "(?:\\s*,\\s*" + PATTERN + ")*))?\\s*;?\\s*");
+    private static final java.util.regex.Pattern TOPIC_PATTERN = java.util.regex.Pattern.compile(
+            "(?:" + GLOB + "|\"" + GLOB + "\"|`" + GLOB + "`|\\[" + GLOB + "\\])");
+    private static final java.util.regex.Pattern PATTERN_COMMAND = java.util.regex.Pattern.compile(
+            "(?i)\\s*(SYNC|SHOW\\s+TABLES)(?=\\s|;|$)");
     private static Query command(Kind kind, String table, boolean ifExists, List<String> patterns) {
         return new Query(null, List.of(), Set.of(), new Command(kind, table, ifExists, patterns));
     }
@@ -46,15 +47,8 @@ public record Query(Select select, List<Reference> references, Set<Integer> para
 
     public static Query parseAndResolve(String sql, Resolver resolver) throws SQLException {
         if (sql == null) throw new SQLException(sentence("SQL is null"), "42000");
-        var sync = SYNC.matcher(sql);
-        if (sync.matches()) {
-            var patterns = new ArrayList<String>();
-            if (sync.group(1) != null) for (String pattern : sync.group(1).split("\\s*,\\s*")) {
-                char first = pattern.charAt(0);
-                patterns.add(first == '"' || first == '`' || first == '[' ? pattern.substring(1, pattern.length() - 1) : pattern);
-            }
-            return command(Kind.SYNC, null, false, List.copyOf(patterns));
-        }
+        Query patterned = patternCommand(sql);
+        if (patterned != null) return patterned;
         Select select;
         var first = new AtomicReference<Token>();
         try {
@@ -66,7 +60,7 @@ public record Query(Select select, List<Reference> references, Set<Integer> para
             if (statements.size() != 1) throw new SQLException(sentence("Only one statement at a time is supported."), "42000");
             var statement = statements.getFirst();
             if (statement instanceof net.sf.jsqlparser.statement.show.ShowTablesStatement show) {
-                if (!show.toString().equalsIgnoreCase("SHOW TABLES")) throw unsupportedStatement();
+                if (!show.toString().equalsIgnoreCase("SHOW TABLES")) throw patternSyntax(Kind.SHOW, null);
                 return command(Kind.SHOW, null, false, List.of());
             }
             if (statement instanceof net.sf.jsqlparser.statement.DescribeStatement describe) {
@@ -118,14 +112,31 @@ public record Query(Select select, List<Reference> references, Set<Integer> para
         return new Query(select, List.copyOf(references), Set.copyOf(tables.parameters), null);
     }
 
+    /** A flat list, not a regex repeating groups recursively once per pattern. */
+    private static Query patternCommand(String sql) {
+        var head = PATTERN_COMMAND.matcher(sql);
+        if (!head.lookingAt()) return null;
+        String tail = sql.substring(head.end()).strip();
+        if (tail.endsWith(";")) tail = tail.substring(0, tail.length() - 1).strip();
+        var patterns = new ArrayList<String>();
+        if (!tail.isEmpty()) for (String item : tail.split(",", -1)) {
+            String pattern = item.strip();
+            // Invalid input keeps the parser's existing syntax diagnostics (including multiple statements).
+            if (!TOPIC_PATTERN.matcher(pattern).matches()) return null;
+            char first = pattern.charAt(0);
+            patterns.add(first == '"' || first == '`' || first == '[' ? pattern.substring(1, pattern.length() - 1) : pattern);
+        }
+        return command(Ascii.equalsIgnoreCase(head.group(1), "SYNC") ? Kind.SYNC : Kind.SHOW,
+                null, false, List.copyOf(patterns));
+    }
+
     private static void validateStart(Token first, Throwable cause) throws SQLException {
         // Parenthesized SELECTs are already accepted; inspect their first keyword too.
         while (first != null && "(".equals(first.image)) first = first.next;
         if (first == null && cause != null) return; // A lexical failure before the first token.
         String word = first == null ? "" : first.image;
         if (word.isEmpty() || ";".equals(word)) throw new SQLException(sentence("Empty statement."), "42000", cause);
-        if (Ascii.equalsIgnoreCase(word, "SYNC")) throw new SQLException(sentence(
-                "SYNC expects topic names or patterns separated by commas, such as SYNC orders, shop-*."), "42000", cause);
+        if (Ascii.equalsIgnoreCase(word, "SYNC")) throw patternSyntax(Kind.SYNC, cause);
         if (!START_WORDS.contains(Ascii.toUpperCase(word))) {
             throw new SQLException(sentence("Unknown statement \"" + word
                     + "\": only SELECT, WITH ... SELECT, SHOW TABLES, DESCRIBE, DROP TABLE and SYNC are supported."), "42000", cause);
@@ -133,8 +144,16 @@ public record Query(Select select, List<Reference> references, Set<Integer> para
         Token second = first.next;
         if (second != null && Ascii.equalsIgnoreCase(word, "DROP") && !Ascii.equalsIgnoreCase(second.image, "TABLE"))
             throw new SQLException(sentence("Only DROP TABLE is supported."), "42000", cause);
-        if (second != null && Ascii.equalsIgnoreCase(word, "SHOW") && !Ascii.equalsIgnoreCase(second.image, "TABLES"))
-            throw syntaxError(second, cause);
+        if (second != null && Ascii.equalsIgnoreCase(word, "SHOW")) {
+            if (!Ascii.equalsIgnoreCase(second.image, "TABLES")) throw syntaxError(second, cause);
+            if (cause != null) throw patternSyntax(Kind.SHOW, cause);
+        }
+    }
+
+    private static SQLException patternSyntax(Kind kind, Throwable cause) {
+        String statement = kind == Kind.SYNC ? "SYNC" : "SHOW TABLES";
+        return new SQLException(sentence(statement + " expects topic names or patterns separated by commas, such as "
+                + statement + " orders, shop-*."), "42000", cause);
     }
 
     private static SQLException syntaxError(Token token, Throwable cause) {

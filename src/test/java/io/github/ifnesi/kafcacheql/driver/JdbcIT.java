@@ -99,9 +99,10 @@ class JdbcIT {
      * through the shared topic list. Uncached statistics are NULL; offline lists cached topics only.
      */
     @Test void cacheStatementsShowAndDescribeOnlineAndOffline() throws Exception {
-        String cached = topic("delete"), uncached = topic("compact");
+        String cached = topic("delete"), uncached = topic("compact"), filtered = topic("delete");
         send(cached, 1, null);
-        var p = settings(); p.setProperty("topics.include", cached + "|" + uncached);
+        var p = settings(); p.setProperty("topics.include", cached + "|" + uncached + "|" + filtered);
+        p.setProperty("topics.exclude", filtered);
         // §12.3: client info is a read-only allowlist, including when credentials came from a file or URL.
         Path credentials = dir.resolve("credentials.properties");
         java.nio.file.Files.writeString(credentials, "ssl.keystore.password=file-secret\n");
@@ -129,6 +130,8 @@ class JdbcIT {
                 assertEquals(2, count);
             }
             assertEquals(List.of("listTopics"), calls); calls.clear();
+            int listings = assertShowPatterns(s, cached, uncached, filtered, false);
+            assertEquals(Collections.nCopies(listings, "listTopics"), calls); calls.clear();
             try (var r = s.executeQuery("DESCRIBE " + StorageDdl.quote(uncached))) {
                 var names = new ArrayList<String>(); while (r.next()) names.add(r.getString("column_name"));
                 assertTrue(names.containsAll(List.of("_partition", "_offset", "_headers"))); assertFalse(names.contains("n"));
@@ -174,9 +177,36 @@ class JdbcIT {
             assertClientInfo(c, p, true);
             assertTrue(s.execute("SHOW TABLES"));
             try (var r = s.getResultSet()) { assertTrue(r.next()); assertEquals(cached, r.getString(1)); assertFalse(r.next()); }
+            assertShowPatterns(s, cached, uncached, filtered, true);
             try (var r = s.executeQuery("DESCRIBE " + StorageDdl.quote(cached))) { assertTrue(r.next()); }
             assertJdbcThrows(SQLException.class, () -> s.executeQuery("DESCRIBE " + StorageDdl.quote(uncached)));
         }
+    }
+
+    /** PLAN §8.7: SHOW shares SYNC's quoted, case-sensitive GLOB patterns, with OR semantics;
+     * no match is empty, filters apply, and offline lists only cached topics. */
+    private static int assertShowPatterns(Statement statement, String cached, String uncached, String filtered,
+                                          boolean offline) throws SQLException {
+        Set<String> all = offline ? Set.of(cached) : Set.of(cached, uncached);
+        var cases = Map.ofEntries(
+                Map.entry("*" + cached.substring(0, cached.length() - 1) + "?", Set.of(cached)),
+                Map.entry(cached + ", " + uncached, all),
+                Map.entry("\"" + cached + "\"", Set.of(cached)),
+                Map.entry("`" + cached + "`", Set.of(cached)),
+                Map.entry("[" + cached + "]", Set.of(cached)),
+                Map.entry(cached + ", *", all),
+                Map.entry(cached.toUpperCase(Locale.ROOT), Set.<String>of()),
+                Map.entry("no-such-" + cached, Set.<String>of()),
+                Map.entry(filtered, Set.<String>of()),
+                Map.entry(uncached, offline ? Set.<String>of() : Set.of(uncached)));
+        for (var test : cases.entrySet()) {
+            try (var rows = statement.executeQuery("SHOW TABLES " + test.getKey())) {
+                var names = new ArrayList<String>(); while (rows.next()) names.add(rows.getString("table_name"));
+                assertEquals(test.getValue(), new HashSet<>(names), test.getKey());
+                assertEquals(test.getValue().size(), names.size(), "patterns must not duplicate rows");
+            }
+        }
+        return cases.size();
     }
 
     private static void assertClientInfo(Connection connection, Properties settings, boolean offline) throws Exception {
@@ -268,6 +298,11 @@ class JdbcIT {
             try (var r = s.executeQuery("SYNC")) { int n = 0; while (r.next()) { n++; assertEquals(0, r.getLong(2)); } assertEquals(3, n); }
             for (String pattern : List.of("jdbc-*", "*")) try (var r = s.executeQuery("SYNC " + pattern)) {
                 int n = 0; while (r.next()) { n++; assertEquals(0, r.getLong(2)); } assertEquals(3, n);
+            }
+            // §8.7: the shared pattern grammar has no recursive limit on the number of patterns.
+            String thousand = String.join(",", Collections.nCopies(1000, a));
+            for (String command : List.of("SHOW TABLES ", "SYNC ")) try (var r = s.executeQuery(command + thousand)) {
+                assertTrue(r.next()); assertEquals(a, r.getString("table_name")); assertFalse(r.next());
             }
             try (var r = s.executeQuery("SYNC " + a.substring(0, a.length() - 1) + "?")) {
                 assertTrue(r.next()); assertEquals(a, r.getString(1)); assertEquals(0, r.getLong(2)); assertFalse(r.next());
@@ -1694,7 +1729,7 @@ class JdbcIT {
             String topic = topic(policy), table = StorageDdl.quote(topic);
             TestStack.sendJson(topic, "{\"id\":7}", """
                     {"n":7,"mixed":1,"widen":1,"flag":true,"text":"a","nested":{"x":1},"array":[1],
-                     "empty":null,"_offset":123,"it's.complicated":9}
+                     "empty":null,"_offset":123,"it's.complicated":9,"audit\\nERROR forged":1}
                     """, null);
             var p = settings(); p.remove("schema.registry.url"); p.setProperty("cache.path", dir.resolve(policy + ".db").toString());
             try (var c = DriverManager.getConnection(URL, p); var old = c.createStatement(); var next = c.createStatement();
@@ -1707,7 +1742,7 @@ class JdbcIT {
                 assertEquals(9L, before.getObject("it's.complicated")); assertEquals(7L, before.getObject("key_id"));
                 TestStack.sendJson(topic, "second", """
                         {"n":8,"mixed":"N/A","widen":1.25,"flag":false,"text":"b","nested":{"x":2},
-                         "array":[2],"later":"present","key_id":"payload"}
+                         "array":[2],"later":"present","key_id":"payload","audit\\nERROR forged":"text"}
                         """, null);
                 try (var logs = LogCapture.capture(); var rows = next.executeQuery("SELECT * FROM " + table + " WHERE _offset>=0 ORDER BY _offset")) {
                     var types = rows.getMetaData();
@@ -1724,6 +1759,14 @@ class JdbcIT {
                     assertEquals("payload", rows.getObject("key_id_1")); assertNull(rows.getObject("key_id")); assertFalse(rows.next());
                     assertTrue(warnings(next).contains("mixed"), warnings(next));
                     assertTrue(logs.lines().stream().anyMatch(line -> line.startsWith("WARN ") && line.contains("mixed")), logs.lines().toString());
+                    // Record-derived names remain data: no forged log line or multiline SQLWarning.
+                    var fieldLogs = logs.lines().stream().filter(line -> line.startsWith("WARN ") && line.contains("forged")).toList();
+                    assertEquals(1, fieldLogs.size());
+                    assertTrue(fieldLogs.getFirst().contains("audit\\nERROR forged"), fieldLogs.toString());
+                    assertFalse(fieldLogs.getFirst().codePoints().anyMatch(Character::isISOControl));
+                    assertTrue(warnings(next).contains("audit\\nERROR forged"), warnings(next));
+                    for (var warning = next.getWarnings(); warning != null; warning = warning.getNextWarning())
+                        assertFalse(warning.getMessage().codePoints().anyMatch(Character::isISOControl));
                 }
                 assertEquals(width, metadata.getColumnCount());
                 assertEquals(Types.BIGINT, metadata.getColumnType(before.findColumn("widen")));
@@ -2428,7 +2471,7 @@ class JdbcIT {
                     assertEquals(Set.of(append, compact), names, "include/exclude filters and hidden internal tables");
                 }
                 assertEquals(before, cacheTables(control)); assertEquals(List.of("listTopics"), calls); calls.clear(); assertEquals(0, registryRequests.get());
-                metadataNamesAndRefresh(metadata, c, control, calls, forbidKafka, base, fixed);
+                metadataNamesAndRefresh(metadata, c, control, clients.clients(), calls, forbidKafka, base, fixed);
                 forbidKafka.set(false);
                 for (String topic : List.of(append, compact)) {
                     try (var s = c.createStatement(); var r = s.executeQuery("SELECT * FROM " + StorageDdl.quote(topic) + " WHERE _offset>=0")) {
@@ -2539,7 +2582,7 @@ class JdbcIT {
     }
 
     private static void metadataNamesAndRefresh(DatabaseMetaData metadata, Connection c, CacheContext.Lease control,
-            List<String> calls, AtomicBoolean forbidKafka, String base, List<String> fixed) throws Exception {
+            KafkaClients clients, List<String> calls, AtomicBoolean forbidKafka, String base, List<String> fixed) throws Exception {
         String lower = base + "-orders", upper = base + "-Orders";
         var topics = List.of(lower, upper, "sqlite_" + base, "sqlite-" + base);
         for (String topic : topics) { TestStack.createTopic(topic, 1, Map.of()); TestStack.sendString(topic, "key", topic, null); }
@@ -2587,18 +2630,54 @@ class JdbcIT {
             var registeredNames = new TreeSet<String>(); while (rows.next()) registeredNames.add(rows.getString("TABLE_NAME"));
             assertEquals(names, registeredNames, "registration preserves the names advertised by metadata");
         }
-        TestStack.deleteTopic(deleted);
-        String added = base + "-new"; TestStack.createTopic(added, 1, Map.of());
-        calls.clear();
-        try (var rows = metadata.getTables(null, null, "%", null)) {
-            var refreshed = new HashSet<String>(); while (rows.next()) refreshed.add(rows.getString("TABLE_NAME"));
-            assertTrue(refreshed.contains(added)); assertFalse(refreshed.contains(deleted));
-        }
-        assertEquals(List.of("listTopics"), calls); calls.clear(); forbidKafka.set(true);
-        try (var rows = metadata.getColumns(null, null, added, null)) { assertEquals(fixed, columnNames(rows)); }
-        // A deleted, uncached topic disappears from columns on Refresh as well.
-        try (var rows = metadata.getColumns(null, null, deleted, null)) { assertFalse(rows.next()); }
-        assertTrue(calls.isEmpty()); forbidKafka.set(false);
+        // PLAN §12.2: getColumns uses the latest list, even if an older Refresh replies last.
+        Field adminField = KafkaClients.class.getDeclaredField("admin"); adminField.setAccessible(true);
+        Admin original = (Admin) adminField.get(clients);
+        var delayFirst = new AtomicBoolean(true);
+        var captured = new CountDownLatch(1); var release = new CountDownLatch(1);
+        adminField.set(clients, Proxy.newProxyInstance(Admin.class.getClassLoader(), new Class<?>[]{Admin.class}, (self, method, args) -> {
+            try {
+                Object result = method.invoke(original, args);
+                if (method.getName().equals("listTopics") && delayFirst.compareAndSet(true, false)) {
+                    // Complete Kafka's real old snapshot before creating the new topic, then withhold its reply.
+                    ((org.apache.kafka.clients.admin.ListTopicsResult) result).names().get(10, TimeUnit.SECONDS);
+                    captured.countDown();
+                    assertTrue(release.await(20, TimeUnit.SECONDS), "release the old topic-list reply");
+                }
+                return result;
+            } catch (InvocationTargetException failure) { throw failure.getCause(); }
+        }));
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            calls.clear();
+            var older = executor.submit(() -> {
+                var oldNames = new HashSet<String>();
+                try (var rows = metadata.getTables(null, null, "%", null)) {
+                    while (rows.next()) oldNames.add(rows.getString("TABLE_NAME"));
+                }
+                return oldNames;
+            });
+            try {
+                assertTrue(captured.await(10, TimeUnit.SECONDS), "old Kafka snapshot captured");
+                assertEquals(List.of("listTopics"), calls); calls.clear();
+                TestStack.deleteTopic(deleted);
+                String added = base + "-new"; TestStack.createTopic(added, 1, Map.of());
+                try (var rows = metadata.getTables(null, null, "%", null)) {
+                    var refreshed = new HashSet<String>(); while (rows.next()) refreshed.add(rows.getString("TABLE_NAME"));
+                    assertTrue(refreshed.contains(added)); assertFalse(refreshed.contains(deleted));
+                }
+                assertEquals(List.of("listTopics"), calls); calls.clear(); forbidKafka.set(true);
+                try (var rows = metadata.getColumns(null, null, added, null)) { assertEquals(fixed, columnNames(rows)); }
+                release.countDown();
+                var oldNames = older.get(10, TimeUnit.SECONDS);
+                assertTrue(oldNames.contains(deleted)); assertFalse(oldNames.contains(added), "getTables returns its own Kafka snapshot");
+                try (var rows = metadata.getColumns(null, null, added, null)) {
+                    assertEquals(fixed, columnNames(rows), "an old reply cannot replace the newer published list");
+                }
+                // A deleted, uncached topic stays absent even after the delayed old reply.
+                try (var rows = metadata.getColumns(null, null, deleted, null)) { assertFalse(rows.next()); }
+                assertTrue(calls.isEmpty()); forbidKafka.set(false);
+            } finally { release.countDown(); }
+        } finally { adminField.set(clients, original); }
     }
 
     private static List<String> columnNames(ResultSet rows) throws SQLException {
