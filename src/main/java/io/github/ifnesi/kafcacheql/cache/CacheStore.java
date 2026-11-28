@@ -240,7 +240,7 @@ public final class CacheStore implements AutoCloseable {
         try {
             return file.toRealPath();
         } catch (IOException e) {
-            throw ConfigErrors.problem("The cache path " + file + " can't be resolved: " + e.getClass().getSimpleName());
+            throw ConfigErrors.problem("The cache path " + file + " can't be resolved: " + ConfigErrors.detail(e));
         }
     }
 
@@ -270,8 +270,7 @@ public final class CacheStore implements AutoCloseable {
         } catch (FileAlreadyExistsException e) {
             // another connection created it first
         } catch (IOException e) {
-            throw ConfigErrors.problem("The cache " + file + " can't be created: " + e.getClass().getSimpleName()
-                    + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+            throw ConfigErrors.problem("The cache " + file + " can't be created: " + ConfigErrors.detail(e));
         }
     }
 
@@ -305,7 +304,7 @@ public final class CacheStore implements AutoCloseable {
                 pause();
             }
         }
-        throw ConfigErrors.problem("The cache " + file + " can't be read without writing to it: " + failure.getMessage(),
+        throw ConfigErrors.problem("The cache " + file + " can't be read without writing to it: " + ConfigErrors.detail(failure),
                 failure);
     }
 
@@ -413,7 +412,7 @@ public final class CacheStore implements AutoCloseable {
                         + ": set cache.path to another file");
             }
         } catch (IOException e) {
-            throw ConfigErrors.problem("The cache " + file + " can't be checked: " + e.getClass().getSimpleName());
+            throw ConfigErrors.problem("The cache " + file + " can't be checked: " + ConfigErrors.detail(e));
         }
     }
 
@@ -432,7 +431,7 @@ public final class CacheStore implements AutoCloseable {
             }
         } catch (IOException e) {
             throw ConfigErrors.problem("The permissions of the cache " + file + " can't be restricted to its owner: "
-                    + e.getClass().getSimpleName());
+                    + ConfigErrors.detail(e));
         }
     }
 

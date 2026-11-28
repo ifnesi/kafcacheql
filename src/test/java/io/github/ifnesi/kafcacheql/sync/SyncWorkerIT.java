@@ -1,11 +1,12 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ifnesi.kafcacheql.cache.RecordStore;
@@ -468,7 +469,8 @@ class SyncWorkerIT {
     }
 
     Process child(String mode, Path path, String topic) throws Exception {
-        return new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+        return new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                 System.getProperty("java.class.path"), SyncProcess.class.getName(), mode, path.toString(), topic, TestStack.BOOTSTRAP)
                 .redirectError(ProcessBuilder.Redirect.INHERIT).start();
     }

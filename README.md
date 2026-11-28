@@ -68,8 +68,9 @@ The first query can take time on a large topic. Later queries reuse the cache. Y
 connection** to query data already cached, without Kafka or Schema Registry. A range that is missing from the
 cache fails instead of returning an incomplete answer.
 
-No separate query service is needed. Schema Registry is used for records that name a schema. KafCacheQL
-accepts SELECTs only; it never produces records or commits consumer offsets to Kafka. The cache is an
+No separate query service is needed. Schema Registry is used for records that name a schema. KafCacheQL never
+produces records or commits consumer offsets to Kafka. Besides SELECT, it accepts only a few [cache
+statements](docs/sql.md#cache-statements) that list, describe, sync or drop topics in the local cache. The cache is an
 unencrypted local copy; see [cache security](docs/configuration.md#cache-security). Optional
 [record transforms](docs/transforms.md) drop or mask private fields before they reach that copy.
 
@@ -77,15 +78,18 @@ unencrypted local copy; see [cache security](docs/configuration.md#cache-securit
 
 This sets up a small customer-and-order dataset and answers an order summary in your SQL editor.
 
-From a clone of this repository, you need Docker Compose and [DBeaver](https://dbeaver.io/) or
+You need Git, Docker Compose and [DBeaver](https://dbeaver.io/) or
 [DataGrip](https://www.jetbrains.com/datagrip/), running on Java 21 or newer. KafCacheQL supports Kafka 3.1+;
 the bundled stack uses Confluent Platform 8.4.0.
 
 ### 1. Start the stack
 
-The stack provides Kafka, Schema Registry and Control Center for inspecting the original records.
+The stack provides Kafka, Schema Registry and Control Center for inspecting the original records. Get the
+repository and start the stack from its top folder, `kafcacheql`:
 
 ```sh
+git clone https://github.com/ifnesi/kafcacheql.git
+cd kafcacheql
 docker compose up -d
 ```
 
@@ -105,8 +109,9 @@ curl -fL -o ~/.kafcacheql/kafcacheql-jdbc.jar \
 ```
 
 Saving it without the version keeps your tool's settings the same when you upgrade. These docs describe the
-next release. v0.1.0 lacks [record transforms](docs/transforms.md) and shows header values as base64; until
-the next release, [build the driver](#development) to get them.
+next release. v0.1.0 lacks [record transforms](docs/transforms.md), the [command line](docs/cli.md) and the
+[cache statements](docs/sql.md#cache-statements), and shows header values as base64; until the next release,
+[build the driver](#development) to get them.
 
 ### 3. Add sample data and settings
 
@@ -139,6 +144,7 @@ before trying a larger topic.
 ## Go further
 
 - [SQL reference and examples](docs/sql.md): joins, JSON, offset ranges and tail queries.
+- [Command line](docs/cli.md): run SQL from a terminal or a script, and keep a cache warm with `SYNC`.
 - [Configuration](docs/configuration.md): authentication, windows, parallel fetching, cache limits and offline
   use.
 - [DBeaver and DataGrip](docs/tools.md): driver setup and replacing the JAR safely.
@@ -150,8 +156,8 @@ before trying a larger topic.
 
 ## Development
 
-Building needs Java 21+ and Maven 3.9+. Build the JAR and copy it where your tool loads it; tools keep the
-loaded file open, so a rebuild in `target/` would break them:
+Building needs Java 21+ and Maven 3.9+. From the repository's top folder, `kafcacheql`, build the JAR and copy
+it where your tool loads it; tools keep the loaded file open, so a rebuild in `target/` would break them:
 
 ```sh
 mvn package -DskipTests

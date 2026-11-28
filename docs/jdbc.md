@@ -47,6 +47,10 @@ JDBC columns.
 | First `SELECT` on a topic (DBeaver's double-click runs `SELECT *`) | Lists topics to resolve an uncached name; reads config, description and offsets, then fetches the query's window. Schema Registry loads each record's schema ID or GUID and its fixed-version references as needed | Creates the topic's table and view and fills them | Describe and Read; DescribeConfigs or [per-topic settings](configuration.md#per-topic-settings) |
 | Later `SELECT`s | Topic description and start/end offsets, then missing records only. Config is cached per connection by topic ID | Updates rows and view columns | Describe and Read |
 | `SELECT` within `max.staleness.ms` of the last valid check | Skips description and start/end lookups. Missing ranges still need fetching; timestamp bounds still need offset lookups | Reuses the recent topic observation | As for `SELECT` |
+| `SHOW TABLES` | As `getTables()`. Offline, none | As `getTables()`: queues background drops for cached topics Kafka no longer lists | As `getTables()` |
+| `DESCRIBE` | Lists topics when an online name isn't cached; otherwise none | Reads cached columns | As `getTables()` |
+| `DROP TABLE` | None | Deletes the topic's cached records and offsets; Kafka is unchanged | |
+| `SYNC` | Lists topics, then as a later `SELECT`, fetching everything new | Adds rows; holds a lock file beside the cache while it runs | Describe and Read |
 | Any call with `offline=true` | None | Answers from the cache only | |
 | `getPrimaryKeys()` | A named uncached topic: description and config. Null or a listing pattern: lists topics, then one batched config lookup for uncached modes | Reads cached modes; creates no tables | Describe; DescribeConfigs or a mode override |
 | `getIndexInfo()` and the rest of `DatabaseMetaData` | None | | |

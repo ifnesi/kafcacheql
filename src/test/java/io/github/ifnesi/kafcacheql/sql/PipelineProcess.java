@@ -51,14 +51,26 @@ public final class PipelineProcess {
             cache.hooks(new SyncWorker.Hooks() {
                 boolean first = true;
                 @Override public void beforeCommit(SyncBatch batch) throws SQLException {
-                    if (!first) return;
+                    if (!first || args.length == 3 && args[2].equals("try-sync")) return;
                     first = false;
                     System.out.println("BUFFERED");
                     try { if (System.in.read() != '\n') throw new SQLException("Missing query release"); }
                     catch (java.io.IOException e) { throw new SQLException(e); }
                 }
             });
-            System.out.println("RESULT " + QueryPipeline.execute(cache, sql(args[1]), Map.of(), execution).rows());
+            if (args.length == 3 && (args[2].equals("sync") || args[2].equals("try-sync"))) {
+                var p = new Properties(); p.setProperty("cache.path", args[0]); p.setProperty("schema.registry.url", TestStack.REGISTRY);
+                p.setProperty("sync.batch.records", "1"); p.setProperty("max.poll.records", "1");
+                p.setProperty("client.id", "pipeline-" + Integer.toHexString(args[0].hashCode()));
+                try (var c = java.sql.DriverManager.getConnection("jdbc:kafcacheql://" + TestStack.BOOTSTRAP, p);
+                     var s = c.createStatement()) {
+                    if (args[2].equals("try-sync")) {
+                        s.setQueryTimeout(2);
+                        try (var r = s.executeQuery("SYNC " + args[1])) { while (r.next()) {} System.out.println("ACQUIRED"); }
+                        catch (SQLException e) { System.out.println("REFUSED " + e.getSQLState()); }
+                    } else try (var r = s.executeQuery("SYNC " + args[1])) { while (r.next()) System.out.println("RESULT " + r.getLong(2)); }
+                }
+            } else System.out.println("RESULT " + QueryPipeline.execute(cache, sql(args[1]), Map.of(), execution).rows());
         }
     }
 }

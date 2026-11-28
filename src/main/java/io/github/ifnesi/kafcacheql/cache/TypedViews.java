@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.google.common.base.Ascii;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
@@ -61,7 +63,7 @@ public final class TypedViews {
     private record Ids(Set<RecordType> keys, Set<RecordType> values) {
         String signature(List<Inferred> inferred) throws SQLException {
             try { return JacksonMapper.INSTANCE.writeValueAsString(inferred.isEmpty() ? List.of(keys, values) : List.of(keys, values, inferred)); }
-            catch (IOException e) { throw new SQLException("Encoding view schema IDs", e); }
+            catch (IOException e) { throw new SQLException(sentence("Encoding view schema IDs"), e); }
         }
     }
 
@@ -94,7 +96,7 @@ public final class TypedViews {
 
     private static ViewInput viewInput(Connection reader, long generation) throws SQLException {
         return readSignature(StorageDdl.viewSignature(reader, generation)
-                .orElseThrow(() -> new SQLException("Missing typed view for generation " + generation)));
+                .orElseThrow(() -> new SQLException(sentence("Missing typed view for generation " + generation))));
     }
 
     private static ViewInput readSignature(String signature) throws SQLException {
@@ -105,7 +107,7 @@ public final class TypedViews {
             List<Inferred> inferred = input.size() == 2 ? List.of()
                     : List.of(JacksonMapper.INSTANCE.treeToValue(input.get(2), Inferred[].class));
             return new ViewInput(ids, inferred);
-        } catch (IOException e) { throw new SQLException("Reading cached view layout", e); }
+        } catch (IOException e) { throw new SQLException(sentence("Reading cached view layout"), e); }
     }
 
     /** A schema-less view can also result from unsupported or mixed record types; distinguish it for diagnostics. */
@@ -143,7 +145,7 @@ public final class TypedViews {
             if (column.warning() == null) continue;
             String message = "Topic " + topic + ": " + column.warning();
             log.warn("{}", message);
-            warnings.add(new SQLWarning(message, "01000"));
+            warnings.add(new SQLWarning(sentence(message), "01000"));
         }
         return warnings;
     }
@@ -184,7 +186,7 @@ public final class TypedViews {
             Layout result = new Layout(List.copyOf(columns));
             LAYOUTS.put(input, result);
             return result;
-        } catch (RuntimeException e) { throw new SQLException("Reading cached schemas for a typed view", e); }
+        } catch (RuntimeException e) { throw new SQLException(sentence("Reading cached schemas for a typed view"), e); }
     }
 
     /** Sample only on the worker's refresh path. Readers use the descriptors stored with the view. */
@@ -197,7 +199,7 @@ public final class TypedViews {
                 if (ids.keys().isEmpty()) sample(keys, rows.getString(1));
                 if (ids.values().isEmpty()) sample(values, rows.getString(2));
             }
-        } catch (IOException e) { throw new SQLException("Sampling cached JSON for a typed view", e); }
+        } catch (IOException e) { throw new SQLException(sentence("Sampling cached JSON for a typed view"), e); }
         var fields = new ArrayList<Inferred>();
         for (boolean key : List.of(true, false)) {
             for (var field : (key ? keys : values).entrySet()) {
@@ -258,7 +260,7 @@ public final class TypedViews {
                     try {
                         var indexes = new MessageIndexes(List.of(JacksonMapper.INSTANCE.readValue(typed.messageIndex(), Integer[].class)));
                         yield protobuf.toDescriptor(protobuf.toMessageName(indexes));
-                    } catch (IOException e) { throw new SQLException("Reading cached Protobuf message index", e); }
+                    } catch (IOException e) { throw new SQLException(sentence("Reading cached Protobuf message index"), e); }
                 }
                 default -> SchemaRegistry.parseAvro(s).rawSchema();
             };
@@ -322,7 +324,7 @@ public final class TypedViews {
         for (int suffix = 1; !names.add(Ascii.toLowerCase(name)); suffix++) name = base + '_' + suffix;
         String path;
         try { path = field == null ? "$" : "$." + JacksonMapper.INSTANCE.writeValueAsString(field); }
-        catch (IOException e) { throw new SQLException("Encoding JSON field path", e); }
+        catch (IOException e) { throw new SQLException(sentence("Encoding JSON field path"), e); }
         String expression = (key ? "_key" : "_value") + (json ? " -> " : " ->> ") + "'" + path.replace("'", "''") + "'";
         String value = (key ? "_key" : "_value") + " ->> '" + path.replace("'", "''") + "'";
         String jsonType = "json_type(" + (key ? "_key" : "_value") + ", '" + path.replace("'", "''") + "')";

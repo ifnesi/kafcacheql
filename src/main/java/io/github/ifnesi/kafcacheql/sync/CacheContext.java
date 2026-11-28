@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import com.google.common.base.Ascii;
 import com.google.common.collect.RangeSet;
@@ -52,6 +54,7 @@ public final class CacheContext {
     private final CompletableFuture<Void> closed = new CompletableFuture<>();
     private final ArrayDeque<Connection> readers = new ArrayDeque<>();
     private final Path path;
+    private final AtomicBoolean syncing = new AtomicBoolean();
     private record Checked(long generation, TopicInfo topic, EndOffsets ends, Map<Integer, Long> starts) {}
     private final ConcurrentHashMap<String, Checked> checked = new ConcurrentHashMap<>();
     private int leases;
@@ -81,6 +84,14 @@ public final class CacheContext {
             topics = clients == null ? null : clients.clients().topics(config);
         }
 
+        /** Take the process-local guard before opening the OS lock file: closing any channel can release its lock. */
+        public void beginSync() throws SQLException {
+            ensureOpen();
+            if (!context.syncing.compareAndSet(false, true))
+                throw new SQLException(sentence("another SYNC is running on cache " + context.path), "55006");
+        }
+        public void endSync() { context.syncing.set(false); }
+
         public Path path() { return context.path; }
         public DriverConfig config() { return config; }
         public synchronized <T> T read(SqlWork<T> work) throws SQLException {
@@ -100,9 +111,10 @@ public final class CacheContext {
         }
 
         /** Refresh captures generations before Kafka; missing topics are dropped by the worker, without waiting. */
-        public Set<String> listTopics() throws SQLException {
+        public Set<String> listTopics() throws SQLException { return listTopics(null); }
+        public Set<String> listTopics(Execution execution) throws SQLException {
             ensureOpen();
-            var cached = read(reader -> {
+            var cached = read(execution, reader -> {
                 var generations = new TreeMap<String, Long>();
                 try (var s = reader.createStatement(); var r = s.executeQuery("SELECT topic,id FROM \"$topics\" WHERE deleted_ms IS NULL")) {
                     while (r.next()) generations.put(r.getString(1), r.getLong(2));
@@ -110,7 +122,7 @@ public final class CacheContext {
                 return generations;
             });
             if (clients == null) return Set.copyOf(cached.keySet());
-            var listed = clients.clients().listTopics();
+            var listed = clients.clients().listTopics(execution);
             cached.forEach((topic, generation) -> { if (!listed.contains(topic)) context.worker.drop(topic, generation); });
             return listed;
         }
@@ -144,20 +156,24 @@ public final class CacheContext {
         }
 
         private static SQLException unknownTable(String name) {
-            return new SQLException("Unknown table " + name, "42S02");
+            return new SQLException(sentence("Unknown table " + name), "42S02");
         }
 
         /** Full-topic window with §9 validity observations; SQL's resolver can supply bounded windows. */
         public SyncPlan plan(String topic, Execution execution) throws SQLException { return plan(topic, null, execution); }
 
         public SyncPlan plan(String topic, Map<Integer, ? extends RangeSet<Long>> wanted, Execution execution) throws SQLException {
+            return plan(topic, wanted, execution, false);
+        }
+        public SyncPlan freshPlan(String topic, Execution execution) throws SQLException { return plan(topic, null, execution, true); }
+        private SyncPlan plan(String topic, Map<Integer, ? extends RangeSet<Long>> wanted, Execution execution, boolean fresh) throws SQLException {
             execution.check();
             var observed = read(c -> TopicRegistry.observe(c, topic));
             OptionalLong generation = observed.isPresent() ? OptionalLong.of(observed.get().id()) : OptionalLong.empty();
             boolean deleted = observed.isPresent() && observed.get().deleted();
             if (config.offline()) return read(execution, c -> cachedPlan(c, topic, wanted));
             var recent = context.checked.get(topic);
-            if (config.maxStalenessMs() > 0 && recent != null && generation.isPresent() && !deleted
+            if (!fresh && config.maxStalenessMs() > 0 && recent != null && generation.isPresent() && !deleted
                     && recent.generation() == generation.getAsLong()
                     && System.currentTimeMillis() - recent.ends().capturedAtMs() < config.maxStalenessMs()) {
                 return SyncPlan.create(recent.topic(), generation, false, wanted, recent.ends(), recent.starts(), SyncPlan.Source.RECENT);
@@ -166,7 +182,7 @@ public final class CacheContext {
             var found = topics.describe(topic, execution);
             if (found.isEmpty()) {
                 context.worker.delete(topic, generation, execution);
-                throw new SQLException("Unknown topic " + topic, "42S02");
+                throw new SQLException(sentence("Unknown topic " + topic), "42S02");
             }
             var info = found.get();
             var starts = kafka.logStartOffsets(topic, info.partitions(), execution);
@@ -184,18 +200,8 @@ public final class CacheContext {
                     var info = new TopicInfo(topic, Uuid.fromString(row.getString(2)), row.getInt(3),
                             "append".equals(row.getString(4)) ? Mode.APPEND : Mode.COMPACTED, row.getLong(5),
                             "LogAppendTime".equals(row.getString(6)) ? TimestampType.LOG_APPEND_TIME : TimestampType.CREATE_TIME, false);
-                    var starts = new TreeMap<Integer, Long>(); var ends = new TreeMap<Integer, Long>();
-                    try (var partitions = reader.prepareStatement("""
-                            SELECT partition_no,pruned_below,coalesce((SELECT max(end_offset) FROM "$ranges" r
-                                WHERE r.topic_ref=p.topic_ref AND r.partition_no=p.partition_no),pruned_below)
-                            FROM "$partitions" p WHERE topic_ref=?
-                            """)) {
-                        partitions.setLong(1, generation);
-                        try (var rows = partitions.executeQuery()) {
-                            while (rows.next()) { starts.put(rows.getInt(1), rows.getLong(2)); ends.put(rows.getInt(1), rows.getLong(3)); }
-                        }
-                    }
-                    return SyncPlan.create(info, OptionalLong.of(generation), false, wanted, new EndOffsets(ends, 0), starts, SyncPlan.Source.OFFLINE);
+                    var bounds = PartitionStore.cachedBounds(reader, generation);
+                    return SyncPlan.create(info, OptionalLong.of(generation), false, wanted, new EndOffsets(bounds.ends(), 0), bounds.starts(), SyncPlan.Source.OFFLINE);
                 }
             }
         }
@@ -251,7 +257,7 @@ public final class CacheContext {
             }
         }
         private static SQLException missing(SyncPlan plan, Object ranges) {
-            return new SQLException("Offline cache is missing ranges for topic " + plan.topic().name() + " (partition: ranges): " + ranges, "40001");
+            return new SQLException(sentence("Offline cache is missing ranges for topic " + plan.topic().name() + " (partition: ranges): " + ranges), "40001");
         }
         public SQLWarning offlineWarning(Connection reader, SyncPlan plan, long generation) throws SQLException {
             var times = new ArrayList<String>();
@@ -262,7 +268,7 @@ public final class CacheContext {
                             + (rows.getObject(2) == null ? "unknown (no complete sync)" : Instant.ofEpochMilli(rows.getLong(2))));
                 }
             }
-            return new SQLWarning("Topic " + plan.topic().name() + ": offline cache, " + String.join(", ", times), "01000");
+            return new SQLWarning(sentence("Topic " + plan.topic().name() + ": offline cache, " + String.join(", ", times)), "01000");
         }
 
         public long sync(SyncPlan plan, Execution execution) throws SQLException {
@@ -271,13 +277,16 @@ public final class CacheContext {
 
         /** Cached windows take only a reader, even while the worker is held in another topic's first sync. */
         public long sync(SyncPlan plan, Execution execution, BatchWriter writer) throws SQLException {
+            return sync(plan, execution, writer, count -> {});
+        }
+        public long sync(SyncPlan plan, Execution execution, BatchWriter writer, java.util.function.LongConsumer fetched) throws SQLException {
             ensureOpen();
             execution.check();
             if (config.offline()) return read(execution, c -> {
                 long generation = plan.generation().orElseThrow(); validate(c, plan, generation); return generation;
             });
             try {
-                long generation = syncOnline(plan, execution, writer);
+                long generation = syncOnline(plan, execution, writer, fetched);
                 if (plan.checked()) {
                     var check = new Checked(generation, plan.topic(), plan.ends(), plan.logStarts());
                     context.checked.compute(plan.topic().name(), (topic, old) -> old == null
@@ -287,7 +296,7 @@ public final class CacheContext {
             } catch (StaleGeneration stale) { context.checked.remove(plan.topic().name()); throw stale; }
         }
 
-        private long syncOnline(SyncPlan plan, Execution execution, BatchWriter writer) throws SQLException {
+        private long syncOnline(SyncPlan plan, Execution execution, BatchWriter writer, java.util.function.LongConsumer fetched) throws SQLException {
             boolean cached = plan.generation().isPresent() && read(execution, c -> {
                 var current = TopicRegistry.observe(c, plan.topic().name());
                 if (current.isEmpty() || current.get().id() != plan.generation().getAsLong()) throw new StaleGeneration(plan.topic().name());
@@ -317,12 +326,37 @@ public final class CacheContext {
                 }
                 return id;
             }
-            return context.worker.sync(plan, execution, writer, config.syncBatchRecords(), config.syncFetchParallelism());
+            return context.worker.sync(plan, execution, writer, config.syncBatchRecords(), config.syncFetchParallelism(), fetched);
         }
 
         void caughtUp(String topic, long generation, int partition, long capturedAt) throws SQLException {
             ensureOpen();
             context.worker.caughtUp(topic, generation, partition, capturedAt);
+        }
+
+        /** SYNC starts at the last cached range, unless the existing validity rules require rebuilding. */
+        public Map<Integer, Long> newestOffsets(SyncPlan plan, Execution execution) throws SQLException {
+            if (plan.generation().isEmpty() || plan.deleted()) return Map.of();
+            return read(execution, reader -> {
+                long id = plan.generation().getAsLong();
+                SyncWorker.requireGeneration(reader, plan.topic().name(), id);
+                if (TopicRegistry.rebuildReason(reader, id, plan.topic(), context.transforms.settings(plan.topic().name(), config.topic(plan.topic().name())),
+                        plan.logStarts()).isPresent()) return Map.of();
+                return PartitionStore.cachedBounds(reader, id).ends();
+            });
+        }
+
+        public boolean dropTable(String name, Execution execution) throws SQLException {
+            var target = read(execution, reader -> {
+                var resolved = TopicRegistry.resolve(reader, name);
+                if (resolved.isEmpty() || resolved.get().topic().isEmpty()) return null;
+                String topic = resolved.get().topic().get();
+                return Map.entry(topic, TopicRegistry.generation(reader, topic));
+            });
+            if (target == null) return false;
+            context.worker.delete(target.getKey(), target.getValue(), execution);
+            context.checked.remove(target.getKey());
+            return true;
         }
 
         /** Disposable metadata only; the query's own checked snapshot is already open. */
@@ -344,7 +378,7 @@ public final class CacheContext {
         int queuedRequests() { return context.worker.queuedRequests(); }
 
         private synchronized void ensureOpen() throws SQLException {
-            if (closed) throw new SQLException("Cache lease is closed");
+            if (closed) throw new SQLException(sentence("Cache lease is closed"));
             context.worker.checkOpen();
         }
 
@@ -397,9 +431,9 @@ public final class CacheContext {
                 try { context.closed.get(); }
                 catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    throw new SQLException("Interrupted while cache closed", e);
+                    throw new SQLException(sentence("Interrupted while cache closed"), e);
                 } catch (java.util.concurrent.ExecutionException e) {
-                    throw new SQLException("Closing cache failed", e.getCause());
+                    throw new SQLException(sentence("Closing cache failed"), e.getCause());
                 }
                 continue;
             }

@@ -1,12 +1,13 @@
 package io.github.ifnesi.kafcacheql.kafka;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import static io.github.ifnesi.kafcacheql.testkit.TestStack.utf8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
@@ -179,7 +180,7 @@ class KafkaClientsIT {
             assertTrue(opener.error.getMessage().startsWith("Interrupted while opening"), opener.error.getMessage());
 
             waiter.join(15_000);
-            assertTrue(waiter.error.getMessage().startsWith("Reading the cluster ID from localhost:1 failed"),
+            assertTrue(waiter.error.getMessage().startsWith("Can't reach Kafka at localhost:1: timed out after "),
                     "the others get the real outcome: " + waiter.error.getMessage());
             assertFalse(waiter.error.getMessage().contains("Interrupted"), waiter.error.getMessage());
             assertEquals(before, KafkaClients.openCount(), "nothing left open");
@@ -292,7 +293,7 @@ class KafkaClientsIT {
         StringWriter trace = new StringWriter();
         e.printStackTrace(new PrintWriter(trace));
 
-        assertTrue(e.getMessage().startsWith("Reading the cluster ID from localhost:1 failed"), e.getMessage());
+        assertTrue(e.getMessage().startsWith("Can't reach Kafka at localhost:1: timed out after "), e.getMessage());
         assertTrue(trace.toString().contains("Caused by: "), "the cause is kept: " + trace);
         assertFalse(trace.toString().contains("S3CR3T-unreachable"), trace.toString());
         assertTrue(logs.contains("could not be established"), "the client's own warnings, captured: " + logs);

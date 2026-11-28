@@ -1,11 +1,15 @@
 package io.github.ifnesi.kafcacheql.driver;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.DriverProperty;
 import io.github.ifnesi.kafcacheql.config.JdbcUrl;
 import io.github.ifnesi.kafcacheql.config.Secrets;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.Driver;
 import java.sql.DriverManager;
@@ -24,13 +28,26 @@ import java.util.logging.Logger;
  */
 public final class KafCacheQLDriver implements Driver {
 
-    public static final int MAJOR_VERSION = 0;
-    public static final int MINOR_VERSION = 1;
+    public static final String VERSION = version();
+    public static final int MAJOR_VERSION;
+    public static final int MINOR_VERSION;
 
     static {
+        String[] numbers = VERSION.split("[.-]", 3);
+        MAJOR_VERSION = Integer.parseInt(numbers[0]);
+        MINOR_VERSION = Integer.parseInt(numbers[1]);
         try {
             DriverManager.registerDriver(new KafCacheQLDriver());
         } catch (SQLException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    private static String version() {
+        try (var input = KafCacheQLDriver.class.getResourceAsStream("version.txt")) {
+            if (input == null) throw new IOException("Missing KafCacheQL version resource");
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8).strip();
+        } catch (IOException e) {
             throw new ExceptionInInitializerError(e);
         }
     }
@@ -49,7 +66,7 @@ public final class KafCacheQLDriver implements Driver {
     @Override
     public boolean acceptsURL(String url) throws SQLException {
         if (url == null) {
-            throw new SQLException("The URL is null");
+            throw new SQLException(sentence("The URL is null"));
         }
         return JdbcUrl.accepts(url);
     }
@@ -101,6 +118,6 @@ public final class KafCacheQLDriver implements Driver {
     /** The driver logs through SLF4J, not java.util.logging. */
     @Override
     public Logger getParentLogger() throws SQLFeatureNotSupportedException {
-        throw new SQLFeatureNotSupportedException("KafCacheQL logs through SLF4J");
+        throw new SQLFeatureNotSupportedException(sentence("KafCacheQL logs through SLF4J"));
     }
 }

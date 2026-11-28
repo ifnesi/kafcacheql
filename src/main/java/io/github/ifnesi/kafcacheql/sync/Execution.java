@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
@@ -58,18 +60,18 @@ public final class Execution implements AutoCloseable {
         // before its subscription is released, so an expired queued job is removed immediately.
         if (!cancelled && !closed && timed && System.nanoTime() - deadline >= 0) stop(true);
         if (expired) {
-            throw new SQLTimeoutException("Query deadline expired", "HYT00");
+            throw new SQLTimeoutException(sentence("Query deadline expired"), "HYT00");
         }
-        if (cancelled || closed) throw new SQLException("Query cancelled", "57014");
+        if (cancelled || closed) throw new SQLException(sentence("Query cancelled"), "57014");
         if (Thread.currentThread().isInterrupted()) {
             stop(false);
-            throw new SQLException("Query interrupted", "57014");
+            throw new SQLException(sentence("Query interrupted"), "57014");
         }
     }
 
     /** Native calls may report an interrupt before their caller can check the execution token. */
     public SQLException failure(SQLException failure) {
-        try { check(); return failure; }
+        try { check(); return io.github.ifnesi.kafcacheql.config.ConfigErrors.plain(failure); }
         catch (SQLException stopped) {
             if (stopped != failure) stopped.addSuppressed(failure);
             return stopped;
@@ -94,7 +96,7 @@ public final class Execution implements AutoCloseable {
         catch (ExecutionException e) {
             if (e.getCause() instanceof SQLException sql) throw sql;
             if (e.getCause() instanceof Error error) throw error;
-            throw new SQLException("Execution failed", e.getCause());
+            throw new SQLException(sentence("Execution failed"), e.getCause());
         }
     }
 
@@ -110,7 +112,7 @@ public final class Execution implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 cancel();
-                throw new SQLException("Query interrupted", "57014", e);
+                throw new SQLException(sentence("Query interrupted"), "57014", e);
             } catch (ExecutionException e) {
                 check();
                 throw e;
@@ -124,7 +126,7 @@ public final class Execution implements AutoCloseable {
             check();
             try { return query.run(); }
             catch (StaleGeneration stale) {
-                if (offline || replanned) throw new SQLException("Cached window changed for topic " + stale.topic(), "40001", stale);
+                if (offline || replanned) throw new SQLException(sentence("Cached window changed for topic " + stale.topic()), "40001", stale);
                 replanned = true;
             }
             catch (SQLException failure) { throw failure(failure); }

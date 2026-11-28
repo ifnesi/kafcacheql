@@ -398,7 +398,8 @@ class CacheValidityIT {
     }
 
     Process child(Path file, String topic) throws Exception {
-        return new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+        return new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                 System.getProperty("java.class.path"), ValidityProcess.class.getName(), file.toString(), topic)
                 .start();
     }

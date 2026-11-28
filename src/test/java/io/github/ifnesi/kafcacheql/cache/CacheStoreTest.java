@@ -49,6 +49,7 @@ class CacheStoreTest {
         CacheStore.beforeImmutableInspect = () -> {
             try {
                 child[0] = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                        "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"),
                         "-cp", System.getProperty("java.class.path"), CacheWalProcess.class.getName(), file.toString())
                         .redirectError(ProcessBuilder.Redirect.INHERIT).start();
                 var ready = java.util.concurrent.CompletableFuture.supplyAsync(() -> {
@@ -297,6 +298,7 @@ class CacheStoreTest {
     void refusingACacheLeftByACrashedProcessKeepsItsWal() throws Exception {
         Path f = dir.resolve("crashed.db");
         Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"),
                 "-cp", System.getProperty("java.class.path"), CacheCrash.class.getName(), f.toString())
                 .redirectErrorStream(true).start();
         assertTrue(child.waitFor(60, java.util.concurrent.TimeUnit.SECONDS));
@@ -382,6 +384,7 @@ class CacheStoreTest {
     /** A cache for cluster A whose last commit is still in the WAL, as a crashed process leaves it. */
     private static Path crash(Path f) throws Exception {
         Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"),
                 "-cp", System.getProperty("java.class.path"), CacheCrash.class.getName(), f.toString())
                 .redirectErrorStream(true).start();
         assertTrue(child.waitFor(60, java.util.concurrent.TimeUnit.SECONDS));

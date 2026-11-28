@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.schema;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.cache.Cache;
@@ -207,8 +209,8 @@ public final class SchemaRegistry implements AutoCloseable {
     }
 
     private static SQLException failure(String action, String urls, Exception cause, Map<String, ?> settings) {
-        return new SQLException(Secrets.redact("Schema Registry" + (urls.isBlank() ? "" : " at " + urls) + ": " + action
-                + ": " + cause.getMessage(), settings), "08001", Secrets.sanitize(cause, settings));
+        return new SQLException(sentence(Secrets.redact("Schema Registry" + (urls.isBlank() ? "" : " at " + urls) + ": " + action
+                + ": " + io.github.ifnesi.kafcacheql.config.ConfigErrors.detail(cause), settings)), "08001", Secrets.sanitize(cause, settings));
     }
 
     /** Carries a registry/SQLite failure through Confluent's runtime-only deserializer API. */

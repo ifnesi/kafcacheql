@@ -94,7 +94,7 @@ class ShadedLoginIT {
     private static Map<String, String> probe(Path configFile, String mode) throws Exception {
         Path source = Path.of(ShadedLoginIT.class.getResource("/probe/ShadedLoginProbe.java").toURI());
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process p = new ProcessBuilder(java, "-cp", System.getProperty("shadedJar"), source.toString(),
+        Process p = new ProcessBuilder(java, "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp", System.getProperty("shadedJar"), source.toString(),
                 "jdbc:kafcacheql://?config.file=" + configFile, mode, "jdbc:kafcacheql://" + TestStack.BOOTSTRAP)
                 .redirectErrorStream(true).start();
         assertTrue(p.waitFor(90, TimeUnit.SECONDS), "probe finished");

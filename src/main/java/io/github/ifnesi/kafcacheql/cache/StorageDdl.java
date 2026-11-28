@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.config.Mode;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -68,7 +70,7 @@ public final class StorageDdl {
         try (var p = reader.prepareStatement("SELECT view_name FROM \"$topics\" WHERE id=?")) {
             p.setLong(1, id);
             try (var rows = p.executeQuery()) {
-                if (!rows.next()) throw new SQLException("Missing topic generation " + id);
+                if (!rows.next()) throw new SQLException(sentence("Missing topic generation " + id));
                 return rows.getString(1);
             }
         }
@@ -87,7 +89,7 @@ public final class StorageDdl {
                 if (!rows.next()) return Optional.empty();
                 String sql = rows.getString(1), prefix = "CREATE VIEW " + quote(view) + " -- schemas: ";
                 int end = sql.indexOf('\n', prefix.length());
-                if (!sql.startsWith(prefix) || end < 0) throw new SQLException("Missing layout signature for view " + view);
+                if (!sql.startsWith(prefix) || end < 0) throw new SQLException(sentence("Missing layout signature for view " + view));
                 return Optional.of(sql.substring(prefix.length(), end));
             }
         }

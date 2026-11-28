@@ -1,10 +1,15 @@
 package io.github.ifnesi.kafcacheql.driver;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.cache.StorageDdl;
 import io.github.ifnesi.kafcacheql.cache.TopicRegistry;
 import io.github.ifnesi.kafcacheql.cache.TypedViews;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
+import io.github.ifnesi.kafcacheql.config.ConfigErrors;
 import io.github.ifnesi.kafcacheql.sql.QueryPipeline;
+import io.github.ifnesi.kafcacheql.sql.Query;
+import java.nio.file.Path;
 import io.github.ifnesi.kafcacheql.sync.CacheContext;
 import io.github.ifnesi.kafcacheql.sync.Execution;
 import java.lang.reflect.InvocationHandler;
@@ -31,19 +36,19 @@ final class Jdbc {
 
     static Connection connection(CacheContext.Lease cache, String url) { return new ConnectionHandler(cache, url).proxy; }
     private static SQLFeatureNotSupportedException unsupported(String name) {
-        return new SQLFeatureNotSupportedException("KafCacheQL does not support " + name, "0A000");
+        return new SQLFeatureNotSupportedException(sentence("KafCacheQL does not support " + name), "0A000");
     }
     private static <T> T proxy(Class<T> type, InvocationHandler handler) {
         return type.cast(Proxy.newProxyInstance(DriverLoader.LOADER, new Class<?>[] {type}, handler));
     }
     private static Object call(Method method, Object target, Object[] args) throws SQLException {
         try { return method.invoke(target, args); }
-        catch (IllegalAccessException e) { throw new SQLException(e); }
+        catch (IllegalAccessException e) { throw new SQLException(sentence("Calling JDBC " + method.getName() + " failed"), e); }
         catch (InvocationTargetException e) {
-            if (e.getCause() instanceof SQLException sql) throw sql;
+            if (e.getCause() instanceof SQLException sql) throw ConfigErrors.plain(sql);
             if (e.getCause() instanceof RuntimeException runtime) throw runtime;
             if (e.getCause() instanceof Error error) throw error;
-            throw new SQLException(e.getCause());
+            throw new SQLException(sentence("Calling JDBC " + method.getName() + " failed"), e.getCause());
         }
     }
     private abstract static class Handler implements InvocationHandler {
@@ -57,9 +62,10 @@ final class Jdbc {
             if (method.getName().equals("isWrapperFor")) return ((Class<?>) args[0]).isInstance(self);
             if (method.getName().equals("unwrap")) {
                 if (((Class<?>) args[0]).isInstance(self)) return self;
-                throw new SQLException("Not a wrapper for " + ((Class<?>) args[0]).getName());
+                throw new SQLException(sentence("Not a wrapper for " + ((Class<?>) args[0]).getName()));
             }
-            return DriverLoader.call(() -> invoke(method, args == null ? new Object[0] : args));
+            try { return DriverLoader.call(() -> invoke(method, args == null ? new Object[0] : args)); }
+            catch (SQLException failure) { throw ConfigErrors.plain(failure); }
         }
         abstract Object invoke(Method method, Object[] args) throws SQLException;
     }
@@ -73,14 +79,14 @@ final class Jdbc {
         final MetadataHandler metadata = new MetadataHandler(this);
         volatile boolean closed;
         ConnectionHandler(CacheContext.Lease cache, String url) { this.cache = cache; this.url = url; }
-        void check() throws SQLException { if (closed) throw new SQLException("Connection is closed", "08003"); }
+        void check() throws SQLException { if (closed) throw new SQLException(sentence("Connection is closed"), "08003"); }
         @Override Object invoke(Method method, Object[] args) throws SQLException {
             String name = method.getName();
             if (name.equals("isClosed")) return closed;
             if (name.equals("close")) { close(); return null; }
             if (name.equals("isValid")) {
                 int timeout = (int) args[0];
-                if (timeout < 0) throw new SQLException("Negative validation timeout");
+                if (timeout < 0) throw new SQLException(sentence("Negative validation timeout"));
                 if (closed) return false;
                 try (var execution = new Execution(Duration.ofSeconds(timeout))) { return cache.isValid(execution); }
                 catch (SQLException e) { return false; }
@@ -89,7 +95,7 @@ final class Jdbc {
             return switch (name) {
                 case "createStatement", "prepareStatement" -> {
                     boolean prepared = name.equals("prepareStatement");
-                    if (prepared && args[0] == null) throw new SQLException("SQL is null", "42000");
+                    if (prepared && args[0] == null) throw new SQLException(sentence("SQL is null"), "42000");
                     int offset = prepared ? 1 : 0;
                     if (args.length > offset) {
                         if (args.length < offset + 2 || (int) args[offset] != ResultSet.TYPE_FORWARD_ONLY
@@ -124,8 +130,14 @@ final class Jdbc {
                     if (args[0] != null && !args[0].equals("main")) throw unsupported(name); yield null;
                 }
                 case "nativeSQL" -> args[0];
-                case "getClientInfo" -> args.length == 0 ? new java.util.Properties() : null;
-                case "setClientInfo" -> throw new SQLClientInfoException();
+                case "getClientInfo" -> {
+                    var info = new java.util.Properties();
+                    info.setProperty("cache.path", cache.path().toString());
+                    info.setProperty("bootstrap.servers", cache.config().bootstrapServers().orElse(""));
+                    info.setProperty("offline", Boolean.toString(cache.config().offline()));
+                    yield args.length == 0 ? info : info.getProperty((String) args[0]);
+                }
+                case "setClientInfo" -> throw new SQLClientInfoException(sentence("Client info is read-only."), null, Map.of());
                 case "getTypeMap" -> new HashMap<String, Class<?>>();
                 case "setTypeMap" -> { if (!((Map<?, ?>) args[0]).isEmpty()) throw unsupported(name); yield null; }
                 case "getNetworkTimeout" -> 0;
@@ -177,11 +189,11 @@ final class Jdbc {
                 case "getDriverName", "getDatabaseProductName": return "KafCacheQL";
                 case "getDriverMajorVersion", "getDatabaseMajorVersion": return KafCacheQLDriver.MAJOR_VERSION;
                 case "getDriverMinorVersion", "getDatabaseMinorVersion": return KafCacheQLDriver.MINOR_VERSION;
-                case "getDriverVersion", "getDatabaseProductVersion": return KafCacheQLDriver.MAJOR_VERSION + "." + KafCacheQLDriver.MINOR_VERSION;
+                case "getDriverVersion", "getDatabaseProductVersion": return KafCacheQLDriver.VERSION;
                 default: break;
             }
             if (name.equals("getTables")) {
-                topics = Set.copyOf(connection.cache.listTopics());
+                refreshTopics(null);
             }
             Map<String, String> keys = name.equals("getPrimaryKeys") ? primaryKeys((String) args[2]) : Map.of();
             Object result = connection.cache.read(reader -> {
@@ -290,7 +302,7 @@ final class Jdbc {
                     .filter(e -> e.getValue().equalsIgnoreCase(table)).map(Map.Entry::getKey).findFirst().orElse(null));
             boolean all = exact == null && pattern;
             if (all) {
-                topics = Set.copyOf(connection.cache.listTopics());
+                refreshTopics(null);
                 // A real name containing '_' still names one topic, rather than being a navigator pattern.
                 exact = table == null ? null : connection.cache.read(r -> knownViews(r, cached(r)).entrySet().stream()
                         .filter(e -> e.getValue().equalsIgnoreCase(table)).map(Map.Entry::getKey).findFirst().orElse(null));
@@ -326,6 +338,87 @@ final class Jdbc {
             }
             return result;
         }
+        private void refreshTopics(Execution execution) throws SQLException {
+            if (execution != null) execution.check();
+            topics = Set.copyOf(connection.cache.listTopics(execution));
+        }
+
+        synchronized CachedRowSet showTables(Execution execution) throws SQLException {
+            refreshTopics(execution);
+            return connection.cache.read(execution, reader -> {
+                var result = empty(new Column("table_name", JDBCType.VARCHAR), new Column("mode", JDBCType.VARCHAR),
+                        new Column("partitions", JDBCType.INTEGER), new Column("cached_rows", JDBCType.BIGINT), new Column("cached_bytes", JDBCType.BIGINT));
+                var stored = cached(reader);
+                try (var match = reader.prepareStatement("SELECT ? LIKE ? ESCAPE '\\'");
+                     var tables = tables(reader, reader.getMetaData(), match, new Object[]{null, null, null, null})) {
+                    var byView = new HashMap<String, Table>(); stored.values().forEach(t -> byView.put(t.view(), t));
+                    tables.beforeFirst();
+                    while (tables.next()) {
+                        execution.check(); String name = tables.getString("TABLE_NAME");
+                        if (name.startsWith("$")) continue;
+                        var values = new HashMap<String, Object>(); values.put("table_name", name);
+                        Table table = byView.get(name);
+                        if (table != null) {
+                            values.put("mode", table.mode()); values.put("partitions", table.partitions());
+                            try (var s = reader.createStatement(); var count = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(StorageDdl.tableName(table.generation())))) {
+                                count.next(); values.put("cached_rows", count.getLong(1));
+                            }
+                            try (var p = reader.prepareStatement("SELECT coalesce(sum(pgsize),0) FROM dbstat WHERE name IN (SELECT name FROM sqlite_schema WHERE tbl_name=?)")) {
+                                p.setString(1, StorageDdl.tableName(table.generation()));
+                                try (var size = p.executeQuery()) { size.next(); values.put("cached_bytes", size.getLong(1)); }
+                            }
+                        }
+                        add(result, values);
+                    }
+                }
+                result.beforeFirst(); return result;
+            });
+        }
+
+        synchronized CachedRowSet describe(String name, Execution execution) throws SQLException {
+            if (!connection.cache.config().offline() && !connection.cache.read(execution, reader ->
+                    knownViews(reader, cached(reader)).values().stream().anyMatch(view -> view.equalsIgnoreCase(name))
+                    || connection.cache.config().metadataShowInternal() && internalNames(reader).contains(name))) {
+                refreshTopics(execution);
+            }
+            return connection.cache.read(execution, reader -> {
+                var result = empty(new Column("column_name", JDBCType.VARCHAR), new Column("type", JDBCType.VARCHAR));
+                String exact = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+                try (var match = reader.prepareStatement("SELECT ? LIKE ? ESCAPE '\\'");
+                     var columns = columns(reader, reader.getMetaData(), match, new Object[]{null, null, exact, null})) {
+                    columns.beforeFirst();
+                    while (columns.next()) { execution.check(); add(result, Map.of("column_name", columns.getString("COLUMN_NAME"), "type", columns.getString("TYPE_NAME"))); }
+                }
+                if (result.size() == 0) { result.close(); throw new SQLException(sentence("Unknown table " + name), "42S02"); }
+                result.beforeFirst(); return result;
+            });
+        }
+
+        /** Resolve all patterns against the same filtered list before any sync is allowed to fetch. */
+        synchronized Map<String, String> syncTopics(List<String> patterns, Execution execution) throws SQLException {
+            refreshTopics(execution);
+            return connection.cache.read(execution, reader -> {
+                var names = new TreeMap<String, String>();
+                var views = TopicRegistry.viewNames(reader, topics);
+                var stored = cached(reader);
+                for (var entry : views.entrySet()) if (visible(entry.getKey()) && (patterns.size() > 0 || stored.containsKey(entry.getKey())))
+                    names.put(entry.getValue(), entry.getKey());
+                if (patterns.isEmpty()) return names;
+                var selected = new TreeMap<String, String>();
+                try (var match = reader.prepareStatement("SELECT ? GLOB ?")) {
+                    for (String pattern : patterns) {
+                        boolean found = false;
+                        for (var entry : names.entrySet()) {
+                            execution.check(); match.setString(1, entry.getKey()); match.setString(2, pattern);
+                            try (var r = match.executeQuery()) { if (r.next() && r.getBoolean(1)) { selected.put(entry.getKey(), entry.getValue()); found = true; } }
+                        }
+                        if (!found) throw new SQLException(sentence("SYNC pattern matches no topic: " + pattern), "42S02");
+                    }
+                }
+                return selected;
+            });
+        }
+
         private Map<String, String> knownViews(Connection reader, Map<String, Table> stored) throws SQLException {
             var known = new java.util.HashSet<>(topics);
             known.addAll(stored.keySet());
@@ -448,7 +541,7 @@ final class Jdbc {
             if (name.equals("close")) { close(); return null; }
             if (name.equals("isClosed")) return closed;
             connection.check();
-            if (closed) throw new SQLException("Result set is closed", "24000");
+            if (closed) throw new SQLException(sentence("Result set is closed"), "24000");
             checkResultOperation(name);
             return switch (name) {
                 case "getStatement" -> null;
@@ -480,6 +573,7 @@ final class Jdbc {
         ResultHandler result;
         SQLWarning warnings;
         int fetchSize, timeout;
+        int updateCount = -1;
         long maxRows;
         boolean closeOnCompletion;
         StatementHandler(ConnectionHandler connection, String sql) {
@@ -488,7 +582,7 @@ final class Jdbc {
         }
         void check() throws SQLException {
             connection.check();
-            if (closed) throw new SQLException("Statement is closed", "07000");
+            if (closed) throw new SQLException(sentence("Statement is closed"), "07000");
         }
         @Override Object invoke(Method method, Object[] args) throws SQLException {
             String name = method.getName();
@@ -500,31 +594,33 @@ final class Jdbc {
                 check();
                 if (method.getDeclaringClass() == PreparedStatement.class && name.startsWith("set")
                         && args.length >= 2 && args[0] instanceof Integer index) {
-                    if (index < 1) throw new SQLException("Parameter index must be positive", "07009");
+                    if (index < 1) throw new SQLException(sentence("Parameter index must be positive"), "07009");
                     bindings.put(index, new Binding(method, args.clone())); return null;
                 }
                 return switch (name) {
-                    case "executeQuery", "execute" -> {
-                        if (sql != null && args.length != 0) throw new SQLException("A prepared statement uses its prepared SQL");
+                    case "executeQuery", "execute", "executeUpdate", "executeLargeUpdate" -> {
+                        if (sql != null && args.length != 0) throw new SQLException(sentence("A prepared statement uses its prepared SQL"));
                         if (sql == null && args.length != 1) throw unsupported("generated keys");
                         String text = sql == null ? (String) args[0] : sql;
-                        execute(text);
-                        yield name.equals("execute") ? true : result.proxy;
+                        execute(text, name);
+                        if (name.equals("executeUpdate")) yield updateCount;
+                        if (name.equals("executeLargeUpdate")) yield (long) updateCount;
+                        yield name.equals("execute") ? result != null : result.proxy;
                     }
                     case "getResultSet" -> result == null ? null : result.proxy;
                     case "getConnection" -> connection.proxy;
-                    case "executeUpdate", "executeLargeUpdate", "addBatch", "executeBatch", "executeLargeBatch" -> {
+                    case "addBatch", "executeBatch", "executeLargeBatch" -> {
                         warnings = null; throw unsupported("updates and batches");
                     }
                     case "clearBatch", "setEscapeProcessing" -> null;
                     case "clearParameters" -> { bindings.clear(); yield null; }
                     case "getWarnings" -> warnings;
                     case "clearWarnings" -> { warnings = null; yield null; }
-                    case "getUpdateCount" -> -1;
-                    case "getLargeUpdateCount" -> -1L;
+                    case "getUpdateCount" -> updateCount;
+                    case "getLargeUpdateCount" -> (long) updateCount;
                     case "getMoreResults" -> {
                         if (args.length > 0 && (int) args[0] == Statement.KEEP_CURRENT_RESULT) throw unsupported("multiple results");
-                        if (result != null) result.close(); result = null; yield false;
+                        if (result != null) result.close(); result = null; updateCount = -1; yield false;
                     }
                     case "setFetchSize" -> { fetchSize = nonnegative((int) args[0], name); yield null; }
                     case "getFetchSize" -> fetchSize;
@@ -532,10 +628,10 @@ final class Jdbc {
                     case "getQueryTimeout" -> timeout;
                     case "setMaxRows", "setLargeMaxRows" -> {
                         long value = ((Number) args[0]).longValue();
-                        if (value < 0) throw new SQLException("Negative maxRows"); maxRows = value; yield null;
+                        if (value < 0) throw new SQLException(sentence("Negative maxRows")); maxRows = value; yield null;
                     }
                     case "getMaxRows" -> {
-                        if (maxRows > Integer.MAX_VALUE) throw new SQLException("Use getLargeMaxRows for this limit", "22003");
+                        if (maxRows > Integer.MAX_VALUE) throw new SQLException(sentence("Use getLargeMaxRows for this limit"), "22003");
                         yield (int) maxRows;
                     }
                     case "getLargeMaxRows" -> maxRows;
@@ -553,8 +649,8 @@ final class Jdbc {
                 };
             } finally { use.unlock(); }
         }
-        void execute(String text) throws SQLException {
-            warnings = null;
+        void execute(String text, String operation) throws SQLException {
+            warnings = null; updateCount = -1;
             if (result != null) { result.close(); result = null; }
             var active = new Execution(Duration.ofSeconds(timeout));
             synchronized (this) {
@@ -565,10 +661,32 @@ final class Jdbc {
             bindings.forEach((index, binding) -> values.put(index, binding.value()));
             QueryPipeline.Cursor cursor = null;
             try {
-                cursor = QueryPipeline.open(connection.cache, text, values, active, fetchSize, maxRows, new QueryPipeline.Bindings() {
+                Query query = active.run(connection.cache.config().offline(), () -> Query.parseAndResolve(text, name -> {
+                    if (operation.equals("executeUpdate") || operation.equals("executeLargeUpdate")) throw unsupported("updates other than DROP TABLE");
+                    return connection.cache.resolveTable(name, active);
+                }));
+                boolean update = operation.equals("executeUpdate") || operation.equals("executeLargeUpdate");
+                if (update && (query.command() == null || query.command().kind() != Query.Kind.DROP)) throw unsupported("updates other than DROP TABLE");
+                if (query.command() != null) {
+                    if (!bindings.isEmpty()) throw new SQLException(sentence("Cache statements have no parameters"), "07009");
+                    var command = query.command();
+                    if (command.kind() == Query.Kind.DROP) {
+                        if (operation.equals("executeQuery")) throw new SQLException(sentence("DROP TABLE returns an update count"), "42000");
+                        boolean dropped = active.run(connection.cache.config().offline(), () -> connection.cache.dropTable(command.table(), active));
+                        if (!dropped && !command.ifExists()) throw new SQLException(sentence("Unknown cached table " + command.table()), "42S02");
+                        warnings = new SQLWarning(sentence("Topic " + command.table() + " dropped from the local cache; Kafka is unchanged"), "01000");
+                        updateCount = 0; finish(active); return;
+                    }
+                    cursor = switch (command.kind()) {
+                        case SHOW -> QueryPipeline.Cursor.detached(connection.metadata.showTables(active), active, List.of());
+                        case DESCRIBE -> QueryPipeline.Cursor.detached(connection.metadata.describe(command.table(), active), active, List.of());
+                        case SYNC -> sync(command, active);
+                        case DROP -> throw new AssertionError();
+                    };
+                } else cursor = QueryPipeline.open(connection.cache, query, values, active, fetchSize, maxRows, new QueryPipeline.Bindings() {
                     @Override public void validate(Set<Integer> parameters) throws SQLException {
                         for (int index : bindings.keySet()) {
-                            if (!parameters.contains(index)) throw new SQLException("Unknown parameter " + index, "07009");
+                            if (!parameters.contains(index)) throw new SQLException(sentence("Unknown parameter " + index), "07009");
                         }
                     }
                     @Override public void bind(PreparedStatement statement) throws SQLException {
@@ -581,7 +699,7 @@ final class Jdbc {
                 result = new ResultHandler(this, cursor, active);
                 SQLWarning tail = null;
                 for (var warning : cursor.warnings()) {
-                    var copy = new SQLWarning(warning.getMessage(), warning.getSQLState(), warning.getErrorCode(), warning.getCause());
+                    var copy = new SQLWarning(sentence(warning.getMessage()), warning.getSQLState(), warning.getErrorCode(), warning.getCause());
                     if (tail == null) warnings = copy; else tail.setNextWarning(copy);
                     tail = copy;
                 }
@@ -591,6 +709,48 @@ final class Jdbc {
                 throw e;
             }
         }
+        QueryPipeline.Cursor sync(Query.Command command, Execution active) throws SQLException {
+            if (connection.cache.config().offline()) throw new SQLException(sentence("SYNC needs Kafka and cannot run offline"), "08006");
+            Path lockPath = Path.of(connection.cache.path() + ".sync.lock");
+            connection.cache.beginSync();
+            try (var channel = java.nio.channels.FileChannel.open(lockPath, java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE)) {
+                java.nio.channels.FileLock locked;
+                try { locked = channel.tryLock(); }
+                catch (java.nio.channels.OverlappingFileLockException e) { throw syncLocked(lockPath); }
+                if (locked == null) throw syncLocked(lockPath);
+                try (locked) {
+                    var selected = connection.metadata.syncTopics(command.patterns(), active);
+                    var counts = new TreeMap<String, Long>();
+                    selected.keySet().forEach(name -> counts.put(name, 0L));
+                    return active.run(false, () -> {
+                        var plans = new java.util.LinkedHashMap<String, io.github.ifnesi.kafcacheql.sync.SyncPlan>();
+                        // Capture every topic's end before fetching the first one.
+                        for (var entry : selected.entrySet()) plans.put(entry.getKey(), connection.cache.freshPlan(entry.getValue(), active));
+                        var generations = new TreeMap<String, Long>();
+                        var checked = new ArrayList<Map.Entry<io.github.ifnesi.kafcacheql.sync.SyncPlan, Long>>();
+                        var warnings = new ArrayList<SQLWarning>();
+                        for (var entry : plans.entrySet()) {
+                            var plan = io.github.ifnesi.kafcacheql.sql.WindowPlanner.refresh(connection.cache, entry.getValue(), active);
+                            long generation = connection.cache.sync(plan, active, io.github.ifnesi.kafcacheql.cache.RecordStore::write,
+                                    n -> counts.merge(entry.getKey(), n, Long::sum));
+                            generations.put(plan.topic().name(), generation);
+                            checked.add(Map.entry(plan, generation)); warnings.addAll(plan.warnings());
+                        }
+                        try (var reader = connection.cache.borrowReader(active)) {
+                            for (var entry : checked) connection.cache.validate(reader.connection(), entry.getKey(), entry.getValue());
+                            connection.cache.queried(generations, System.currentTimeMillis());
+                        }
+                        var rows = MetadataHandler.empty(new MetadataHandler.Column("table_name", JDBCType.VARCHAR),
+                                new MetadataHandler.Column("fetched_records", JDBCType.BIGINT));
+                        for (var count : counts.entrySet()) MetadataHandler.add(rows, Map.of("table_name", count.getKey(), "fetched_records", count.getValue()));
+                        rows.beforeFirst(); return QueryPipeline.Cursor.detached(rows, active, warnings);
+                    });
+                }
+            } catch (java.io.IOException e) { throw new SQLException(sentence("Opening SYNC lock for " + connection.cache.path()), e); }
+            finally { connection.cache.endSync(); }
+        }
+        private static SQLException syncLocked(Path path) { return new SQLException(sentence("another SYNC is running on cache " + path), "55006"); }
+
         void finish(Execution active) {
             active.close();
             synchronized (this) { if (execution == active) execution = null; }
@@ -616,10 +776,11 @@ final class Jdbc {
         final Execution execution;
         final ResultSet proxy = proxy(ResultSet.class, this);
         final ResultSetMetaData metadata;
+        final long maxRows;
         boolean closed;
         int row;
         ResultHandler(StatementHandler owner, QueryPipeline.Cursor cursor, Execution execution) throws SQLException {
-            this.owner = owner; this.cursor = cursor; this.execution = execution;
+            this.owner = owner; this.cursor = cursor; this.execution = execution; maxRows = owner.maxRows;
             var source = cursor.rows().getMetaData();
             var copy = new RowSetMetaDataImpl();
             var classes = new HashMap<Integer, String>();
@@ -644,7 +805,7 @@ final class Jdbc {
                 String name = method.getName();
                 if (name.equals("isClosed")) return closed;
                 if (name.equals("close")) { close(); return null; }
-                if (closed) throw new SQLException("Result set is closed", "24000");
+                if (closed) throw new SQLException(sentence("Result set is closed"), "24000");
                 return switch (name) {
                     case "getStatement" -> owner.proxy;
                     case "getMetaData" -> metadata;
@@ -654,6 +815,7 @@ final class Jdbc {
                     case "next" -> {
                         if (cursor.ended()) yield false;
                         try {
+                            if (maxRows > 0 && row >= maxRows) { cursor.close(); ended(); yield false; }
                             boolean next = cursor.next();
                             if (next) row++; else ended();
                             yield next;
@@ -665,7 +827,7 @@ final class Jdbc {
                     case "isAfterLast" -> row > 0 && cursor.ended();
                     default -> {
                         checkResultOperation(name);
-                        if (cursor.ended()) throw new SQLException("Result set has no current row", "24000");
+                        if (cursor.ended()) throw new SQLException(sentence("Result set has no current row"), "24000");
                         try {
                             execution.check();
                             Object value;
@@ -726,7 +888,7 @@ final class Jdbc {
                     default -> throw new IllegalArgumentException("Unsupported view type " + type);
                 };
             } catch (NumberFormatException | ArithmeticException e) {
-                throw new SQLException("Invalid " + type + " value '" + value + "' in column " + metadata.getColumnLabel(column), "22018", e);
+                throw new SQLException(sentence("Invalid " + type + " value '" + value + "' in column " + metadata.getColumnLabel(column)), "22018", e);
             }
         }
         private static long integral(Object value) {
@@ -781,7 +943,7 @@ final class Jdbc {
         }
     }
     private static int nonnegative(int value, String name) throws SQLException {
-        if (value < 0) throw new SQLException("Negative " + name); return value;
+        if (value < 0) throw new SQLException(sentence("Negative " + name)); return value;
     }
     private static SQLException append(SQLException failure, SQLException next) {
         if (failure == null) return next; failure.addSuppressed(next); return failure;

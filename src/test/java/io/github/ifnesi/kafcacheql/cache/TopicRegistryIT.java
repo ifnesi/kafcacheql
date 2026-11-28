@@ -1,10 +1,11 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import static io.github.ifnesi.kafcacheql.cache.CacheStoreTest.query;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
@@ -413,6 +414,7 @@ class TopicRegistryIT {
 
     private Process child(CacheStore cache, String topic) throws Exception {
         return new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"),
                 "-cp", System.getProperty("java.class.path"), TopicRegistrationProcess.class.getName(),
                 cache.path().toString(), lease.clients().clusterId(), topic, TestStack.BOOTSTRAP)
                 .redirectError(ProcessBuilder.Redirect.INHERIT).start();

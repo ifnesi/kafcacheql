@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.schema;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -239,7 +241,7 @@ public final class RecordDecoder implements AutoCloseable {
                  KafkaProtobufDeserializer<Message> protobufKey = keyProtobuf) {
                 // Close the deserializers before their shared client, preserving suppressed failures.
             } catch (SQLException | RuntimeException e) {
-                throw new SQLException(Secrets.redact("Closing decoder: " + e.getMessage(), properties),
+                throw new SQLException(sentence(Secrets.redact("Closing decoder: " + io.github.ifnesi.kafcacheql.config.ConfigErrors.detail(e), properties)),
                         "08001", Secrets.sanitize(e, properties));
             }
             return null;

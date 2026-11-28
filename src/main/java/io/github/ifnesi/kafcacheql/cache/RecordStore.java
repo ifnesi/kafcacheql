@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
@@ -116,7 +118,7 @@ public final class RecordStore {
                 json.writeEndObject();
             } while (iterator.hasNext());
             json.writeEndArray();
-        } catch (IOException e) { throw new SQLException("Encoding Kafka headers", e); }
+        } catch (IOException e) { throw new SQLException(sentence("Encoding Kafka headers"), e); }
         return text.toString();
     }
 }

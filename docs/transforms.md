@@ -266,14 +266,14 @@ SELECT _partition, _offset, _decode_error FROM "customer-events" WHERE _decode_e
 - **Keep data out of logs and messages.** Do not log record contents or put them in exception messages.
 - **Don't keep the record.** Do not store the record, or its maps and lists, after `apply` returns.
 - **Test it like any Java class.** `Record` has a public constructor, so a unit test can call `apply`
-  directly:
+  directly, as below.
 
-  ```java
-  var record = new RecordTransform.Record("customer-events", 0, 42L, 1_700_000_000_000L, null, null,
-          "c01", new HashMap<>(Map.of("notes", "card 4111111111111111")), new ArrayList<>());
-  var result = new CustomerPrivacy().apply(record);
-  assertEquals("card [card removed]", ((Map<?, ?>) result.value()).get("notes"));
-  ```
+```java
+var record = new RecordTransform.Record("customer-events", 0, 42L, 1_700_000_000_000L, null, null,
+        "c01", new HashMap<>(Map.of("notes", "card 4111111111111111")), new ArrayList<>());
+var result = new CustomerPrivacy().apply(record);
+assertEquals("card [card removed]", ((Map<?, ?>) result.value()).get("notes"));
+```
 
 ### Build and load the class
 

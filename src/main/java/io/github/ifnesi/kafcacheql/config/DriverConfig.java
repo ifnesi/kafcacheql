@@ -319,8 +319,7 @@ public record DriverConfig(
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             props.load(reader);
         } catch (IOException e) {
-            throw ConfigErrors.problem("config.file " + file + " can't be read: " + e.getClass().getSimpleName()
-                    + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+            throw ConfigErrors.problem("config.file " + ConfigErrors.detail(e), e);
         } catch (IllegalArgumentException e) {
             // Properties.load: a malformed unicode escape. Its message quotes nothing from the file.
             throw ConfigErrors.problem("config.file " + file + " isn't a valid properties file: " + e.getMessage());

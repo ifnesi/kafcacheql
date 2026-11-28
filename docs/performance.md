@@ -74,7 +74,7 @@ other machines or remote clusters will differ.
 To repeat these scenarios on your machine, run the two measurements below. The first compares full topics and
 query windows; the second compares one and four consumers.
 
-With the [quick start](../README.md#quick-start)'s stack running, from the repository root:
+With the [quick start](../README.md#quick-start)'s stack running, from the repository's top folder, `kafcacheql`:
 
 ```sh
 mvn test-compile failsafe:integration-test failsafe:verify \

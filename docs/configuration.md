@@ -93,7 +93,9 @@ must be decoded with the schema it names.
 
 Kafka's SASL mechanisms PLAIN and SCRAM, and TLS, are meant to work as in any Kafka client. Tested so far:
 SASL/PLAIN, and Confluent Cloud over SASL_SSL with a Schema Registry API key, as in the example above. OAuth
-is not yet supported: neither Kafka's `OAUTHBEARER` nor Schema Registry's bearer tokens (`bearer.auth.*`).
+is not supported: neither Kafka's `OAUTHBEARER` nor Schema Registry's bearer tokens (`bearer.auth.*`).
+Kafka's own JVM system properties (`-Dorg.apache.kafka.*`), such as login-module restrictions, aren't read by
+the driver; Kafka's built-in defaults still apply.
 Third-party Kafka extensions built against Kafka's own classes, such as AWS MSK IAM, are not supported: the
 driver's copy of Kafka is relocated inside its JAR, where such extensions can't load.
 
@@ -159,8 +161,8 @@ credentials.
 [Record transforms](transforms.md) can remove or mask chosen fields before they are cached. Configure them
 before querying sensitive topics; they do not erase earlier copies or replace Kafka's access controls.
 
-`topics.include` and `topics.exclude` only filter navigator listings. They do not prevent queries or erase
-excluded topics from the cache.
+`topics.include` and `topics.exclude` filter navigator listings, `SHOW TABLES` and the topics `SYNC` reaches.
+They do not prevent queries or erase excluded topics from the cache.
 
 ## Per-topic settings
 

@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.driver;
 
+import static io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertJdbcThrows;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 import io.confluent.kafka.schemaregistry.client.rest.RestService;
@@ -91,6 +93,259 @@ class JdbcIT {
         var result = new ArrayList<Integer>();
         while (rows.next()) result.add(rows.getInt(1));
         return result;
+    }
+
+    /** PLAN §8.7: SHOW uses getTables and dbstat; DESCRIBE uses getColumns, finding unknown online names
+     * through the shared topic list. Uncached statistics are NULL; offline lists cached topics only.
+     */
+    @Test void cacheStatementsShowAndDescribeOnlineAndOffline() throws Exception {
+        String cached = topic("delete"), uncached = topic("compact");
+        send(cached, 1, null);
+        var p = settings(); p.setProperty("topics.include", cached + "|" + uncached);
+        // §12.3: client info is a read-only allowlist, including when credentials came from a file or URL.
+        Path credentials = dir.resolve("credentials.properties");
+        java.nio.file.Files.writeString(credentials, "ssl.keystore.password=file-secret\n");
+        p.setProperty("config.file", credentials.toString());
+        String privateUrl = URL + "?schema.registry.basic.auth.user.info=url-user%3Aurl-secret";
+        try (var info = DriverManager.getConnection(privateUrl, p)) { assertClientInfo(info, p, false); }
+
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement(); var clients = KafkaClients.acquire(DriverConfig.load(URL, p)); var control = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            Field adminField = KafkaClients.class.getDeclaredField("admin"); adminField.setAccessible(true);
+            Admin original = (Admin) adminField.get(clients.clients()); var calls = new ArrayList<String>();
+            adminField.set(clients.clients(), Proxy.newProxyInstance(Admin.class.getClassLoader(), new Class<?>[]{Admin.class}, (self, method, args) -> {
+                calls.add(method.getName());
+                try { return method.invoke(original, args); } catch (InvocationTargetException e) { throw e.getCause(); }
+            }));
+            // §8.7: an online DESCRIBE also finds an uncached topic before any listing.
+            try (var r = s.executeQuery("DESCRIBE " + StorageDdl.quote(uncached))) {
+                var names = new ArrayList<String>(); while (r.next()) names.add(r.getString("column_name"));
+                assertTrue(names.containsAll(List.of("_partition", "_offset", "_headers"))); assertFalse(names.contains("n"));
+            }
+            assertEquals(List.of("listTopics"), calls); calls.clear();
+            try (var r = s.executeQuery("SHOW TABLES")) {
+                int count = 0;
+                while (r.next()) { count++; assertNull(r.getObject("mode")); assertNull(r.getObject("partitions"));
+                    assertNull(r.getObject("cached_rows")); assertNull(r.getObject("cached_bytes")); }
+                assertEquals(2, count);
+            }
+            assertEquals(List.of("listTopics"), calls); calls.clear();
+            try (var r = s.executeQuery("DESCRIBE " + StorageDdl.quote(uncached))) {
+                var names = new ArrayList<String>(); while (r.next()) names.add(r.getString("column_name"));
+                assertTrue(names.containsAll(List.of("_partition", "_offset", "_headers"))); assertFalse(names.contains("n"));
+            }
+            assertTrue(calls.isEmpty(), "a listed DESCRIBE needs no Kafka call");
+            assertJdbcThrows(SQLException.class, () -> s.executeQuery("DESCRIBE no_such_topic"));
+            assertEquals(List.of("listTopics"), calls); calls.clear();
+            try (var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(cached))) { assertEquals(List.of(1), values(r)); }
+            try (var r = s.executeQuery("SHOW TABLES")) {
+                while (r.next()) if (r.getString(1).equals(cached)) {
+                    assertEquals("append", r.getString("mode")); assertEquals(1, r.getInt("partitions"));
+                    assertEquals(1, r.getLong("cached_rows")); assertTrue(r.getLong("cached_bytes") > 0);
+                }
+            }
+            try (var r = s.executeQuery("DESCRIBE " + StorageDdl.quote(cached))) {
+                boolean found = false; while (r.next()) if (r.getString(1).equals("n")) { found = true; assertEquals("BIGINT", r.getString(2)); }
+                assertTrue(found);
+            }
+            s.setMaxRows(1);
+            try (var r = s.executeQuery("SHOW TABLES")) { assertTrue(r.next()); assertFalse(r.next(), "maxRows also applies to cache statement results"); }
+            s.setMaxRows(0);
+            adminField.set(clients.clients(), original);
+            // §12.3: cancel also covers SHOW's potentially long SQLite row/page counting.
+            var counting = new CountDownLatch(1); var release = new CountDownLatch(1);
+            Connection reader = control.read(physical -> {
+                Function.create(physical, "count", new Function.Aggregate() {
+                    @Override protected void xStep() {}
+                    @Override protected void xFinal() throws SQLException { counting.countDown(); await(release); result(1); }
+                }, 0);
+                return physical;
+            });
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var pending = executor.submit(() -> { try (var r = s.executeQuery("SHOW TABLES")) { while (r.next()) {} } return null; });
+                try {
+                    assertTrue(counting.await(10, TimeUnit.SECONDS)); s.cancel(); release.countDown();
+                    var failure = assertJdbcThrows(ExecutionException.class, () -> pending.get(10, TimeUnit.SECONDS));
+                    assertEquals("57014", ((SQLException) failure.getCause()).getSQLState());
+                } finally { release.countDown(); if (!reader.isClosed()) Function.destroy(reader, "count"); }
+            }
+        }
+        p.setProperty("offline", "true");
+        try (var c = DriverManager.getConnection("jdbc:kafcacheql://", p); var s = c.createStatement()) {
+            assertClientInfo(c, p, true);
+            assertTrue(s.execute("SHOW TABLES"));
+            try (var r = s.getResultSet()) { assertTrue(r.next()); assertEquals(cached, r.getString(1)); assertFalse(r.next()); }
+            try (var r = s.executeQuery("DESCRIBE " + StorageDdl.quote(cached))) { assertTrue(r.next()); }
+            assertJdbcThrows(SQLException.class, () -> s.executeQuery("DESCRIBE " + StorageDdl.quote(uncached)));
+        }
+    }
+
+    private static void assertClientInfo(Connection connection, Properties settings, boolean offline) throws Exception {
+        var expected = new Properties();
+        expected.setProperty("cache.path", Path.of(settings.getProperty("cache.path")).toRealPath().toString());
+        expected.setProperty("bootstrap.servers", offline ? "" : TestStack.BOOTSTRAP);
+        expected.setProperty("offline", Boolean.toString(offline));
+        assertEquals(expected, connection.getClientInfo());
+        for (String key : expected.stringPropertyNames()) assertEquals(expected.getProperty(key), connection.getClientInfo(key));
+        assertNull(connection.getClientInfo("ssl.keystore.password"));
+        assertNull(connection.getClientInfo("schema.registry.basic.auth.user.info"));
+        // Existing setClientInfo behavior is SQLClientInfoException; neither overload may change anything.
+        assertJdbcThrows(SQLClientInfoException.class, () -> connection.setClientInfo("cache.path", "changed"));
+        assertJdbcThrows(SQLClientInfoException.class, () -> connection.setClientInfo(new Properties()));
+        Properties returned = connection.getClientInfo(); returned.setProperty("offline", "changed");
+        assertEquals(expected, connection.getClientInfo());
+    }
+
+    /** PLAN §8.7: DROP commits a cache-only generation-guarded deletion, warns, refetches online,
+     * works offline, and an in-flight query replans against its retained deleted generation.
+     */
+    @Test void cacheDropCommitsAndAnInFlightQueryReplans() throws Exception {
+        String topic = TestStack.uniqueTopic("jdbc.names.part-x"), never = topic("delete"), table = StorageDdl.quote(topic);
+        TestStack.createTopic(topic, 1, Map.of("cleanup.policy", "delete"));
+        send(topic, 0, null); var p = settings();
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
+            assertJdbcThrows(SQLException.class, () -> s.executeUpdate("DROP TABLE " + StorageDdl.quote(never)));
+            assertEquals(0, s.executeUpdate("DROP TABLE IF EXISTS " + StorageDdl.quote(never)));
+            try (var r = s.executeQuery("SELECT n FROM " + table)) { assertEquals(List.of(0), values(r)); }
+            // §8.7: quoted names mean exactly what they mean in SELECT, including dots.
+            for (String quoted : List.of(table, "`" + topic + "`", "[" + topic + "]", "main." + table)) {
+                try (var r = s.executeQuery("DESCRIBE " + quoted)) {
+                    boolean found = false; while (r.next()) found |= r.getString(1).equals("n"); assertTrue(found, quoted);
+                }
+            }
+            send(topic, 1, null);
+            Process child = cacheStatementProcess(p, topic, "query");
+            try (var output = child.inputReader()) {
+                assertEquals("BUFFERED", output.readLine());
+                assertFalse(s.execute("DROP TABLE " + table)); assertEquals(0, s.getUpdateCount()); assertNull(s.getResultSet());
+                assertTrue(s.getWarnings().getMessage().contains("Kafka"));
+                try (var r = s.executeQuery("SELECT deleted_ms FROM \"$topics\" WHERE topic='" + topic + "'")) { assertTrue(r.next()); assertNotNull(r.getObject(1)); }
+                assertTrue(TestStack.admin().listTopics().names().get().contains(topic));
+                child.getOutputStream().write('\n'); child.getOutputStream().flush();
+                assertTrue(child.waitFor(20, TimeUnit.SECONDS)); assertEquals(0, child.exitValue());
+                assertTrue(output.readLine().contains("RESULT"));
+            } finally { child.destroyForcibly(); }
+            try (var r = s.executeQuery("SELECT n FROM " + table + " ORDER BY n")) { assertEquals(List.of(0, 1), values(r)); }
+            for (String quoted : List.of("`" + topic + "`", "[" + topic + "]", "main." + table)) {
+                assertEquals(0, s.executeUpdate("DROP TABLE " + quoted));
+                try (var r = s.executeQuery("SELECT n FROM " + table + " ORDER BY n")) { assertEquals(List.of(0, 1), values(r)); }
+            }
+        }
+        p.setProperty("offline", "true");
+        try (var c = DriverManager.getConnection("jdbc:kafcacheql://", p); var s = c.createStatement()) {
+            assertEquals(0, s.executeUpdate("DROP TABLE " + table));
+            assertEquals(0, s.executeLargeUpdate("DROP TABLE IF EXISTS " + table));
+            assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT * FROM " + table));
+        }
+        p.setProperty("offline", "false");
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement(); var r = s.executeQuery("SELECT n FROM " + table + " ORDER BY n")) {
+            assertEquals(List.of(0, 1), values(r));
+        }
+    }
+
+    /** PLAN §8.7: SYNC is uncapped, starts at the newest cached range (leaving old gaps),
+     * reads uncached/compacted topics to end, validates every pattern before fetching, and fails offline.
+     */
+    @Test void cacheSyncIsUncappedAndLeavesOlderGaps() throws Exception {
+        String a = topic("delete"), b = topic("delete"), compact = topic("compact");
+        for (String topic : List.of(a, b, compact)) for (int i = 0; i < 8; i++) send(topic, i, System.currentTimeMillis() - 7_200_000);
+        var p = settings(); p.setProperty("topics.include", a + "|" + b + "|" + compact);
+        p.setProperty("append.default.window", "1h"); p.setProperty("append.default.window.max.records", "1");
+        var fetched = new CopyOnWriteArrayList<String>();
+        try (var c = DriverManager.getConnection(URL, p); var control = CacheContext.acquire(DriverConfig.load(URL, p)); var s = c.createStatement()) {
+            control.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) {
+                batch.records().forEach(r -> fetched.add(batch.plan().topic().name() + ":" + r.offset()));
+            }});
+            try (var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(a) + " WHERE _offset>=3 AND _offset<5")) { assertEquals(List.of(3, 4), values(r)); }
+            fetched.clear();
+            assertJdbcThrows(SQLException.class, () -> s.executeQuery("SYNC " + b + ", no-such-pattern-??")); assertTrue(fetched.isEmpty());
+            try (var r = s.executeQuery("SYNC " + a + ", \"" + b + "\", " + compact)) {
+                var counts = new HashMap<String, Long>(); while (r.next()) counts.put(r.getString("table_name"), r.getLong("fetched_records"));
+                assertEquals(Map.of(a, 3L, b, 8L, compact, 8L), counts);
+            }
+            assertEquals(19, fetched.size()); assertFalse(fetched.contains(a + ":0")); assertFalse(fetched.contains(a + ":1"));
+            assertFalse(fetched.contains(a + ":2"));
+            fetched.clear();
+            try (var r = s.executeQuery("SYNC")) { int n = 0; while (r.next()) { n++; assertEquals(0, r.getLong(2)); } assertEquals(3, n); }
+            for (String pattern : List.of("jdbc-*", "*")) try (var r = s.executeQuery("SYNC " + pattern)) {
+                int n = 0; while (r.next()) { n++; assertEquals(0, r.getLong(2)); } assertEquals(3, n);
+            }
+            try (var r = s.executeQuery("SYNC " + a.substring(0, a.length() - 1) + "?")) {
+                assertTrue(r.next()); assertEquals(a, r.getString(1)); assertEquals(0, r.getLong(2)); assertFalse(r.next());
+            }
+            assertTrue(fetched.isEmpty());
+            // §8.1/§8.7: statements outside the supported grammar are syntax errors, not unsupported JDBC APIs.
+            for (String bad : List.of("SYNC x; SELECT 1", "SYNC x,", "DROP VIEW x", "DROP TABLE x CASCADE", "SHOW FULL TABLES", "DELETE FROM x", "SELECT 1; SELECT 2")) {
+                var rejected = assertJdbcThrows(SQLException.class, () -> s.execute(bad), bad);
+                assertEquals("42000", rejected.getSQLState(), bad);
+                assertFalse(rejected instanceof SQLFeatureNotSupportedException, bad);
+            }
+            assertJdbcThrows(SQLFeatureNotSupportedException.class, () -> s.executeUpdate("SHOW TABLES"));
+            assertJdbcThrows(SQLException.class, () -> s.executeQuery("DROP TABLE " + StorageDdl.quote(b)));
+        }
+        p.setProperty("offline", "true");
+        try (var c = DriverManager.getConnection("jdbc:kafcacheql://", p); var s = c.createStatement()) {
+            assertJdbcThrows(SQLException.class, () -> s.executeQuery("SYNC"));
+        }
+    }
+
+    /** PLAN §8.7: the process lock rejects overlapping SYNC immediately, queries do not take it,
+     * a killed process releases it, and the same JVM cannot overlap either; cancellation keeps batches.
+     */
+    @Test void cacheSyncLockIsExclusiveAndReleasedByDeathAndCancel() throws Exception {
+        String topic = topic("delete"), ready = topic("delete");
+        for (int i = 0; i < 10; i++) send(topic, i, null); send(ready, 42, null);
+        var p = settings();
+        try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement(); var control = CacheContext.acquire(DriverConfig.load(URL, p))) {
+            try (var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(ready))) { assertEquals(List.of(42), values(r)); }
+            Process child = cacheStatementProcess(p, topic, "sync");
+            try (var output = child.inputReader()) {
+                assertEquals("BUFFERED", output.readLine());
+                long start = System.nanoTime();
+                assertTrue(assertJdbcThrows(SQLException.class, () -> s.executeQuery("SYNC " + topic)).getMessage().contains("another SYNC"));
+                assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(3));
+                s.setQueryTimeout(2);
+                try (var r = s.executeQuery("SELECT n FROM " + StorageDdl.quote(ready))) { assertEquals(List.of(42), values(r)); }
+            } finally { child.destroyForcibly(); assertTrue(child.waitFor(10, TimeUnit.SECONDS)); }
+            s.setQueryTimeout(0);
+            var held = new CountDownLatch(1); var release = new CountDownLatch(1);
+            control.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) throws SQLException {
+                held.countDown(); await(release);
+            }});
+            try (var executor = Executors.newSingleThreadExecutor(); var sync = c.createStatement()) {
+                var active = executor.submit(() -> { try (var r = sync.executeQuery("SYNC " + topic)) { while (r.next()) {} } return null; });
+                try {
+                    assertTrue(held.await(10, TimeUnit.SECONDS));
+                    assertSyncRefusedInAnotherProcess(p, topic);
+                    var rejected = assertJdbcThrows(SQLException.class, () -> s.executeQuery("SYNC " + topic));
+                    assertEquals("55006", rejected.getSQLState()); assertTrue(rejected.getMessage().contains("another SYNC"));
+                    assertFalse(active.isDone(), "the original holder is still running");
+                    // §8.7: rejecting the second party must not release the holder's OS lock for a third party.
+                    assertSyncRefusedInAnotherProcess(p, topic);
+                    assertFalse(active.isDone(), "the holder remains paused throughout the interleaving");
+                    sync.cancel(); release.countDown();
+                    var failure = assertJdbcThrows(ExecutionException.class, () -> active.get(10, TimeUnit.SECONDS));
+                    assertEquals("57014", ((SQLException) failure.getCause()).getSQLState());
+                } finally { release.countDown(); control.hooks(new SyncWorker.Hooks() {}); }
+            }
+            try (var r = s.executeQuery("SYNC " + topic)) { assertTrue(r.next()); assertTrue(r.getLong(2) < 10); }
+            assertTrue(java.nio.file.Files.exists(Path.of(p.getProperty("cache.path") + ".sync.lock")));
+        }
+    }
+
+    private static void assertSyncRefusedInAnotherProcess(Properties p, String topic) throws Exception {
+        Process child = cacheStatementProcess(p, topic, "try-sync");
+        try {
+            assertTrue(child.waitFor(10, TimeUnit.SECONDS), "a competing SYNC fails immediately");
+            assertEquals(0, child.exitValue());
+            assertEquals("REFUSED 55006", child.inputReader().readLine());
+        } finally { child.destroyForcibly(); }
+    }
+
+    private static Process cacheStatementProcess(Properties p, String topic, String mode) throws Exception {
+        return new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
+                System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sql.PipelineProcess.class.getName(),
+                p.getProperty("cache.path"), topic, mode).redirectError(ProcessBuilder.Redirect.INHERIT).start();
     }
 
     /** PLAN §7.1: headers preserve order/duplicates, with strict UTF-8 text or base64, including masked text.
@@ -257,6 +512,10 @@ class JdbcIT {
                 assertTrue(r.next()); assertEquals("later", JacksonMapper.INSTANCE.readTree(r.getString(1)).get("action").asText());
                 assertNull(r.getString(2)); assertFalse(r.next());
             }
+            // SYNC uses the same transform path; fetched_records counts even a record the hook skips.
+            TestStack.sendString(a, null, "{\"action\":\"skip\"}", null);
+            try (var r = s.executeQuery("SYNC " + a)) { assertTrue(r.next()); assertEquals(1, r.getLong("fetched_records")); assertFalse(r.next()); }
+            try (var r = s.executeQuery("SELECT count(*) FROM " + StorageDdl.quote(a) + " WHERE _offset=8")) { assertTrue(r.next()); assertEquals(0, r.getInt(1)); }
             // PLAN §7.4: internal failures contain no payload, and original tombstones still delete state.
             assertAll(
                     () -> {
@@ -333,12 +592,12 @@ class JdbcIT {
         String topic = topic("compact"), table = StorageDdl.quote(topic);
         TestStack.send(topic, 0, null, "pii-key".getBytes(), "{\"email\":\"private-email\"}".getBytes(), new RecordHeaders());
         var p = settings(); p.setProperty("topic." + topic + ".mask", "_key,email");
-        assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, p)).getMessage().contains("mask.secret"));
+        assertTrue(assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection(URL, p)).getMessage().contains("mask.secret"));
         p.setProperty("mask.secret", "first-secret"); p.setProperty("topic." + topic + ".transform", "missing.Transform");
-        assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, p)).getMessage().contains("missing.Transform"));
+        assertTrue(assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection(URL, p)).getMessage().contains("missing.Transform"));
         p.setProperty("topic." + topic + ".transform", VersionErrorTransform.class.getName());
-        var versionError = assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, p));
-        assertEquals("Configuring record transform for " + topic + ": version failure [hidden]", versionError.getMessage());
+        var versionError = assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection(URL, p));
+        assertEquals("Configuring record transform for " + topic + ": version failure [hidden].", versionError.getMessage());
         assertNotNull(versionError.getCause());
         assertFalse(versionError.getCause().getMessage().contains("first-secret"));
         p.setProperty("topic." + topic + ".transform", PrivacyTransform.class.getName());
@@ -347,11 +606,11 @@ class JdbcIT {
             try (var r = s.executeQuery("SELECT email FROM " + table)) { assertTrue(r.next()); first = r.getString(1); }
             try (var r = s.executeQuery("SELECT id FROM \"$topics\"")) { assertTrue(r.next()); generation = r.getLong(1); }
             var other = (Properties) p.clone(); other.setProperty("mask.secret", "second-secret");
-            assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, other)).getMessage().contains("different record transform"));
+            assertTrue(assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection(URL, other)).getMessage().contains("different record transform"));
         }
         p.setProperty("mask.secret", "second-secret"); p.setProperty("offline", "true");
         byte[] before = java.nio.file.Files.readAllBytes(Path.of(p.getProperty("cache.path")));
-        assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection("jdbc:kafcacheql://", p)).getMessage().contains("record transform settings"));
+        assertTrue(assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection("jdbc:kafcacheql://", p)).getMessage().contains("record transform settings"));
         assertArrayEquals(before, java.nio.file.Files.readAllBytes(Path.of(p.getProperty("cache.path"))));
         p.setProperty("offline", "false");
         try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
@@ -387,11 +646,12 @@ class JdbcIT {
             // Kafka requires an explicit API timeout to be at least its request timeout.
             if (timeout == 5_000) p.setProperty("request.timeout.ms", "1000");
             long start = System.nanoTime();
-            SQLException error = assertThrows(SQLException.class, () -> DriverManager.getConnection("jdbc:kafcacheql://" + brokers, p));
+            SQLException error = assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection("jdbc:kafcacheql://" + brokers, p));
             long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
             System.out.println("Opening timeout " + timeout + " ms: failed after " + elapsed + " ms: " + error.getMessage());
             assertAll(
                     () -> assertEquals("08006", error.getSQLState()),
+                    () -> assertEquals("Can't reach Kafka at " + brokers + ": timed out after " + timeout / 1000 + " s.", error.getMessage()),
                     () -> assertTrue(error.getMessage().contains(brokers), error.getMessage()),
                     () -> assertTrue(elapsed >= timeout - 1000 && elapsed < timeout + 4000,
                             "opening took " + elapsed + " ms, expected about " + timeout + " ms"));
@@ -456,7 +716,7 @@ class JdbcIT {
                         TestStack.await(() -> consumerBeans(topic).size() == 4, "four consumers for six waiting partitions");
                         if (cancel) {
                             s.cancel();
-                            var failure = assertThrows(java.util.concurrent.ExecutionException.class, () -> querying.get(2, TimeUnit.SECONDS));
+                            var failure = assertJdbcThrows(java.util.concurrent.ExecutionException.class, () -> querying.get(2, TimeUnit.SECONDS));
                             assertInstanceOf(SQLException.class, failure.getCause());
                             assertEquals("57014", ((SQLException) failure.getCause()).getSQLState());
                         }
@@ -605,7 +865,7 @@ class JdbcIT {
         try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
              var cache = CacheContext.acquire(DriverConfig.load(URL, p))) {
             cache.hooks(new SyncWorker.Hooks() { @Override public void afterCommit(SyncBatch batch) throws SQLException { s.cancel(); } });
-            assertEquals("57014", assertThrows(SQLException.class, () -> s.executeQuery(cachedWindow)).getSQLState());
+            assertEquals("57014", assertJdbcThrows(SQLException.class, () -> s.executeQuery(cachedWindow)).getSQLState());
             assertEquals(2, cachedCount(cache, a)); assertTrue(usedBytes(cache) > 1);
         }
         try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement();
@@ -647,7 +907,7 @@ class JdbcIT {
                 assertEquals(23, values(r).size(), "age expiry also waits for the query snapshot");
             }
             var different = new Properties(); different.putAll(p); different.setProperty("cache.retention.hours", "2");
-            assertTrue(assertThrows(SQLException.class, () -> DriverManager.getConnection(URL, different))
+            assertTrue(assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection(URL, different))
                     .getMessage().contains("cache.retention.hours"));
             assertEquals(0, fetched.get(), "age expiry runs even when a query fetches no new records");
             TestStack.await(() -> {
@@ -803,7 +1063,8 @@ class JdbcIT {
                 } finally { admin.set(clients.clients(), original); }
                 assertFalse(control.<Boolean>read(r -> TopicRegistry.observe(r, gone).orElseThrow().deleted()));
                 TestStack.createTopic(race, 1, Map.of()); send(race, 9, null);
-                Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+                Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                        "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                         System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sql.PipelineProcess.class.getName(),
                         control.path().toString(), race, "jdbc").redirectError(ProcessBuilder.Redirect.INHERIT).start();
                 try {
@@ -839,7 +1100,8 @@ class JdbcIT {
             try (var rows = c.getMetaData().getColumns(null, null, gone, null)) { assertFalse(rows.next()); }
             try (var s = c.createStatement(); var rows = s.executeQuery("SELECT n FROM " + StorageDdl.quote(race))) { assertEquals(List.of(9), values(rows)); }
             TestStack.deleteTopic(race);
-            Process holder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+            Process holder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                     System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sync.SyncProcess.class.getName(),
                     "lock", control.path().toString(), race, TestStack.BOOTSTRAP)
                     .redirectError(ProcessBuilder.Redirect.INHERIT).start();
@@ -1522,7 +1784,7 @@ class JdbcIT {
                         assertTrue(rows.next()); String textValue = field.equals("flag") ? "unknown" : "N/A";
                         assertEquals(type.getName(), rows.getMetaData().getColumnClassName(1));
                         assertEquals(textValue, rows.getString(1)); assertEquals(textValue, rows.getString(field));
-                        SQLException invalid = assertThrows(SQLException.class, () -> getter.accept(rows));
+                        SQLException invalid = assertJdbcThrows(SQLException.class, () -> getter.accept(rows));
                         assertEquals("22018", invalid.getSQLState());
                         assertTrue(invalid.getMessage().contains(field), invalid.getMessage());
                         assertTrue(invalid.getMessage().contains(textValue), invalid.getMessage());
@@ -1616,7 +1878,8 @@ class JdbcIT {
                             });
                         }
                         send(topic, 9, null);
-                        Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+                        Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                                "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                                 System.getProperty("java.class.path"), io.github.ifnesi.kafcacheql.sql.PipelineProcess.class.getName(),
                                 control.path().toString(), topic, "jdbc").redirectError(ProcessBuilder.Redirect.INHERIT).start();
                         try {
@@ -1681,14 +1944,14 @@ class JdbcIT {
             // S5-1 / §8.4, §11: cached timestamps cannot prove that missing offsets contain no matches.
             for (String bound : List.of("_timestamp>=" + (base + 2 * hour), "_timestamp=" + (base + 2 * hour),
                     "_timestamp>=" + (base + 100 * hour), "_timestamp>=" + (base + 4 * hour) + " AND _partition=0")) {
-                assertMissing(assertThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE " + bound)), topic, "[2..3)");
+                assertMissing(assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE " + bound)), topic, "[2..3)");
             }
-            assertMissing(assertThrows(SQLException.class, () -> s.executeQuery("SELECT a.n FROM " + table + " a JOIN " + table
+            assertMissing(assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT a.n FROM " + table + " a JOIN " + table
                     + " b ON a._partition=b._partition WHERE a._offset>=3 AND a._timestamp>=" + (base + 4 * hour)
                     + " AND b._timestamp>=" + (base + 4 * hour))), topic, "[2..3)");
             var wide = new Properties(); wide.putAll(p); wide.setProperty("append.default.window.max.records", "4");
             try (var other = DriverManager.getConnection(url, wide); var query = other.createStatement()) {
-                assertMissing(assertThrows(SQLException.class, () -> query.executeQuery("SELECT n FROM " + table)), topic, "[2..3)");
+                assertMissing(assertJdbcThrows(SQLException.class, () -> query.executeQuery("SELECT n FROM " + table)), topic, "[2..3)");
             }
             try (var rows = s.executeQuery("SELECT n FROM " + StorageDdl.quote(compact))) { assertEquals(List.of(8), values(rows)); }
             try (var tables = c.getMetaData().getTables(null, null, "%", null)) {
@@ -1696,9 +1959,9 @@ class JdbcIT {
             }
             try (var columns = c.getMetaData().getColumns(null, null, topic, "n")) { assertEquals(List.of("n"), columnNames(columns)); }
             try (var columns = c.getMetaData().getColumns(null, null, uncached, null)) { assertFalse(columns.next()); }
-            SQLException missing = assertThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=1 AND _offset<4"));
+            SQLException missing = assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=1 AND _offset<4"));
             assertMissing(missing, topic, "[2..3)");
-            SQLException beyond = assertThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=4 AND _offset<7"));
+            SQLException beyond = assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT n FROM " + table + " WHERE _offset>=4 AND _offset<7"));
             assertMissing(beyond, topic, "[5..7)");
             assertEquals(before, partitionState(control), "offline queries never advance caught_up_at_ms");
             long generation = control.read(r -> io.github.ifnesi.kafcacheql.cache.TopicRegistry.generation(r, topic).orElseThrow());
@@ -1708,7 +1971,7 @@ class JdbcIT {
                     io.github.ifnesi.kafcacheql.cache.PartitionStore.deleteChunk(writer, generation, 0, 100); return null;
                 });
             }
-            assertMissing(assertThrows(SQLException.class, () -> s.executeQuery(cached)), topic, "[0..1)");
+            assertMissing(assertJdbcThrows(SQLException.class, () -> s.executeQuery(cached)), topic, "[0..1)");
             assertEquals(0, requests.get()); assertNull(field(control, "clients"));
             assertTrue(((Set<?>) field(field(field(control, "context"), "worker"), "consumers")).isEmpty());
         } finally { registry.stop(0); }
@@ -1734,7 +1997,7 @@ class JdbcIT {
         } return state; });
     }
 
-    /** PLAN §12.3: read-only, Spring transaction compatibility, SELECT only, warnings, SQLite bindings;
+    /** PLAN §12.3: read-only, Spring transaction compatibility, SELECT/cache statements, warnings, SQLite bindings;
      * §8.3: timestamp operands are folded afresh for each execution; §7.2/0015d: schema-derived result
      * types for every mapping, while user-computed columns keep SQLite's types.
      */
@@ -1756,7 +2019,36 @@ class JdbcIT {
             try (var s = c.createStatement(); var prepared = c.prepareStatement("SELECT n FROM " + table
                     + " WHERE _timestamp>=? AND _timestamp<? AND n>=? ORDER BY _offset")) {
                 assertSame(c, s.getConnection());
-                assertThrows(SQLFeatureNotSupportedException.class, () -> s.executeUpdate("DELETE FROM " + table));
+                var rejected = assertJdbcThrows(SQLException.class, () -> s.executeUpdate("DELETE FROM " + table));
+                assertEquals("42000", rejected.getSQLState());
+                assertFalse(rejected instanceof SQLFeatureNotSupportedException);
+                var missingConfig = assertJdbcThrows(SQLException.class, () -> DriverManager.getConnection(URL + "?config.file=/nope.properties"));
+                assertEquals("config.file /nope.properties doesn't exist.", missingConfig.getMessage());
+                // §8.1/§8.7: parser failures are readable syntax errors; names stay SQL identifiers.
+                for (var bad : io.github.ifnesi.kafcacheql.testkit.SqlErrors.badInputs()) {
+                    var error = assertJdbcThrows(SQLException.class, () -> s.execute(bad.sql()), bad.sql());
+                    io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertMessage(bad, error);
+                }
+                record Syntax(String sql, int line, int column, String token, boolean hint) {}
+                for (var syntax : List.of(
+                        new Syntax("DESCRIBE shop-customer-notes;", 1, 14, "-", true),
+                        new Syntax("DROP TABLE shop-customer-notes;", 1, 16, "-", true),
+                        new Syntax("SELECT * FROM shop-customer-notes;", 1, 19, "-", true),
+                        new Syntax("SELECT *\nFROM shop-customer-notes;", 2, 10, "-", true),
+                        new Syntax("DESCRIBE .;", 1, 10, ".", true),
+                        new Syntax("DESCRIBE ;", 1, 10, ";", false))) {
+                    var error = assertJdbcThrows(SQLException.class, () -> s.execute(syntax.sql()), syntax.sql());
+                    assertEquals("42000", error.getSQLState()); assertNotNull(error.getCause());
+                    String message = error.getMessage();
+                    io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertReadable(message);
+                    assertTrue(message.contains("line " + syntax.line() + ", column " + syntax.column()), message);
+                    assertTrue(message.contains("unexpected token '" + syntax.token() + "'"), message);
+                    assertFalse(message.contains("the statement ends too early"), message);
+                    assertFalse(message.toLowerCase(java.util.Locale.ROOT).contains("jsqlparser"), message);
+                    assertFalse(message.toLowerCase(java.util.Locale.ROOT).contains("shaded"), message);
+                    String hint = "Quote names that contain '-' or '.', such as \"my-topic\".";
+                    assertEquals(syntax.hint(), message.contains(hint), message);
+                }
                 prepared.setLong(1, base + 2000); prepared.setLong(2, base + 4000); prepared.setInt(3, 2);
                 try (var r = prepared.executeQuery()) { assertEquals(List.of(2, 3), values(r)); }
                 assertEquals(List.of(2L, 3L), fetched); fetched.clear();
@@ -1798,7 +2090,7 @@ class JdbcIT {
                     int last = r.getMetaData().getColumnCount();
                     assertEquals(Types.BOOLEAN, r.getMetaData().getColumnType(last));
                 }
-                SQLException missing = assertThrows(SQLException.class, () -> s.executeQuery("SELECT status FROM " + table));
+                SQLException missing = assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT status FROM " + table));
                 assertFalse(missing.getMessage().contains("no records with a schema are cached"), "schema-backed topics keep SQLite's diagnosis");
                 assertAll(() -> valuesCte(s, table), () -> schemaTypes(s), this::withoutRegistry);
             }
@@ -1827,7 +2119,7 @@ class JdbcIT {
         String topic = topic("delete"), table = StorageDdl.quote(topic);
         Properties p = settings(); p.remove("schema.registry.url"); p.setProperty("cache.path", dir.resolve("no-registry.db").toString());
         try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
-            SQLException missing = assertThrows(SQLException.class, () -> s.executeQuery("SELECT status FROM " + table));
+            SQLException missing = assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT status FROM " + table));
             assertTrue(missing.getMessage().contains("no records with a schema are cached"), missing.getMessage());
             assertTrue(missing.getMessage().contains(topic), missing.getMessage());
             assertTrue(missing.getMessage().contains("_value ->> '$.status'"), missing.getMessage());
@@ -1858,7 +2150,7 @@ class JdbcIT {
                 assertTrue(rows.next()); assertEquals("open", rows.getString(1));
             }
             // Unrelated SQLite preparation errors must keep their own diagnosis.
-            SQLException function = assertThrows(SQLException.class, () -> s.executeQuery("SELECT absent_function(_value) FROM " + table));
+            SQLException function = assertJdbcThrows(SQLException.class, () -> s.executeQuery("SELECT absent_function(_value) FROM " + table));
             assertFalse(function.getMessage().contains("no records with a schema are cached"));
         }
     }
@@ -2036,6 +2328,20 @@ class JdbcIT {
                 // PLAN §12.2: expose KafCacheQL's product identity so tools use standard JDBC introspection.
                 assertAll(() -> assertEquals("KafCacheQL", metadata.getDatabaseProductName()),
                         () -> assertEquals(metadata.getDriverVersion(), metadata.getDatabaseProductVersion()));
+                // PLAN §12.2: product/major/minor versions are the driver's Maven project version.
+                String version = System.getProperty("projectVersion"); assertNotNull(version);
+                String[] numbers = version.split("[.-]", 3);
+                int major = Integer.parseInt(numbers[0]), minor = Integer.parseInt(numbers[1]);
+                var driver = DriverManager.getDriver(URL);
+                assertAll(
+                        () -> assertEquals(version, metadata.getDriverVersion()),
+                        () -> assertEquals(version, metadata.getDatabaseProductVersion()),
+                        () -> assertEquals(major, metadata.getDriverMajorVersion()),
+                        () -> assertEquals(minor, metadata.getDriverMinorVersion()),
+                        () -> assertEquals(major, metadata.getDatabaseMajorVersion()),
+                        () -> assertEquals(minor, metadata.getDatabaseMinorVersion()),
+                        () -> assertEquals(major, driver.getMajorVersion()),
+                        () -> assertEquals(minor, driver.getMinorVersion()));
                 // 0013d / PLAN §12.2: database versions are the driver's; unimplemented metadata
                 // returns empty results with the names and types in java.sql.DatabaseMetaData's contract.
                 assertAll(
@@ -2390,14 +2696,14 @@ class JdbcIT {
             });
             var cancelled = executor.submit(() -> { try (var r = s.executeQuery(sql)) { values(r); } return null; });
             assertTrue(committed.await(10, TimeUnit.SECONDS)); s.cancel(); release.countDown();
-            var failure = assertThrows(ExecutionException.class, () -> cancelled.get(10, TimeUnit.SECONDS));
+            var failure = assertJdbcThrows(ExecutionException.class, () -> cancelled.get(10, TimeUnit.SECONDS));
             assertInstanceOf(SQLException.class, failure.getCause()); assertEquals("57014", ((SQLException) failure.getCause()).getSQLState());
             assertEquals(List.of(0L, 1L, 2L), stored);
             try (var r = s.executeQuery(sql)) { assertEquals(30, values(r).size()); }
             assertEquals(java.util.stream.LongStream.range(0, 30).boxed().toList(), stored, "resume never refetches committed offsets");
             s.setQueryTimeout(1);
             long started = System.nanoTime();
-            assertThrows(SQLTimeoutException.class, () -> s.executeQuery("WITH RECURSIVE x(n) AS "
+            assertJdbcThrows(SQLTimeoutException.class, () -> s.executeQuery("WITH RECURSIVE x(n) AS "
                     + "(SELECT 1 UNION ALL SELECT n+1 FROM x WHERE n<1000000000) SELECT sum(n) FROM x"));
             assertTrue(System.nanoTime() - started < TimeUnit.SECONDS.toNanos(5), "SQLite is interrupted, not merely checked afterwards");
             s.setQueryTimeout(0);
@@ -2439,11 +2745,11 @@ class JdbcIT {
                 control.hooks(new SyncWorker.Hooks() {
                     @Override public void beforeCommit(SyncBatch batch) { throw new NoClassDefFoundError("demo.MissingJdbcClass"); }
                 });
-                assertThrows(NoClassDefFoundError.class, () -> s.executeQuery(sql));
+                assertJdbcThrows(NoClassDefFoundError.class, () -> s.executeQuery(sql));
                 Thread worker = (Thread) field(field(field(control, "context"), "worker"), "thread");
                 worker.join(10_000); assertFalse(worker.isAlive());
                 for (String next : List.of(sql, "SELECT n FROM " + StorageDdl.quote(topic) + " WHERE _offset<30", "SELECT 1")) {
-                    SQLException error = assertThrows(SQLException.class, () -> s.executeQuery(next));
+                    SQLException error = assertJdbcThrows(SQLException.class, () -> s.executeQuery(next));
                     assertTrue(error.getMessage().contains("demo.MissingJdbcClass"), error.toString());
                     assertNotNull(error.getCause());
                     assertTrue(error.getCause().toString().contains("demo.MissingJdbcClass"), error.getCause().toString());

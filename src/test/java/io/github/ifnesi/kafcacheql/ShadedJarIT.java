@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -35,7 +36,7 @@ class ShadedJarIT {
 
     /** Libraries relocated under PREFIX. */
     private static final List<String> RELOCATED = List.of(
-            "org/apache/kafka/", "io/confluent/", "org/apache/avro/", "com/fasterxml/jackson/",
+            "org/jline/", "org/apache/kafka/", "io/confluent/", "org/apache/avro/", "com/fasterxml/jackson/",
             "net/sf/jsqlparser/", "com/google/", "org/apache/commons/", "org/apache/hc/",
             "com/squareup/", "com/palantir/javapoet/", "okio/",
             "org/yaml/snakeyaml/", "io/swagger/", "com/eclipsesource/json/",
@@ -48,7 +49,7 @@ class ShadedJarIT {
      */
     private static final List<String> KEPT = List.of(
             "io/github/ifnesi/kafcacheql/", "org/sqlite/", "com/github/luben/zstd/", "org/xerial/snappy/",
-            "net/jpountz/", "org/slf4j/");
+            "net/jpountz/", "org/slf4j/", "org/jline/nativ/");
 
     private static Path jar;
 
@@ -126,15 +127,18 @@ class ShadedJarIT {
         try (JarFile file = new JarFile(jar.toFile())) {
             for (JarEntry entry : file.stream().toList()) {
                 String name = entry.getName();
-                if (!name.startsWith("META-INF/services/") || entry.isDirectory()) {
+                boolean jlineProvider = name.startsWith("META-INF/jline/providers/");
+                if ((!name.startsWith("META-INF/services/") && !jlineProvider) || entry.isDirectory()) {
                     continue;
                 }
-                List<String> lines = new ArrayList<>(List.of(name.substring("META-INF/services/".length())));
+                List<String> lines = new ArrayList<>();
+                if (!jlineProvider) lines.add(name.substring("META-INF/services/".length()));
                 try (InputStream in = file.getInputStream(entry)) {
                     lines.addAll(new String(in.readAllBytes(), StandardCharsets.UTF_8).lines().toList());
                 }
                 for (String line : lines) {
                     String cls = line.replaceAll("#.*", "").trim().replace('.', '/');
+                    if (jlineProvider && !cls.isEmpty()) assertNotNull(file.getJarEntry(cls + ".class"), name + ": " + line);
                     if (RELOCATED.stream().anyMatch(cls::startsWith)) {
                         strays.add(name + ": " + line);
                     }
@@ -147,6 +151,8 @@ class ShadedJarIT {
     @Test
     void onlyKafCacheQLIsAdvertisedAsADriver() throws IOException {
         try (JarFile file = new JarFile(jar.toFile())) {
+            assertNull(file.getJarEntry("META-INF/services/org.slf4j.spi.SLF4JServiceProvider"),
+                    "the CLI provider is explicit; libraries keep the host provider");
             JarEntry entry = file.getJarEntry("META-INF/services/java.sql.Driver");
             assertNotNull(entry, "META-INF/services/java.sql.Driver");
             try (InputStream in = file.getInputStream(entry)) {
@@ -163,6 +169,10 @@ class ShadedJarIT {
     @Test
     void nativePlatformsAreExactlyTheSupportedSubset() throws IOException {
         Set<String> expected = Set.of(
+                "org/jline/nativ/Linux/x86_64", "org/jline/nativ/Linux/arm64",
+                "org/jline/nativ/Linux-musl/x86_64", "org/jline/nativ/Linux-musl/arm64",
+                "org/jline/nativ/Mac/x86_64", "org/jline/nativ/Mac/arm64",
+                "org/jline/nativ/Windows/x86_64", "org/jline/nativ/Windows/arm64",
                 "org/sqlite/native/Linux/x86_64", "org/sqlite/native/Linux/aarch64",
                 "org/sqlite/native/Linux-Musl/x86_64", "org/sqlite/native/Linux-Musl/aarch64",
                 "org/sqlite/native/Mac/x86_64", "org/sqlite/native/Mac/aarch64",

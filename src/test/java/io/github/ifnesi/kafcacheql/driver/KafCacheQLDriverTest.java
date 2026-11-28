@@ -2,6 +2,7 @@ package io.github.ifnesi.kafcacheql.driver;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -120,8 +121,10 @@ class KafCacheQLDriverTest {
 
     @Test
     void versionAndCompliance() {
-        assertEquals(0, driver.getMajorVersion());
-        assertEquals(1, driver.getMinorVersion());
+        String version = System.getProperty("projectVersion"); assertNotNull(version);
+        String[] numbers = version.split("[.-]", 3);
+        assertEquals(Integer.parseInt(numbers[0]), driver.getMajorVersion());
+        assertEquals(Integer.parseInt(numbers[1]), driver.getMinorVersion());
         assertFalse(driver.jdbcCompliant());
         assertThrows(SQLFeatureNotSupportedException.class, driver::getParentLogger);
     }

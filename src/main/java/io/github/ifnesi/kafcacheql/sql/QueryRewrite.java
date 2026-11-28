@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sql;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.cache.StorageDdl;
 import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.sync.SyncPlan;
@@ -49,7 +51,7 @@ final class QueryRewrite {
                         ? new Alias(StorageDdl.quote(reference.table().getUnquotedName()), true) : reference.table().getAlias());
                 replacements.put(reference.table(), replacement);
                 selects.add(reference.select());
-            } catch (JSQLParserException e) { throw new SQLException("Cannot build window query: " + e.getMessage(), e); }
+            } catch (JSQLParserException e) { throw new SQLException(sentence("Cannot build the query for its requested window"), e); }
         }
         for (PlainSelect select : selects) {
             select.setFromItem(replace(select.getFromItem(), replacements));

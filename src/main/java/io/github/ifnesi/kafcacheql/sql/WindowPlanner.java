@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sql;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.google.common.collect.DiscreteDomain;
 import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
@@ -20,7 +22,7 @@ import java.util.TreeMap;
 import org.apache.kafka.common.record.TimestampType;
 
 /** One topic observation shared by all its SQL references. All output intervals are half-open offsets. */
-final class WindowPlanner {
+public final class WindowPlanner {
     private final CacheContext.Lease cache;
     private final SyncPlan base;
     private final Execution execution;
@@ -33,6 +35,18 @@ final class WindowPlanner {
         this.cache = cache; this.base = base; this.execution = execution; this.startedAt = startedAt;
     }
 
+    /** Cache refresh ignores query windows/caps and leaves gaps older than the newest cached range. */
+    public static SyncPlan refresh(CacheContext.Lease cache, SyncPlan base, Execution execution) throws SQLException {
+        if (base.topic().mode() == Mode.COMPACTED) return base;
+        var ends = cache.newestOffsets(base, execution);
+        var wanted = new TreeMap<Integer, ImmutableRangeSet<Long>>();
+        for (var partition : base.ends().offsets().entrySet()) {
+            long start = ends.getOrDefault(partition.getKey(), base.logStarts().get(partition.getKey()));
+            wanted.put(partition.getKey(), ImmutableRangeSet.of(Range.atLeast(start)));
+        }
+        return base.withWindows(wanted);
+    }
+
     Map<Integer, ImmutableRangeSet<Long>> windows(Bounds bounds, List<SQLWarning> warnings) throws SQLException {
         if (base.topic().mode() == Mode.COMPACTED) return base.windows();
         boolean defaults = !bounds.hasWindowBound() && bounds.tailRecords().isEmpty();
@@ -41,8 +55,8 @@ final class WindowPlanner {
         if (defaults && !window.isAll()) {
             String description = "last " + window.duration().orElseThrow().toString()
                     .substring(2).toLowerCase(Locale.ROOT) + ", ≤" + maxRecords + " records/partition";
-            warnings.add(new SQLWarning(base.topic().name() + ": default window applied (" + description
-                    + "); add a `_timestamp`/`_offset` bound to override", "01000"));
+            warnings.add(new SQLWarning(sentence(base.topic().name() + ": default window applied (" + description
+                    + "); add a `_timestamp`/`_offset` bound to override"), "01000"));
         }
         // Apply offset/partition bounds and the record cap before using cached timestamps. These are
         // the candidate intervals whose coverage must be proved before time can narrow them offline.

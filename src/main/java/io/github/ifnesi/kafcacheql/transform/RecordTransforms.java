@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.transform;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -51,7 +53,7 @@ public final class RecordTransforms {
                                 .asSubclass(RecordTransform.class).getConstructor().newInstance();
                         classes.put(settings.className(), hook);
                     } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
-                        throw ConfigErrors.problem(Secrets.redact("Loading record transform " + settings.className() + ": " + e,
+                        throw ConfigErrors.problem(Secrets.redact("Loading record transform " + settings.className() + ": " + ConfigErrors.detail(e),
                                 config.redactions()), Secrets.sanitize(e, config.redactions()));
                     }
                 }
@@ -59,7 +61,7 @@ public final class RecordTransforms {
             try { topics.put(entry.getKey(), new TopicTransform(settings, hook, config.maskSecret().orElseThrow())); }
             catch (VirtualMachineError e) { throw e; }
             catch (Throwable e) {
-                throw ConfigErrors.problem(Secrets.redact("Configuring record transform for " + entry.getKey() + ": " + e.getMessage(),
+                throw ConfigErrors.problem(Secrets.redact("Configuring record transform for " + entry.getKey() + ": " + ConfigErrors.detail(e),
                         config.redactions()), Secrets.sanitize(e, config.redactions()));
             }
         }
@@ -95,7 +97,7 @@ public final class RecordTransforms {
     public static TransformSettings policy(String fingerprint) throws SQLException {
         if (fingerprint.isEmpty()) return TransformSettings.NONE;
         try { return JSON.readValue(fingerprint, Fingerprint.class).settings(); }
-        catch (IOException e) { throw new SQLException("Reading cached record transform settings", e); }
+        catch (IOException e) { throw new SQLException(sentence("Reading cached record transform settings"), e); }
     }
 
     /** Runs only on a decoding owner, after the existing decoder finished both sides. */

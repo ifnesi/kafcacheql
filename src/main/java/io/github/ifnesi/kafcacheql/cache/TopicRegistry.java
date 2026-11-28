@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.config.Format;
 import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.config.TopicSettings;
@@ -243,7 +245,7 @@ public final class TopicRegistry {
         try (PreparedStatement p = reader.prepareStatement("SELECT partition_count FROM \"$topics\" WHERE id=?")) {
             p.setLong(1, generation);
             try (ResultSet rows = p.executeQuery()) {
-                if (!rows.next()) throw new SQLException("Missing topic generation " + generation);
+                if (!rows.next()) throw new SQLException(sentence("Missing topic generation " + generation));
                 return rows.getInt(1);
             }
         }
@@ -316,7 +318,7 @@ public final class TopicRegistry {
         }
         String reason = hasReservedPrefix(topic) ? "SQLite reserves names starting with sqlite_"
                 : "SQLite identifiers are case-insensitive";
-        return Optional.of(new SQLWarning("Topic " + topic + " uses view \"" + view + "\" because " + reason, "01000"));
+        return Optional.of(new SQLWarning(sentence("Topic " + topic + " uses view \"" + view + "\" because " + reason), "01000"));
     }
 
     private static long insert(Connection writer, TopicInfo topic, TopicSettings settings, int decoderVersion,
@@ -339,7 +341,7 @@ public final class TopicRegistry {
             p.setString(11, settings.transformFingerprint());
             try (ResultSet rs = p.executeQuery()) {
                 if (!rs.next()) {
-                    throw new SQLException("Registration of topic " + topic.name() + " returned no id");
+                    throw new SQLException(sentence("Registration of topic " + topic.name() + " returned no id"));
                 }
                 return rs.getLong(1);
             }

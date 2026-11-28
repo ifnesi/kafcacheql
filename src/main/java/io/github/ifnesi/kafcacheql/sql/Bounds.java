@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sql;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.google.common.base.Ascii;
 import com.google.common.collect.ImmutableRangeSet;
 import com.google.common.collect.Range;
@@ -192,7 +194,7 @@ public record Bounds(ImmutableRangeSet<Long> partitions, ImmutableRangeSet<Long>
             String sql = operands.stream().map(Object::toString).collect(Collectors.joining(",", "SELECT ", ""));
             try (var statement = sqlite.prepareStatement(sql)) {
                 for (int index : constant.parameters) {
-                    if (!parameters.containsKey(index)) throw new SQLException("Parameter " + index + " is not bound", "07001");
+                    if (!parameters.containsKey(index)) throw new SQLException(sentence("Parameter " + index + " is not bound"), "07001");
                     statement.setObject(index, parameters.get(index));
                 }
                 try (var rows = statement.executeQuery()) {

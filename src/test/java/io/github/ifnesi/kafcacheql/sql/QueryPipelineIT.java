@@ -178,7 +178,8 @@ class QueryPipelineIT {
                 try { return query(cache, topic); } catch (SQLException e) { throw new CompletionException(e); }
             });
             assertTrue(buffered.await(10, TimeUnit.SECONDS));
-            Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+            Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                     System.getProperty("java.class.path"), PipelineProcess.class.getName(), cache.path().toString(), topic)
                     .redirectError(ProcessBuilder.Redirect.INHERIT).start();
             try (var output = new BufferedReader(new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8))) {

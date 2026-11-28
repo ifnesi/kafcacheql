@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sql;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.google.common.collect.RangeSet;
 import com.google.common.collect.TreeRangeSet;
 import io.github.ifnesi.kafcacheql.cache.TypedViews;
@@ -73,11 +75,21 @@ public final class QueryPipeline {
 
     private static Cursor open(CacheContext.Lease cache, String sql, Map<Integer, ?> parameters, Execution execution,
                                int fetchSize, long maxRows, Bindings bindings, Hooks hooks) throws SQLException {
+        return execution.run(cache.config().offline(), () -> open(cache,
+                Query.parseAndResolve(sql, name -> cache.resolveTable(name, execution)), parameters, execution, fetchSize, maxRows, bindings, hooks));
+    }
+
+    public static Cursor open(CacheContext.Lease cache, Query query, Map<Integer, ?> parameters, Execution execution,
+                              int fetchSize, long maxRows, Bindings bindings) throws SQLException {
+        return open(cache, query, parameters, execution, fetchSize, maxRows, bindings, new Hooks() {});
+    }
+    private static Cursor open(CacheContext.Lease cache, Query query, Map<Integer, ?> parameters, Execution execution,
+                              int fetchSize, long maxRows, Bindings bindings, Hooks hooks) throws SQLException {
         long startedAt = System.currentTimeMillis();
         return execution.run(cache.config().offline(), () -> {
-            Query query = Query.parseAndResolve(sql, name -> cache.resolveTable(name, execution));
+            if (query.command() != null) throw new SQLException(sentence("A cache statement requires JDBC execution"), "42000");
             for (int index : query.parameters()) {
-                if (!parameters.containsKey(index)) throw new SQLException("Parameter " + index + " is not bound", "07001");
+                if (!parameters.containsKey(index)) throw new SQLException(sentence("Parameter " + index + " is not bound"), "07001");
             }
             bindings.validate(query.parameters());
             var bounds = cache.read(execution, c -> Bounds.extract(query, c, parameters));
@@ -174,8 +186,8 @@ public final class QueryPipeline {
                     && !TypedViews.hasSchemas(reader, window.generation())) topics.add(topic);
         }
         if (topics.isEmpty()) return failure;
-        return new SQLException(failure.getMessage() + "; column " + column + " isn't known yet for topic(s) " + topics
-                + " because no records with a schema are cached; use _value ->> '$." + field + "' to read the JSON value",
+        return new SQLException(sentence(io.github.ifnesi.kafcacheql.config.ConfigErrors.detail(failure) + "; column " + column + " isn't known yet for topic(s) " + topics
+                + " because no records with a schema are cached; use _value ->> '$." + field + "' to read the JSON value"),
                 "42S22", failure.getErrorCode(), failure);
     }
 
@@ -191,6 +203,9 @@ public final class QueryPipeline {
         private Cursor(CacheContext.Reader reader, ResultSet rows, Execution execution, List<SQLWarning> warnings,
                        Map<Integer, JDBCType> types) {
             this.reader = reader; this.rows = rows; this.execution = execution; this.warnings = warnings; this.types = types;
+        }
+        public static Cursor detached(ResultSet rows, Execution execution, List<SQLWarning> warnings) {
+            return new Cursor(null, rows, execution, List.copyOf(warnings), Map.of());
         }
         public ResultSet rows() { return rows; }
         public List<SQLWarning> warnings() { return warnings; }
@@ -212,7 +227,7 @@ public final class QueryPipeline {
         @Override public void close() throws SQLException {
             if (ended) return;
             ended = true;
-            reader.close();
+            if (reader == null) rows.close(); else reader.close();
         }
     }
 

@@ -42,7 +42,7 @@ class DriverManagerIT {
     private static Map<String, String> probe(String classPath, String url, Path cache) throws Exception {
         Path source = probeSource();
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
-        Process p = new ProcessBuilder(java, "-cp", classPath, source.toString(), url, cache.toString())
+        Process p = new ProcessBuilder(java, "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp", classPath, source.toString(), url, cache.toString())
                 .redirectErrorStream(true).start();
         assertTrue(p.waitFor(60, TimeUnit.SECONDS), "probe finished");
         String output = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);

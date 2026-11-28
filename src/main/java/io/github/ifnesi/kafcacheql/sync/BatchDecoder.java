@@ -22,16 +22,19 @@ final class BatchDecoder implements AutoCloseable {
         decoder = new RecordDecoder(settings, reader, schemas);
     }
 
-    List<SyncBatch.Record> decode(String topic, ConsumerRecords<byte[], byte[]> records, long end,
+    record Decoded(List<SyncBatch.Record> records, long fetched) {}
+    Decoded decode(String topic, ConsumerRecords<byte[], byte[]> records, long end,
                                   Format key, Format value) throws SQLException {
         List<SyncBatch.Record> decoded = new ArrayList<>(records.count());
+        long fetched = 0;
         // Finish the poll even after cancellation; the caller drops it, retaining fetched schemas.
         for (var record : records) {
             if (record.offset() >= end) break;
+            fetched++;
             var result = transforms.apply(record, decoder.decode(topic, record.headers(), record.key(), record.value(), key, value));
             if (result != null) decoded.add(result);
         }
-        return decoded;
+        return new Decoded(decoded, fetched);
     }
 
     @Override public void close() throws SQLException {

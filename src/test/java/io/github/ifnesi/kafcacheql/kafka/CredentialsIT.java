@@ -1,8 +1,11 @@
 package io.github.ifnesi.kafcacheql.kafka;
 
+import static io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertJdbcThrows;
+
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
@@ -95,7 +98,7 @@ class CredentialsIT {
         try (var capture = LogCapture.capture()) {
             Properties p = properties();
             p.setProperty("request.timeout.ms", "HEADER-SECRET");
-            SQLException invalid = assertThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
+            SQLException invalid = assertJdbcThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
             assertTrue(invalid.getMessage().contains("request.timeout.ms"));
             assertHidden(trace(invalid), "HEADER-SECRET");
 
@@ -104,14 +107,14 @@ class CredentialsIT {
             p.setProperty("schema.registry.url", "http://REGISTRY-USER:FIRST,SECOND@localhost:8081");
             DriverConfig malformed = DriverConfig.load(url(), p);
             assertHidden(malformed.toString(), "REGISTRY-USER", "FIRST", "SECOND");
-            SQLException badUrl = assertThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
+            SQLException badUrl = assertJdbcThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
             assertTrue(badUrl.getMessage().contains("schema.registry.url"));
             assertHidden(trace(badUrl), "REGISTRY-USER", "FIRST", "SECOND");
 
             p.setProperty("schema.registry.url", TestStack.REGISTRY);
             p.setProperty("sasl.jaas.config", "org.apache.kafka.common.security.plain.PlainLoginModule required "
                     + "username=test password=FIRST SECOND;");
-            SQLException badJaas = assertThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
+            SQLException badJaas = assertJdbcThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
             assertTrue(badJaas.getMessage().contains("sasl.jaas.config can't be parsed"));
             assertHidden(trace(badJaas), "FIRST", "SECOND");
 

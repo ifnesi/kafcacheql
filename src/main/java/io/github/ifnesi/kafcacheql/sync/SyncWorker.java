@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.sync;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.transform.RecordTransforms;
 import com.google.common.collect.Range;
 import io.github.ifnesi.kafcacheql.cache.CacheStore;
@@ -127,7 +129,7 @@ public final class SyncWorker implements AutoCloseable {
             checkOpen();
             return store;
         }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new SQLException("Interrupted opening cache", e); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new SQLException(sentence("Interrupted opening cache"), e); }
         catch (java.util.concurrent.ExecutionException e) {
             if (e.getCause() instanceof SQLException sql) throw sql;
             throw failure("Opening sync worker", e.getCause());
@@ -136,9 +138,9 @@ public final class SyncWorker implements AutoCloseable {
 
     synchronized void checkOpen() throws SQLException {
         if (terminalFailure != null) {
-            throw new SQLException(terminalFailure.getMessage(), terminalFailure.getSQLState(), terminalFailure);
+            throw new SQLException(sentence(terminalFailure.getMessage()), terminalFailure.getSQLState(), terminalFailure);
         }
-        if (closing) throw new SQLException("Cache context is closed");
+        if (closing) throw new SQLException(sentence("Cache context is closed"));
     }
 
     void hooks(Hooks hooks) { this.hooks = hooks; }
@@ -190,7 +192,7 @@ public final class SyncWorker implements AutoCloseable {
             synchronized (this) {
                 if (queue.remove(queued)) {
                     pending.remove(job);
-                    job.result.completeExceptionally(new SQLException("Query cancelled", "57014"));
+                    job.result.completeExceptionally(new SQLException(sentence("Query cancelled"), "57014"));
                 }
                 if (active == job) wakeConsumers();
             }
@@ -210,22 +212,22 @@ public final class SyncWorker implements AutoCloseable {
         }
     }
 
-    long sync(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize, int parallelism) throws SQLException {
+    long sync(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize, int parallelism, java.util.function.LongConsumer fetched) throws SQLException {
         return submit(execution, () -> {
             syncWrote = false;
-            try { return fetch(plan, execution, writer, batchSize, parallelism); }
+            try { return fetch(plan, execution, writer, batchSize, parallelism, fetched); }
             finally { if (syncWrote) checkpoint(); }
         });
     }
 
     void delete(String topic, java.util.OptionalLong generation, Execution execution) throws SQLException {
         submit(execution, () -> {
-            if (!TopicRegistry.delete(cache, topic, generation, execution::check)) throw new StaleGeneration(topic);
+            if (!dropTopic(topic, generation, execution::check)) throw new StaleGeneration(topic);
             return null;
         });
     }
 
-    private long fetch(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize, int parallelism) throws SQLException {
+    private long fetch(SyncPlan plan, Execution execution, BatchWriter writer, int batchSize, int parallelism, java.util.function.LongConsumer fetched) throws SQLException {
         execution.check();
         var observed = TopicRegistry.observe(cache.writer(), plan.topic().name());
         if (plan.generation().isPresent() && (observed.isEmpty() || observed.get().id() != plan.generation().getAsLong())) {
@@ -270,7 +272,7 @@ public final class SyncWorker implements AutoCloseable {
                         .mapToLong(r -> r.upperEndpoint() - r.lowerEndpoint()).sum()));
                 for (Range<Long> range : missing.asRanges()) {
                     request.write(() -> { hooks.beforeFetch(plan); return null; });
-                    fetchRange(fetcher, plan, generation, partition.getKey(), range, baseline, request, writer, batchSize, progress);
+                    fetchRange(fetcher, plan, generation, partition.getKey(), range, baseline, request, writer, batchSize, progress, fetched);
                 }
             });
         }
@@ -352,7 +354,7 @@ public final class SyncWorker implements AutoCloseable {
     }
 
     private void fetchRange(FetchConsumer fetcher, SyncPlan plan, long generation, int partition, Range<Long> range,
-                            long baseline, FetchRequest request, BatchWriter writer, int batchSize, PartitionProgress progress) throws SQLException {
+                            long baseline, FetchRequest request, BatchWriter writer, int batchSize, PartitionProgress progress, java.util.function.LongConsumer fetched) throws SQLException {
         request.check();
         TopicPartition tp = new TopicPartition(plan.topic().name(), partition);
         long end = range.upperEndpoint();
@@ -366,10 +368,10 @@ public final class SyncWorker implements AutoCloseable {
             while (position < end) {
                 var records = fetcher.poll(request);
                 position = Math.min(end, fetcher.position(tp, request));
-                var decoded = records.isEmpty() ? List.<SyncBatch.Record>of()
+                var decoded = records.isEmpty() ? new BatchDecoder.Decoded(List.of(), 0)
                         : fetcher.decoder.decode(tp.topic(), records, end, key, value);
                 long captured = position;
-                request.write(() -> { output.accept(decoded, captured); return null; });
+                request.write(() -> { fetched.accept(decoded.fetched()); output.accept(decoded.records(), captured); return null; });
             }
         } catch (OffsetOutOfRangeException | org.apache.kafka.common.errors.UnknownTopicOrPartitionException expired) {
             throw new StaleGeneration(tp.topic());
@@ -572,7 +574,7 @@ public final class SyncWorker implements AutoCloseable {
             Checkpoint result;
             // The worker's busy_timeout is 100 ms; this pragma runs outside any write transaction.
             try (Statement s = cache.writer().createStatement(); var rows = s.executeQuery("PRAGMA wal_checkpoint(TRUNCATE)")) {
-                if (!rows.next()) throw new SQLException("WAL checkpoint returned no result");
+                if (!rows.next()) throw new SQLException(sentence("WAL checkpoint returned no result"));
                 result = new Checkpoint(rows.getInt(1), rows.getInt(2), rows.getInt(3));
             }
             if (result.contended()) {
@@ -606,9 +608,13 @@ public final class SyncWorker implements AutoCloseable {
                 })));
     }
 
+    private boolean dropTopic(String topic, java.util.OptionalLong generation, CacheStore.Check check) throws SQLException {
+        return TopicRegistry.delete(cache, topic, generation, check);
+    }
+
     void drop(String topic, long generation) {
         background(new Background(List.of("drop", generation), 0, () -> {
-            TopicRegistry.delete(cache, topic, java.util.OptionalLong.of(generation), null);
+            dropTopic(topic, java.util.OptionalLong.of(generation), null);
             return null;
         }));
     }
@@ -695,7 +701,7 @@ public final class SyncWorker implements AutoCloseable {
     }
 
     private SQLException failure(String what, Throwable cause) {
-        return new SQLException(Secrets.redact(what + ": " + cause.getMessage(), settings.schemaRegistry()), "08006",
+        return new SQLException(sentence(Secrets.redact(what + ": " + io.github.ifnesi.kafcacheql.config.ConfigErrors.detail(cause), settings.schemaRegistry())), "08006",
                 Secrets.sanitize(cause, settings.schemaRegistry()));
     }
 
@@ -705,7 +711,7 @@ public final class SyncWorker implements AutoCloseable {
             closing = true;
             background.clear();
             current = active;
-            for (Job<?> job : pending) job.result.completeExceptionally(new SQLException("Cache context is closed"));
+            for (Job<?> job : pending) job.result.completeExceptionally(new SQLException(sentence("Cache context is closed")));
             pending.clear();
             queue.clear();
             queue.add(() -> {});

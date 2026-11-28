@@ -109,7 +109,7 @@ class WindowsIT {
                      "topic." + defaults + ".append.default.window", "all"))) {
             var timeResult = query(time, sql);
             assertEquals(List.of("0|1", "0|2", "1|1", "1|2"), rows(timeResult));
-            assertEquals(defaults + ": default window applied (last 30s, ≤100 records/partition); add a `_timestamp`/`_offset` bound to override",
+            assertEquals(defaults + ": default window applied (last 30s, ≤100 records/partition); add a `_timestamp`/`_offset` bound to override.",
                     timeResult.warnings().getFirst().getMessage());
             assertEquals(List.of("0|2", "1|2"), rows(query(records, sql)));
             var partitionOnly = query(records, "SELECT _partition,_offset FROM " + q(defaults) + " WHERE _partition=1 ORDER BY _offset");
@@ -236,7 +236,8 @@ class WindowsIT {
         private final Process process;
         private final BufferedReader output;
         Child(Path file, String topic) throws Exception {
-            process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+            process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                     System.getProperty("java.class.path"), WindowProcess.class.getName(), file.toString(), topic)
                     .redirectError(ProcessBuilder.Redirect.INHERIT).start();
             output = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));

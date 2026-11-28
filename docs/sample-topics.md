@@ -10,8 +10,9 @@ SQLite copy filled by your queries.
 
 ## Before you produce
 
-Start the stack from the [quick start](../README.md#quick-start), then run the commands from the repository
-root. Producers run inside the containers. Examples with keys use `key|value`; an Avro string key is JSON,
+Start the stack from the [quick start](../README.md#1-start-the-stack), then run the commands below from the
+repository's top folder, `kafcacheql`, where the stack's compose file is (`cd kafcacheql` if you're
+elsewhere). Producers run inside the containers. Examples with keys use `key|value`; an Avro string key is JSON,
 hence its quotes.
 
 Use a fresh stack or unused topic names. Rerunning the producers appends more records, so aggregate counts

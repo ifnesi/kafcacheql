@@ -1,5 +1,7 @@
 package io.github.ifnesi.kafcacheql.cache;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import com.google.common.collect.Range;
 import com.google.common.collect.RangeSet;
 import com.google.common.collect.TreeRangeSet;
@@ -13,6 +15,24 @@ import java.util.List;
 /** Partition progress and append retention. Mutations belong to the worker's guarded transaction. */
 public final class PartitionStore {
     private PartitionStore() {}
+
+    public record CachedBounds(Map<Integer, Long> starts, Map<Integer, Long> ends) {}
+
+    /** Shared by offline planning and SYNC's continuation from the newest covered offset. */
+    public static CachedBounds cachedBounds(Connection reader, long generation) throws SQLException {
+        var starts = new java.util.TreeMap<Integer, Long>(); var ends = new java.util.TreeMap<Integer, Long>();
+        try (var p = reader.prepareStatement("""
+                SELECT partition_no,pruned_below,max(pruned_below,coalesce((SELECT max(end_offset) FROM "$ranges" r
+                    WHERE r.topic_ref=p.topic_ref AND r.partition_no=p.partition_no),pruned_below))
+                FROM "$partitions" p WHERE topic_ref=?
+                """)) {
+            p.setLong(1, generation);
+            try (var rows = p.executeQuery()) {
+                while (rows.next()) { starts.put(rows.getInt(1), rows.getLong(2)); ends.put(rows.getInt(1), rows.getLong(3)); }
+            }
+        }
+        return new CachedBounds(starts, ends);
+    }
 
     /** Capture once before fetching: later completion timestamps must not hide an expired baseline. */
     public static Map<Integer, Long> safetyBaselines(Connection reader, long generation) throws SQLException {
@@ -34,7 +54,7 @@ public final class PartitionStore {
                 "SELECT pruned_below FROM \"$partitions\" WHERE topic_ref=? AND partition_no=?")) {
             p.setLong(1, generation); p.setInt(2, partition);
             try (var rows = p.executeQuery()) {
-                if (!rows.next()) throw new SQLException("Missing cached partition " + partition + " of generation " + generation);
+                if (!rows.next()) throw new SQLException(sentence("Missing cached partition " + partition + " of generation " + generation));
                 return rows.getLong(1);
             }
         }

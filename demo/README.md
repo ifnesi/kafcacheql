@@ -67,13 +67,32 @@ Kafka still holds the original fake data; transforms only change the cache. See
 
 ## Running it
 
-Start the stack with step 1 of the [quick start](../README.md#quick-start). The demo loads the driver from
-`target/`, so build it with `mvn package -DskipTests` (Java 21+ and Maven 3.9+). Then start the demo from the
-repository root:
+The demo has no Kafka or Schema Registry of its own: it uses the ones from the repository's main stack. You
+need Git, Docker Compose, Java 21+ and Maven 3.9+. In order:
+
+**1.** Get the repository and start the main stack (Kafka, Schema Registry and Control Center) from its top
+folder, `kafcacheql`. Wait for Kafka on `localhost:9092`:
 
 ```sh
-docker compose -f demo/compose.yaml up -d --build
+git clone https://github.com/ifnesi/kafcacheql.git
+cd kafcacheql
+docker compose up -d
 ```
+
+**2.** Still in `kafcacheql`, build the driver. The demo loads it from `kafcacheql/target/`:
+
+```sh
+mvn package -DskipTests
+```
+
+**3.** Move into the demo's folder, `kafcacheql/demo`, and start the demo:
+
+```sh
+cd demo
+docker compose up -d --build
+```
+
+The rest of this page runs from `kafcacheql/demo`.
 
 Compose compiles the demo class in a Java 21 JDK container, starts the producer and Zeppelin, and installs
 the connection and notebook. No separate host compiler step is needed for the class.
@@ -86,7 +105,7 @@ newer records.
 To check that all seven paragraphs run, without opening a browser:
 
 ```sh
-docker compose -f demo/compose.yaml run --rm check
+docker compose run --rm check
 ```
 
 ## What you'll see
@@ -135,12 +154,43 @@ After about a minute of producing, on an empty cache, it returned in about three
 Run it in a new Zeppelin paragraph starting with `%store`, using the demo's window, or from [DBeaver or
 DataGrip](../docs/tools.md), which read whole topics by default.
 
+## From the command line
+
+The driver's JAR is also a [command-line tool](../docs/cli.md). With the root stack and the demo running, as
+in [Running it](#running-it), use it inside Zeppelin's container: it already has Java, the driver, the demo's
+settings and its transform class, and the tool shares the note's cache. Define a shell function once:
+
+```sh
+kafcacheql() {
+  docker compose exec zeppelin /opt/java21/bin/java --enable-native-access=ALL-UNNAMED \
+    -cp /driver/kafcacheql-jdbc.jar:/transforms/shop-transforms.jar io.github.ifnesi.kafcacheql.cli.Main "$@"
+}
+URL='jdbc:kafcacheql://broker:29092?config.file=/demo/kafcacheql.properties'
+```
+
+List the topics and their cached sizes, then bring the orders topics up to date:
+
+```sh
+kafcacheql "$URL" 'SHOW TABLES'
+kafcacheql "$URL" 'SYNC shop-order*'
+```
+
+`SYNC` fetches everything new, so it ignores the demo's 15-minute window; queries still use the window.
+The masked customer profiles as JSON, ready for `jq`:
+
+```sh
+kafcacheql --json "$URL" 'SELECT _key, _value FROM "shop-customer-profiles" LIMIT 2'
+```
+
+Run `kafcacheql "$URL"` alone for an interactive session: type statements ending with `;`, such as the
+five-topic join above, and `quit` to leave.
+
 ## Producing faster
 
 The rate defaults to two orders per second. To produce five orders per second:
 
 ```sh
-ORDERS_PER_SECOND=5 docker compose -f demo/compose.yaml up -d producer
+ORDERS_PER_SECOND=5 docker compose up -d producer
 ```
 
 ## Configuration and cleanup
@@ -152,11 +202,19 @@ settings are in [interpreter.json](zeppelin/interpreter.json) and
 [kafcacheql.properties](kafcacheql.properties), which sets the window and transforms. Its `mask.secret` is for
 this demo only. The compiled class's JAR is mounted beside the driver and loaded by the JDBC interpreter.
 
-Stop the demo before rebuilding the JAR, then start it again to load the new classes:
+Stop the demo before rebuilding the JAR, then start it again to load the new classes. From `kafcacheql/demo`:
 
 ```sh
-docker compose -f demo/compose.yaml down
+docker compose down
+cd ..                     # back to kafcacheql, to build
+mvn package -DskipTests
+cd demo                   # back to kafcacheql/demo
+docker compose up -d
 ```
 
+`docker compose down` here stops only the demo.
+
 Add `--volumes` to discard the demo's cache and notes, for example if a new driver refuses the old cache
-format. Its `shop-*` Kafka topics and Schema Registry subjects remain; the root stack keeps running.
+format. Its `shop-*` Kafka topics and Schema Registry subjects remain; the main stack keeps running. To stop
+the main stack too, run `docker compose down` again from `kafcacheql`. That deletes all its Kafka data: every
+topic, including `shop-*` and any sample topics, is gone when the stack starts again.

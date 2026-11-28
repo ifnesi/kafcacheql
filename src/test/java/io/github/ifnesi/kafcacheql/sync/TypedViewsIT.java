@@ -216,7 +216,8 @@ class TypedViewsIT {
             // replacing/deleting the last record of a schema removes just that schema's columns.
             Schema external = schema("{\"type\":\"record\",\"name\":\"SnapshotValue\",\"fields\":[{\"name\":\"n\",\"type\":\"int\"},{\"name\":\"added\",\"type\":\"string\",\"default\":\"\"},{\"name\":\"external\",\"type\":\"string\",\"default\":\"\"}]}");
             TestStack.sendAvro(topic, "d", record(external, "n", 4, "added", "new", "external", "child"), null, TestStack.SchemaIdIn.PREFIX);
-            Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-cp",
+            Process child = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-cp",
                     System.getProperty("java.class.path"), "io.github.ifnesi.kafcacheql.sql.PipelineProcess",
                     reader.path().toString(), topic, "jdbc").redirectError(ProcessBuilder.Redirect.INHERIT).start();
             try {

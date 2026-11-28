@@ -2,7 +2,8 @@
 
 Use SQL to join topic data, summarize events and inspect individual records. KafCacheQL runs SELECTs on a
 local SQLite cache, the records it has fetched from Kafka. Joins, aggregations, window functions, CTEs and
-JSON functions use SQLite SQL. Both SELECT and `WITH … SELECT` are accepted.
+JSON functions use SQLite SQL. Both SELECT and `WITH … SELECT` are accepted, plus a few [cache
+statements](#cache-statements) for looking at and managing the cache.
 
 ## Tables
 
@@ -75,6 +76,41 @@ A plain `LIMIT` limits returned rows, not the initial sync. A tail query, ordere
 literal limit and only optional partition conditions, can fetch the last records instead. Offsets are numbered
 per partition, so this does not mean the newest records by time. See [window details](#window-details) for the
 exact rules and optional time windows.
+
+## Cache statements
+
+These statements act on the local cache only. None of them changes anything in Kafka.
+
+| Statement | Result |
+|---|---|
+| `SHOW TABLES` | One row per topic: `table_name`, `mode`, `partitions`, `cached_rows`, `cached_bytes`. The last four are NULL for a topic with nothing cached |
+| `DESCRIBE "orders"` | One row per column: `column_name`, `type`. Before a topic's first query, only the built-in columns |
+| `DROP TABLE "orders"` | Deletes the topic's cached records and offsets. **The Kafka topic is not deleted.** The next online query fetches it again |
+| `SYNC "orders", "customers"` | Brings topics up to date, and returns `table_name` and `fetched_records` for each |
+
+`SHOW TABLES` lists the same topics as your tool's navigator; offline, it lists the cached ones. Counting rows
+and bytes reads the cache, so it takes longer on a large cache. `DROP TABLE IF EXISTS` doesn't fail when the
+topic has nothing cached.
+
+### SYNC or SELECT
+
+`SYNC` follows one rule: it fetches everything new, uncapped. For each partition it reads from the newest
+cached offset to Kafka's current end; a topic with nothing cached is read in full. A configured window,
+record cap or `WHERE` clause plays no part. To fetch less, use a `SELECT`: its window and cap apply even to
+`SELECT *`. `SYNC` doesn't fill older gaps, such as offsets a past query skipped.
+
+Topic names can be written without quotes, with `*` matching any run of characters and `?` one character:
+
+```sql
+SYNC demo-*, *-shop*, orders-20??;
+```
+
+Patterns are case-sensitive and match the topics the navigator lists. A pattern that matches no topic fails
+the statement before anything is fetched. `SYNC` on its own syncs every cached topic the navigator still lists; `SYNC *` syncs every
+listed topic, which can be a lot of data. Only one `SYNC` runs on a cache at a time: a second one, from any
+program, fails at once instead of fetching the same records again. A query whose records are already cached
+doesn't wait for a `SYNC`; one that must fetch waits its turn, as behind any other sync. `SYNC`
+needs Kafka, so an offline connection refuses it.
 
 ## Examples
 

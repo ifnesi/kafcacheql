@@ -1,6 +1,9 @@
 package io.github.ifnesi.kafcacheql.kafka;
 
+import static io.github.ifnesi.kafcacheql.config.ConfigErrors.sentence;
+
 import io.github.ifnesi.kafcacheql.config.DriverConfig;
+import io.github.ifnesi.kafcacheql.config.ConfigErrors;
 import io.github.ifnesi.kafcacheql.config.Mode;
 import io.github.ifnesi.kafcacheql.config.DriverLoader;
 import io.github.ifnesi.kafcacheql.config.Secrets;
@@ -155,13 +158,13 @@ public final class KafkaClients {
         } catch (InterruptedException e) {
             release(key, entry);
             Thread.currentThread().interrupt();
-            throw new SQLException("Interrupted while opening the Kafka clients", KAFKA_FAILURE, e);
+            throw new SQLException(sentence("Interrupted while opening the Kafka clients"), KAFKA_FAILURE, e);
         } catch (ExecutionException e) {
             release(key, entry);
             if (e.getCause() instanceof SQLException s) {
                 throw s;
             }
-            throw new SQLException("Opening the Kafka clients failed", KAFKA_FAILURE, e.getCause());
+            throw new SQLException(sentence("Opening the Kafka clients failed"), KAFKA_FAILURE, e.getCause());
         }
     }
 
@@ -187,8 +190,21 @@ public final class KafkaClients {
             admin = Admin.create(adminSettings);
             String configuredTimeout = config.clientSettings().get(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG);
             int openingTimeout = configuredTimeout == null ? DEFAULT_OPEN_TIMEOUT_MS : Integer.parseInt(configuredTimeout.trim());
-            String clusterId = get(admin.describeCluster(new DescribeClusterOptions().timeoutMs(openingTimeout)).clusterId(), "Reading the cluster ID from "
-                    + adminSettings.get(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG), forErrors);
+            String brokers = config.bootstrapServers().orElseThrow();
+            String clusterId;
+            try {
+                clusterId = admin.describeCluster(new DescribeClusterOptions().timeoutMs(openingTimeout)).clusterId().get();
+            } catch (ExecutionException e) {
+                if (e.getCause() instanceof org.apache.kafka.common.errors.TimeoutException) {
+                    String seconds = java.math.BigDecimal.valueOf(openingTimeout, 3).stripTrailingZeros().toPlainString();
+                    throw new SQLException(sentence("Can't reach Kafka at " + brokers + ": timed out after " + seconds + " s."), KAFKA_FAILURE,
+                            Secrets.sanitize(e.getCause(), forErrors));
+                }
+                throw sql("Reading the cluster ID from " + brokers, e.getCause(), forErrors);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw sql("Opening the Kafka connection", e, forErrors);
+            }
             return new KafkaClients(clientId, clusterId, admin, forErrors);
         } catch (SQLException e) {
             closeQuietly(admin, clientId);
@@ -411,12 +427,8 @@ public final class KafkaClients {
 
     /** The cause is attached as a redacted copy: its messages, causes and suppressed exceptions included. */
     private static SQLException sql(String what, Throwable cause, Map<String, Object> settings) {
-        Throwable root = cause;
-        while (root.getCause() != null && root.getCause() != root) {
-            root = root.getCause();
-        }
-        String detail = root.getClass().getSimpleName() + (root.getMessage() == null ? "" : ": " + root.getMessage());
-        return new SQLException(what + " failed: " + Secrets.redact(detail, settings), KAFKA_FAILURE,
+        String detail = ConfigErrors.detail(cause);
+        return new SQLException(sentence(what + " failed: " + Secrets.redact(detail, settings)), KAFKA_FAILURE,
                 Secrets.sanitize(cause, settings));
     }
 

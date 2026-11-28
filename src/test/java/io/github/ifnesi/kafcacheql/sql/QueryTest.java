@@ -8,28 +8,30 @@ import java.util.List;
 import java.util.Optional;
 import java.util.TreeMap;
 import net.sf.jsqlparser.JSQLParserException;
-import net.sf.jsqlparser.parser.CCJSqlParserUtil;
 import org.junit.jupiter.api.Test;
 
 class QueryTest {
-    /** PLAN §8.1: "DML, DDL, PRAGMA, ATTACH, multiple statements, etc. are rejected before anything runs."
+    /** PLAN §8.1: "Other DML/DDL, PRAGMA, ATTACH and multiple statements are rejected before anything runs."
      * The resolver is the only handoff to Kafka/cache work; it must never be reached for these inputs.
      */
     @Test void rejectsOtherStatementsBeforeResolvingAnything() {
         Query.Resolver untouched = name -> { throw new AssertionError("Touched Kafka/cache for " + name); };
         for (String sql : List.of("INSERT INTO orders VALUES (1)", "UPDATE orders SET status = 'x'",
-                "DELETE FROM orders", "CREATE TABLE orders (id INT)", "DROP TABLE orders", "PRAGMA user_version",
+                "DELETE FROM orders", "CREATE TABLE orders (id INT)", "DROP VIEW orders", "PRAGMA user_version",
                 "ATTACH DATABASE 'other.db' AS other", "BEGIN", "VACUUM", "EXPLAIN SELECT * FROM orders",
                 "VALUES (1)", "SELECT * FROM orders; SELECT * FROM payments", "SELECT * FROM orders; DELETE FROM orders",
                 "WITH x AS (SELECT * FROM orders) DELETE FROM orders", "SELECT * INTO copy FROM orders",
                 "WITH x AS (DELETE FROM orders RETURNING *) SELECT * FROM x")) {
             assertThrows(SQLException.class, () -> Query.parseAndResolve(sql, untouched), sql);
         }
-        // 0008a: an unparseable SELECT retains the parser's diagnostic, including unsupported SQLite syntax.
+        // §8.1: unparseable SELECTs retain their cause, with driver-owned diagnostics and SQLState.
         for (String sql : List.of("SELECT * FROM", "SELECT * FROM orders WHERE _key GLOB 'a*'")) {
-            var parser = assertThrows(JSQLParserException.class, () -> CCJSqlParserUtil.parseStatements(sql), sql);
             var error = assertThrows(SQLException.class, () -> Query.parseAndResolve(sql, untouched), sql);
-            assertEquals(parser.getMessage(), error.getMessage());
+            io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertReadable(error.getMessage());
+            assertEquals("42000", error.getSQLState());
+            assertInstanceOf(JSQLParserException.class, error.getCause());
+            assertTrue(error.getMessage().startsWith("SQL syntax error at line "), error.getMessage());
+            assertFalse(error.getMessage().contains("jsqlparser"), error.getMessage());
         }
     }
 
