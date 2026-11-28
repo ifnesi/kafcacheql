@@ -166,7 +166,13 @@ Numbers stay numbers, and `_key`, `_value` and `_headers` are nested JSON, so th
 tools such as `jq`.
 
 Results go to standard output. Errors and warnings, such as an expired range or a `DROP TABLE` notice, go to
-standard error with `ERROR:` or `WARN:` in front. The tool prints no log output. Some errors you may see:
+standard error with `ERROR:` or `WARN:` in front. The tool prints no log output.
+
+On Java 25 and newer, Java itself adds four lines starting `WARNING: ... sun.misc.Unsafe` the first time a
+query decodes Avro, JSON Schema or Protobuf. They come from the Guava library inside the driver, at the
+version Confluent's libraries use, and are harmless.
+
+Some errors you may see:
 
 ```text
 kafcacheql> SELEC * FROM "orders";

@@ -42,7 +42,16 @@ class CliIT {
         try (var out = Files.newOutputStream(config)) { p.store(out, null); }
         return "jdbc:kafcacheql://" + TestStack.BOOTSTRAP + "?config.file=" + config;
     }
-    private record Output(int status, String out, String err) {}
+    // PLAN §14: Confluent's versions may emit only the JDK's four-line Unsafe diagnostic.
+    // Keep raw stderr (and print it below); all other output still faces the existing assertions.
+    private static final java.util.regex.Pattern UNSAFE_WARNING = java.util.regex.Pattern.compile(
+            "(?m)^WARNING: A terminally deprecated method in sun\\.misc\\.Unsafe has been called\\R"
+            + "WARNING: sun\\.misc\\.Unsafe::(\\w+) has been called by ([\\w.$]+) \\(file:[^\\r\\n]+\\)\\R"
+            + "WARNING: Please consider reporting this to the maintainers of class \\2\\R"
+            + "WARNING: sun\\.misc\\.Unsafe::\\1 will be removed in a future release\\R");
+    private record Output(int status, String out, String err) {
+        String messages() { return UNSAFE_WARNING.matcher(err).replaceAll(""); }
+    }
     private Output run(String input, String... args) throws Exception {
         List<String> command = new ArrayList<>(List.of(java(), "-Xmx1g", "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir"), "-jar", jar()));
         command.addAll(List.of(args));
@@ -53,8 +62,9 @@ class CliIT {
             assertTrue(process.waitFor(60, TimeUnit.SECONDS), "CLI finishes");
             String errors = Files.readString(err);
             System.err.print(errors); // Every warning remains visible.
-            io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertReadable(errors);
-            return new Output(process.exitValue(), Files.readString(out), errors);
+            var result = new Output(process.exitValue(), Files.readString(out), errors);
+            io.github.ifnesi.kafcacheql.testkit.SqlErrors.assertReadable(result.messages());
+            return result;
         } finally { process.destroyForcibly(); }
     }
     private static String java() { return System.getProperty("test.cli.java", Path.of(System.getProperty("java.home"), "bin", "java").toString()); }
@@ -64,16 +74,16 @@ class CliIT {
     @Test void argumentsAndTableAndJsonOutput() throws Exception {
         String topic = topic(), url = url(topic);
         var table = run("", url, "SELECT n, NULL AS \"absent\" FROM \"" + topic + "\"", "SELECT 12345 AS wider");
-        assertEquals(0, table.status(), table.err());
+        assertEquals(0, table.status(), table.messages());
         assertEquals("n | absent\n--+-------\n7 | NULL  \nwider\n-----\n12345\n", table.out());
-        assertEquals("", table.err(), "§14.1: no log output");
-        assertFalse(table.err().contains("No SLF4J providers"));
-        assertFalse(table.err().contains("no providers"));
+        assertEquals("", table.messages(), "§14.1: no log output");
+        assertFalse(table.messages().contains("No SLF4J providers"));
+        assertFalse(table.messages().contains("no providers"));
         var json = run("", "--mode", "json", url,
                 "SELECT n, NULL AS \"absent\", _key, _value, _headers, 'plain' AS text FROM \"" + topic + "\"",
                 "SELECT 2 AS second");
-        assertEquals(0, json.status(), json.err());
-        assertEquals("", json.err(), "§14.1: no log output");
+        assertEquals(0, json.status(), json.messages());
+        assertEquals("", json.messages(), "§14.1: no log output");
         var lines = json.out().lines().toList();
         assertEquals(2, lines.size(), json.out());
         var row = JSON.readTree(lines.getFirst()).get(0);
@@ -87,7 +97,7 @@ class CliIT {
         for (String text : List.of("123 trailing", "", "   ", "plain text", "123 456", "{} []")) {
             String sql = "SELECT '" + text + "' AS _value, '" + text + "' AS _key, '" + text + "' AS _headers";
             var literal = run("", "--mode", "json", url, sql);
-            assertEquals(0, literal.status(), literal.err()); assertEquals("", literal.err());
+            assertEquals(0, literal.status(), literal.messages()); assertEquals("", literal.messages());
             var object = JSON.readTree(literal.out()).get(0);
             for (String column : List.of("_value", "_key", "_headers")) {
                 assertTrue(object.get(column).isTextual(), literal.out());
@@ -96,23 +106,23 @@ class CliIT {
         }
         var nested = run("", "--mode", "json", url,
                 "SELECT ' 123 ' AS _value, 'true' AS _key, 'null' AS _headers UNION ALL SELECT '[1]' AS _value, '{}' AS _key, '\"text\"' AS _headers");
-        assertEquals(0, nested.status(), nested.err()); assertEquals("", nested.err());
+        assertEquals(0, nested.status(), nested.messages()); assertEquals("", nested.messages());
         var complete = JSON.readTree(nested.out());
         assertTrue(complete.get(0).get("_value").isNumber()); assertTrue(complete.get(0).get("_key").booleanValue());
         assertTrue(complete.get(0).get("_headers").isNull()); assertTrue(complete.get(1).get("_value").isArray());
         assertTrue(complete.get(1).get("_key").isObject()); assertEquals("text", complete.get(1).get("_headers").textValue());
         var failure = run("", url, "SELECT missing FROM \"" + topic + "\"", "SELECT 999 AS never");
         assertEquals(1, failure.status()); assertFalse(failure.out().contains("never"));
-        assertTrue(failure.err().contains("missing"), failure.err());
-        assertEquals(1, failure.err().lines().count(), "only the driver error");
-        assertTrue(failure.err().startsWith("ERROR: "), failure.err());
+        assertTrue(failure.messages().contains("missing"), failure.messages());
+        assertEquals(1, failure.messages().lines().count(), "only the driver error");
+        assertTrue(failure.messages().startsWith("ERROR: "), failure.messages());
         var missingFile = run("", "jdbc:kafcacheql://localhost:1?config.file=/nope.properties", "SHOW TABLES");
-        assertEquals("ERROR: config.file /nope.properties doesn't exist.\n", missingFile.err());
+        assertEquals("ERROR: config.file /nope.properties doesn't exist.\n", missingFile.messages());
         int port;
         try (var socket = new java.net.ServerSocket(0)) { port = socket.getLocalPort(); }
         String brokers = "localhost:" + port;
         var unreachable = run("", "jdbc:kafcacheql://" + brokers + "?default.api.timeout.ms=500&request.timeout.ms=100", "SHOW TABLES");
-        assertEquals("ERROR: Can't reach Kafka at " + brokers + ": timed out after 0.5 s.\n", unreachable.err());
+        assertEquals("ERROR: Can't reach Kafka at " + brokers + ": timed out after 0.5 s.\n", unreachable.messages());
         assertEquals(1, run("").status(), "usage error");
         // §14.1: safe diagnostics and cells, schema queries on the selected Java runtime, native SQLite UNION types.
         String schemaTopic = TestStack.uniqueTopic("cli-schema");
@@ -123,11 +133,15 @@ class CliIT {
         var record = new org.apache.avro.generic.GenericData.Record(schema); record.put("ms", 42L);
         TestStack.sendAvro(schemaTopic, "k", record, null, TestStack.SchemaIdIn.PREFIX);
         String schemaUrl = url(schemaTopic) + "&topic." + schemaTopic + ".value.format=auto&schema.registry.url=" + TestStack.REGISTRY;
+        var backed = run("", "--mode", "json", schemaUrl, "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0");
+        assertEquals(0, backed.status(), backed.messages()); assertEquals("", backed.messages());
+        assertEquals(42, JSON.readTree(backed.out()).get(0).get("ms").longValue());
+        System.out.println("Avro CLI stderr:\n" + backed.err());
         assertAll(
                 () -> {
                     var typo = run("", "jdbc:kafcacheq://localhost:9092?password=PLANTED-CLI-SECRET", "SHOW TABLES");
                     assertEquals(1, typo.status());
-                    assertEquals("ERROR: Not a KafCacheQL URL: it must start with jdbc:kafcacheql:\n", typo.err());
+                    assertEquals("ERROR: Not a KafCacheQL URL: it must start with jdbc:kafcacheql:\n", typo.messages());
                     assertFalse(typo.out().contains("PLANTED-CLI-SECRET"));
                 },
                 () -> {
@@ -137,29 +151,40 @@ class CliIT {
                     String label = "head\u001b[2J\r\u0085";
                     String query = "SELECT _value ->> '$' AS '" + label + "' FROM \"" + schemaTopic + "\" WHERE _offset=1";
                     var cells = run("", schemaUrl, query);
-                    assertEquals(0, cells.status(), cells.err()); assertEquals("", cells.err());
+                    assertEquals(0, cells.status(), cells.messages()); assertEquals("", cells.messages());
                     String heading = "head\\x1b[2J\\r\\x85", value = "before\\x1b[2Jafter\\r\\n\\t\\x00\\x7f\\x85";
                     int width = Math.max(heading.length(), value.length());
                     assertEquals(heading + " ".repeat(width-heading.length()) + "\n" + "-".repeat(width) + "\n" + value + "\n", cells.out());
                     var escaped = run("", "--mode", "json", schemaUrl, query);
-                    assertEquals(0, escaped.status(), escaped.err()); assertEquals("", escaped.err());
+                    assertEquals(0, escaped.status(), escaped.messages()); assertEquals("", escaped.messages());
                     assertEquals(control, JSON.readTree(escaped.out()).get(0).get(label).textValue());
                     assertFalse(escaped.out().contains("\u001b")); assertFalse(escaped.out().contains("\r"));
                 },
                 () -> {
-                    var backed = run("", "--mode", "json", schemaUrl, "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0");
-                    assertEquals(0, backed.status(), backed.err()); assertEquals("", backed.err());
-                    assertEquals(42, JSON.readTree(backed.out()).get(0).get("ms").longValue());
                     String direct = "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0", literal = "SELECT 1.5 AS ms";
                     for (String query : List.of(direct + " UNION ALL " + literal, literal + " UNION ALL " + direct)) {
                         var union = run("", "--mode", "json", schemaUrl, query);
-                        assertEquals(0, union.status(), union.err()); assertEquals("", union.err());
+                        assertEquals(0, union.status(), union.messages()); assertEquals("", union.messages());
                         var values = JSON.readTree(union.out());
                         assertEquals(query.startsWith(direct) ? 42 : 1.5, values.get(0).get("ms").doubleValue());
                         assertEquals(query.startsWith(direct) ? 1.5 : 42, values.get(1).get("ms").doubleValue());
                     }
                 });
-        // §14.1: no log output on Protobuf queries, including on Java 25 (no Unsafe warning).
+        // §14: each schema format works through the shaded JAR; only the JDK Unsafe warnings are allowed.
+        String jsonTopic = TestStack.uniqueTopic("cli-json-schema");
+        TestStack.createTopic(jsonTopic, 1, Map.of());
+        var jsonSchema = new io.confluent.kafka.schemaregistry.json.JsonSchema(
+                "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}");
+        try (var serializer = new io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer<>()) {
+            serializer.configure(Map.of("schema.registry.url", TestStack.REGISTRY), false);
+            var envelope = io.confluent.kafka.schemaregistry.json.JsonSchemaUtils.envelope(jsonSchema, JSON.readTree("{\"id\":42}"));
+            TestStack.send(jsonTopic, 0, null, null, serializer.serialize(jsonTopic, envelope), null);
+        }
+        String jsonUrl = url(jsonTopic) + "&topic." + jsonTopic + ".value.format=auto&schema.registry.url=" + TestStack.REGISTRY;
+        var schemaJson = run("", "--mode", "json", jsonUrl, "SELECT id FROM \"" + jsonTopic + "\"");
+        assertEquals(0, schemaJson.status(), schemaJson.messages()); assertEquals("", schemaJson.messages());
+        assertEquals(42, JSON.readTree(schemaJson.out()).get(0).get("id").longValue());
+        System.out.println("JSON Schema CLI stderr:\n" + schemaJson.err());
         String protobufTopic = TestStack.uniqueTopic("cli-protobuf");
         TestStack.createTopic(protobufTopic, 1, Map.of());
         var protobufSchema = new io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema(
@@ -173,8 +198,9 @@ class CliIT {
         }
         String protobufUrl = url(protobufTopic) + "&topic." + protobufTopic + ".value.format=auto&schema.registry.url=" + TestStack.REGISTRY;
         var protobuf = run("", "--mode", "json", protobufUrl, "SELECT id FROM \"" + protobufTopic + "\"");
-        assertEquals(0, protobuf.status(), protobuf.err()); assertEquals("", protobuf.err());
+        assertEquals(0, protobuf.status(), protobuf.messages()); assertEquals("", protobuf.messages());
         assertEquals(42, JSON.readTree(protobuf.out()).get(0).get("id").longValue());
+        System.out.println("Protobuf CLI stderr:\n" + protobuf.err());
     }
 
     /** §14.1 Output modes: line prints aligned names, NULL and escaped controls, with only a blank
@@ -193,15 +219,15 @@ class CliIT {
         assertAll(
                 () -> {
                     var line = run("", "--mode", "line", url, query);
-                    assertEquals(0, line.status(), line.err()); assertEquals("", line.err());
+                    assertEquals(0, line.status(), line.messages()); assertEquals("", line.messages());
                     assertEquals("_offset: 0\n   漢字: before\\x1b[2Jafter\\r\\n\\t\\x00\\x7f\\x85\n   café: NULL\n\n"
                             + "_offset: 1\n   漢字: João\n   café: NULL\n", line.out());
                     var empty = run("", "--mode", "line", url, query + " LIMIT 0");
-                    assertEquals(0, empty.status(), empty.err()); assertEquals("", empty.err()); assertEquals("", empty.out());
+                    assertEquals(0, empty.status(), empty.messages()); assertEquals("", empty.messages()); assertEquals("", empty.out());
                     var table = run("", "--mode", "table", url, query);
                     var defaults = run("", url, query);
-                    assertEquals(0, table.status(), table.err()); assertEquals("", table.err());
-                    assertEquals(0, defaults.status(), defaults.err()); assertEquals("", defaults.err());
+                    assertEquals(0, table.status(), table.messages()); assertEquals("", table.messages());
+                    assertEquals(0, defaults.status(), defaults.messages()); assertEquals("", defaults.messages());
                     assertEquals(defaults.out(), table.out());
                 },
                 () -> {
@@ -211,10 +237,10 @@ class CliIT {
                     var statements = List.of(query + " LIMIT 0", first, second, query + " LIMIT 0", first, query + " LIMIT 0");
                     var arguments = new ArrayList<>(List.of("--mode", "line", url)); arguments.addAll(statements);
                     var consecutive = run("", arguments.toArray(String[]::new));
-                    assertEquals(0, consecutive.status(), consecutive.err()); assertEquals("", consecutive.err());
+                    assertEquals(0, consecutive.status(), consecutive.messages()); assertEquals("", consecutive.messages());
                     assertEquals("n: 0\n\nn: 1\n\nn: 0\n", consecutive.out());
                     var script = run(String.join(";\n", statements) + ";\n", "--mode", "line", url);
-                    assertEquals(0, script.status(), script.err()); assertEquals("", script.err());
+                    assertEquals(0, script.status(), script.messages()); assertEquals("", script.messages());
                     assertEquals(consecutive.out(), script.out());
                 },
                 () -> {
@@ -223,21 +249,21 @@ class CliIT {
                             new String[] {"--mode", "line", url, query, "--mode", "json"})) {
                         var late = run("", args);
                         assertEquals(1, late.status()); assertEquals("", late.out());
-                        assertEquals("ERROR: Put --mode before the URL.\n" + usage, late.err());
+                        assertEquals("ERROR: Put --mode before the URL.\n" + usage, late.messages());
                     }
                 },
                 () -> {
                     var bogus = run("", "--mode", "bogus", url, query);
-                    assertEquals(1, bogus.status()); assertEquals("", bogus.out()); assertEquals(invalidMode, bogus.err());
+                    assertEquals(1, bogus.status()); assertEquals("", bogus.out()); assertEquals(invalidMode, bogus.messages());
                 },
                 () -> {
                     var missing = run("", "--mode");
-                    assertEquals(1, missing.status()); assertEquals("", missing.out()); assertEquals(invalidMode, missing.err());
+                    assertEquals(1, missing.status()); assertEquals("", missing.out()); assertEquals(invalidMode, missing.messages());
                 },
                 () -> {
                     var removed = run("", "--json", url, query);
                     assertEquals(1, removed.status()); assertEquals("", removed.out());
-                    assertEquals("ERROR: Unknown option: --json.\n" + usage, removed.err());
+                    assertEquals("ERROR: Unknown option: --json.\n" + usage, removed.messages());
                 });
     }
 
@@ -250,29 +276,29 @@ class CliIT {
                 + "SELECT missing FROM \"" + topic + "\";\nSELECT 999 AS never;\n", "--mode", "json", url);
         assertEquals(1, result.status());
         assertEquals("[{\"text\":\"a;b\"}]\n[{\"n\":7}]\n", result.out());
-        assertTrue(result.err().contains("missing"), result.err());
+        assertTrue(result.messages().contains("missing"), result.messages());
         assertEquals(0, run("SELECT n FROM \"" + topic + "\";\n", url).status());
         // §14.1 Help: scripts and arguments print neither greeting nor help; help is sent as SQL.
         var help = run("help;\nSELECT 999 AS never;\n", "--mode", "json", url);
         assertEquals(1, help.status()); assertEquals("", help.out());
         var argument = run("", "--mode", "json", url, "help;");
         assertEquals(1, argument.status()); assertEquals("", argument.out());
-        assertTrue(help.err().startsWith("ERROR: "), help.err());
-        assertEquals(argument.err(), help.err(), "the driver's SQL rejection, as for an argument");
+        assertTrue(help.messages().startsWith("ERROR: "), help.messages());
+        assertEquals(argument.messages(), help.messages(), "the driver's SQL rejection, as for an argument");
     }
 
     /** §14.1: cache statements work as anywhere else; DROP prints its warning on stderr. */
     @Test void cacheStatementsAndWarnings() throws Exception {
         String topic = topic(), url = url(topic);
         var result = run("", "--mode", "json", url, "SYNC " + topic, "DROP TABLE \"" + topic + "\"");
-        assertEquals(0, result.status(), result.err());
+        assertEquals(0, result.status(), result.messages());
         var row = JSON.readTree(result.out()).get(0);
         assertEquals(topic, row.get("table_name").textValue());
         assertEquals(1, row.get("fetched_records").longValue());
-        assertTrue(result.err().contains("Kafka is unchanged"), result.err());
-        assertFalse(result.err().contains("No SLF4J providers"), result.err());
-        assertEquals(1, result.err().lines().count(), "only the driver warning");
-        assertTrue(result.err().startsWith("WARN: "), result.err());
+        assertTrue(result.messages().contains("Kafka is unchanged"), result.messages());
+        assertFalse(result.messages().contains("No SLF4J providers"), result.messages());
+        assertEquals(1, result.messages().lines().count(), "only the driver warning");
+        assertTrue(result.messages().startsWith("WARN: "), result.messages());
         assertTrue(TestStack.topicExists(topic));
     }
 
