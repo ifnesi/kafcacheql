@@ -95,6 +95,31 @@ class CredentialsIT {
      * Real JDBC validation failures and a broker rejecting a login must reveal no credential.
      */
     @Test void connectionErrorsHideCredentials() throws Exception {
+        org.junit.jupiter.api.Assertions.assertAll(
+                () -> {
+                    for (boolean offline : List.of(false, true)) for (String source : List.of("properties", "url", "file")) {
+                        var p = new Properties(); p.setProperty("offline", Boolean.toString(offline));
+                        p.setProperty("cache.path", System.getProperty("java.io.tmpdir") + "/refused-bootstrap.db");
+                        String bootstrap = "alice:PLANTED-BOOTSTRAP-SECRET@localhost:9092", jdbc = "jdbc:kafcacheql://";
+                        if (source.equals("url")) jdbc += "?bootstrap.servers=" + bootstrap;
+                        else if (source.equals("properties")) p.setProperty("bootstrap.servers", bootstrap);
+                        else {
+                            var file = java.nio.file.Files.createTempFile(java.nio.file.Path.of(System.getProperty("java.io.tmpdir")), "bootstrap-", ".properties");
+                            java.nio.file.Files.writeString(file, "bootstrap.servers=" + bootstrap);
+                            p.setProperty("config.file", file.toString());
+                        }
+                        final String address = jdbc;
+                        SQLException failure = assertJdbcThrows(SQLException.class, () -> new KafCacheQLDriver().connect(address, p));
+                        assertTrue(failure.getMessage().contains("credentials")); assertHidden(trace(failure), "PLANTED-BOOTSTRAP-SECRET");
+                    }
+                },
+                () -> {
+                    for (String key : List.of("sasl.login.callback.handler.class", "sasl.client.callback.handler.class", "sasl.login.class")) {
+                        Properties p = properties(); p.setProperty(key, "java.lang.String");
+                        SQLException failure = assertJdbcThrows(SQLException.class, () -> new KafCacheQLDriver().connect(url(), p));
+                        assertEquals(key + " must name a class that implements " + (key.equals("sasl.login.class") ? "Login." : "AuthenticateCallbackHandler."), failure.getMessage());
+                    }
+                });
         try (var capture = LogCapture.capture()) {
             Properties p = properties();
             p.setProperty("request.timeout.ms", "HEADER-SECRET");

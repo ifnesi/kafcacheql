@@ -165,7 +165,8 @@ class RecordDecoderIT {
         verifyFlow(avroTopic, Format.AVRO, Format.AVRO, List.of(
                 new Expected("\"key\"", keyId, DECIMAL_JSON, valueId, null),
                 new Expected(base64(unknown), "2147483647", base64(unknown), "2147483647", "key,value"),
-                new Expected(base64(corruptKey), keyId, DECIMAL_JSON, valueId, "key"),
+                new Expected(base64(corruptKey), keyId, DECIMAL_JSON, valueId, "key",
+                        "key: Avro, schema " + keyId + ": the value ends before the record does"),
                 new Expected("\"key\"", keyId, base64(corruptValue), valueId, "value"),
                 new Expected(base64(key), null, base64(value), null, "key,value"),
                 new Expected(null, null, DECIMAL_JSON, valueSchema.getGuid(), null),
@@ -236,7 +237,11 @@ class RecordDecoderIT {
                 .build();
     }
 
-    private record Expected(String key, String keyRef, String value, String valueRef, String errors) {}
+    private record Expected(String key, String keyRef, String value, String valueRef, String errors, String detail) {
+        Expected(String key, String keyRef, String value, String valueRef, String errors) {
+            this(key, keyRef, value, valueRef, errors, null);
+        }
+    }
 
     private static Expected plain(String key, String value) {
         return new Expected(key, null, value, null, null);
@@ -306,6 +311,7 @@ class RecordDecoderIT {
                     assertEquals(row.key() == null ? 0 : 1, rs.getInt(8), context + " key json_valid");
                     assertEquals(row.value() == null ? 0 : 1, rs.getInt(9), context + " value json_valid");
                     String error = rs.getString(7);
+                    if (row.detail() != null) assertEquals(row.detail(), error, context);
                     if (row.errors() == null) {
                         assertNull(error, context);
                     } else {

@@ -57,8 +57,12 @@ public final class Main {
 
     private static int run(String[] args) {
         int url = args.length > 0 && args[0].equals("--json") ? 1 : 0;
-        if (args.length <= url || !args[url].startsWith("jdbc:")) {
+        if (args.length <= url) {
             System.err.println("Usage: java -jar kafcacheql-jdbc.jar [--json] <jdbc-url> [statement ...]");
+            return 1;
+        }
+        if (!args[url].startsWith("jdbc:kafcacheql:")) {
+            System.err.println("ERROR: Not a KafCacheQL URL: it must start with jdbc:kafcacheql:");
             return 1;
         }
         var cli = new Main(url == 1);

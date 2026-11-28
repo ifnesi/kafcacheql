@@ -76,7 +76,18 @@ final class ResultTypes {
     private List<Output> select(Select select, Scope outer) throws SQLException {
         var ctes = new Scope(outer, select.getWithItemsList());
         if (select instanceof ParenthesedSelect nested) return select(nested.getSelect(), ctes);
-        if (select instanceof SetOperationList set) return select(set.getSelects().getFirst(), ctes);
+        if (select instanceof SetOperationList set) {
+            var output = new ArrayList<>(select(set.getSelects().getFirst(), ctes));
+            for (int branch = 1; branch < set.getSelects().size(); branch++) {
+                var columns = select(set.getSelects().get(branch), ctes);
+                for (int i = 0; i < output.size(); i++) {
+                    Output first = output.get(i);
+                    if (i >= columns.size() || first.type() != columns.get(i).type())
+                        output.set(i, new Output(first.name(), null));
+                }
+            }
+            return output;
+        }
         if (select instanceof Values values) {
             var expressions = values.getExpressions();
             var row = expressions.getFirst() instanceof ExpressionList<?> list ? list : expressions;

@@ -159,7 +159,8 @@ equivalent permissions yourself. Protect the cache and settings file as you woul
 credentials.
 
 [Record transforms](transforms.md) can remove or mask chosen fields before they are cached. Configure them
-before querying sensitive topics; they do not erase earlier copies or replace Kafka's access controls.
+before querying sensitive topics; they do not erase earlier copies or replace Kafka's access controls. They
+apply to records only: schemas from Schema Registry are cached unchanged.
 
 `topics.include` and `topics.exclude` filter navigator listings, `SHOW TABLES` and the topics `SYNC` reaches.
 They do not prevent queries or erase excluded topics from the cache.

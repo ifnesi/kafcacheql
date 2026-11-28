@@ -23,7 +23,10 @@ public final class ConfigErrors {
         if (root instanceof java.nio.file.FileAlreadyExistsException file) return file.getFile() + " already exists";
         if (root instanceof java.nio.file.FileSystemException file && file.getReason() != null) return file.getReason();
         if (root instanceof InterruptedException) return "operation interrupted";
-        String message = root.getMessage();
+        if (root instanceof java.io.EOFException) return "unexpected end of input";
+        if (root instanceof ClassCastException) return "a configured class has an incompatible type";
+        String message = root instanceof com.fasterxml.jackson.core.JsonProcessingException json
+                ? json.getOriginalMessage() : root.getMessage();
         if (message == null || message.isBlank()) {
             if (root instanceof java.util.concurrent.TimeoutException || root instanceof org.apache.kafka.common.errors.TimeoutException) return "timed out";
             return "operation failed";

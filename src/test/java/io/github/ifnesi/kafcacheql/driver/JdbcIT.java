@@ -352,7 +352,14 @@ class JdbcIT {
      * §7.3: older decoder output is served unchanged offline and rebuilt on the next online use.
      */
     @Test void headersAreReadableAndOlderCachesRebuildOnlyOnline() throws Exception {
-        String plain = topic("delete"), maskedTopic = topic("compact");
+        String plain = topic("delete"), maskedTopic = topic("compact"), corrupt = topic("delete");
+        var record = new GenericData.Record(VALUE); record.put("n", 1); record.put("ok", true);
+        byte[] framed = TestStack.serializeAvro(corrupt, new RecordHeaders(), record, TestStack.SchemaIdIn.PREFIX, false);
+        int schemaId = ByteBuffer.wrap(framed, 1, 4).getInt();
+        TestStack.send(corrupt, 0, null, null, Arrays.copyOf(framed, 5), null);
+        String oldError = "value: Error deserializing Avro message for id SchemaId{schemaType='AVRO', id="
+                + schemaId + ", guid='null', messageIndexes=null}";
+        String newError = "value: Avro, schema " + schemaId + ": the value ends before the record does";
         var p = settings(); p.setProperty("mask.secret", "test-transform-secret");
         p.setProperty("topic." + maskedTopic + ".mask.headers", "client-ip");
         var headers = new RecordHeaders().add("text", TestStack.utf8("café"))
@@ -364,10 +371,10 @@ class JdbcIT {
                 new RecordHeaders().add("client-ip", TestStack.utf8("private-ip-123")));
         String hash = masked(TestStack.utf8("private-ip-123"));
         assertTrue(hash.matches("[0-9a-f]{64}"));
-        var expected = Map.of(plain, """
+        var expected = Map.of(corrupt, "[]", plain, """
                 [{"key":"text","value":"café"},{"key":"binary","base64":"AP8="},{"key":"null","value":null},{"key":"empty","value":""},{"key":"tag","value":"first"},{"key":"tag","value":"second"}]""",
                 maskedTopic, "[{\"key\":\"client-ip\",\"value\":\"" + hash + "\"}]");
-        var old = Map.of(plain, """
+        var old = Map.of(corrupt, "[]", plain, """
                 [{"key":"text","value":"Y2Fmw6k="},{"key":"binary","value":"AP8="},{"key":"null","value":null},{"key":"empty","value":""},{"key":"tag","value":"Zmlyc3Q="},{"key":"tag","value":"c2Vjb25k"}]""",
                 maskedTopic, "[{\"key\":\"client-ip\",\"value\":\"" + Base64.getEncoder().encodeToString(TestStack.utf8(hash)) + "\"}]");
         var generations = new HashMap<String, Long>();
@@ -376,19 +383,22 @@ class JdbcIT {
             try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(plain) + " WHERE _offset=1")) {
                 assertTrue(r.next()); assertEquals("[]", r.getString(1)); assertFalse(r.next());
             }
-            for (String topic : List.of(plain, maskedTopic)) {
-                try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
-                    assertTrue(r.next()); assertEquals(expected.get(topic), r.getString(1)); assertFalse(r.next());
+            for (String topic : List.of(plain, maskedTopic, corrupt)) {
+                try (var r = s.executeQuery("SELECT _headers,_decode_error FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
+                    assertTrue(r.next()); assertEquals(expected.get(topic), r.getString(1));
+                    assertEquals(topic.equals(corrupt) ? newError : null, r.getString(2)); assertFalse(r.next());
                 }
                 long generation = cache.read(reader -> TopicRegistry.generation(reader, topic).orElseThrow());
                 generations.put(topic, generation);
-                // Seed the exact version-6 representation, including on a transformed topic.
+                // Seed version-6 headers (including transformed ones) and the version-7 decoder error.
                 cache.write(topic, generation, execution, writer -> {
-                    try (var update = writer.prepareStatement("UPDATE " + StorageDdl.quote(StorageDdl.tableName(generation)) + " SET _headers=? WHERE _offset=0")) {
-                        update.setString(1, old.get(topic)); assertEquals(1, update.executeUpdate());
+                    try (var update = writer.prepareStatement("UPDATE " + StorageDdl.quote(StorageDdl.tableName(generation)) + " SET _headers=?,_decode_error=? WHERE _offset=0")) {
+                        update.setString(1, old.get(topic)); update.setString(2, topic.equals(corrupt) ? oldError : null);
+                        assertEquals(1, update.executeUpdate());
                     }
-                    try (var update = writer.prepareStatement("UPDATE \"$topics\" SET decoder_version=6 WHERE id=?")) {
-                        update.setLong(1, generation); assertEquals(1, update.executeUpdate());
+                    try (var update = writer.prepareStatement("UPDATE \"$topics\" SET decoder_version=? WHERE id=?")) {
+                        update.setInt(1, topic.equals(corrupt) ? 7 : 6); update.setLong(2, generation);
+                        assertEquals(1, update.executeUpdate());
                     }
                     return null;
                 });
@@ -396,23 +406,25 @@ class JdbcIT {
         }
         p.setProperty("offline", "true");
         try (var c = DriverManager.getConnection("jdbc:kafcacheql://", p); var s = c.createStatement()) {
-            for (String topic : List.of(plain, maskedTopic)) {
-                try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
-                    assertTrue(r.next()); assertEquals(old.get(topic), r.getString(1)); assertFalse(r.next());
+            for (String topic : List.of(plain, maskedTopic, corrupt)) {
+                try (var r = s.executeQuery("SELECT _headers,_decode_error FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
+                    assertTrue(r.next()); assertEquals(old.get(topic), r.getString(1));
+                    assertEquals(topic.equals(corrupt) ? oldError : null, r.getString(2)); assertFalse(r.next());
                 }
                 try (var r = s.executeQuery("SELECT id,decoder_version FROM \"$topics\" WHERE topic='" + topic + "'")) {
-                    assertTrue(r.next()); assertEquals(generations.get(topic).longValue(), r.getLong(1)); assertEquals(6, r.getInt(2));
+                    assertTrue(r.next()); assertEquals(generations.get(topic).longValue(), r.getLong(1)); assertEquals(topic.equals(corrupt) ? 7 : 6, r.getInt(2));
                 }
             }
         }
         p.setProperty("offline", "false");
         try (var c = DriverManager.getConnection(URL, p); var s = c.createStatement()) {
-            for (String topic : List.of(plain, maskedTopic)) {
-                try (var r = s.executeQuery("SELECT _headers FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
-                    assertTrue(r.next()); assertEquals(expected.get(topic), r.getString(1)); assertFalse(r.next());
+            for (String topic : List.of(plain, maskedTopic, corrupt)) {
+                try (var r = s.executeQuery("SELECT _headers,_decode_error FROM " + StorageDdl.quote(topic) + " WHERE _offset=0")) {
+                    assertTrue(r.next()); assertEquals(expected.get(topic), r.getString(1));
+                    assertEquals(topic.equals(corrupt) ? newError : null, r.getString(2)); assertFalse(r.next());
                 }
                 try (var r = s.executeQuery("SELECT id,decoder_version FROM \"$topics\" WHERE topic='" + topic + "'")) {
-                    assertTrue(r.next()); assertTrue(r.getLong(1) > generations.get(topic)); assertEquals(7, r.getInt(2));
+                    assertTrue(r.next()); assertTrue(r.getLong(1) > generations.get(topic)); assertEquals(8, r.getInt(2));
                 }
             }
         }
@@ -2259,6 +2271,22 @@ class JdbcIT {
                 }
             }
             assertFalse(rows.next());
+        }
+        // §7.2: computed expressions keep SQLite's types, including every contributing UNION branch.
+        String direct = "SELECT l FROM " + table + " WHERE _offset=0", literal = "SELECT 1.5 AS l";
+        for (String sql : List.of(direct + " UNION ALL " + literal, literal + " UNION ALL " + direct)) {
+            try (var rows = statement.executeQuery(sql)) {
+                double[] wanted = sql.startsWith(direct) ? new double[]{1, 1.5} : new double[]{1.5, 1};
+                for (double value : wanted) {
+                    assertTrue(rows.next()); assertEquals(value, ((Number) rows.getObject(1)).doubleValue());
+                    assertEquals(value, rows.getDouble(1)); assertEquals((float) value, rows.getFloat(1));
+                }
+                assertFalse(rows.next());
+            }
+        }
+        try (var rows = statement.executeQuery(direct + " UNION ALL " + direct)) {
+            assertType(rows, "l", JDBCType.BIGINT);
+            while (rows.next()) assertEquals(1L, rows.getObject(1));
         }
         // A computed column named like a schema field must still keep SQLite's type.
         try (var rows = statement.executeQuery("SELECT count(*) AS bool FROM " + table + " WHERE _offset>=0")) {

@@ -139,12 +139,16 @@ public final class RecordDecoder implements AutoCloseable {
                         }
                         return new Part(decoded, ref, stored, null, messageIndex);
                     } catch (RuntimeException | IOException e) {
+                        String reason = io.github.ifnesi.kafcacheql.config.ConfigErrors.detail(e);
                         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+                            if (cause instanceof java.io.EOFException) reason = "the value ends before the record does";
                             if (cause instanceof SchemaRegistry.LookupFailure lookup) {
                                 throw lookup.failure();
                             }
                         }
-                        return failed(payload, key, ref, stored, e.getMessage());
+                        String name = avro ? "Avro" : json ? "JSON Schema" : "Protobuf";
+                        return failed(payload, key, ref, stored, name + ", schema " + ref + ": "
+                                + reason);
                     }
                 }
             }

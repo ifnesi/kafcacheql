@@ -114,6 +114,67 @@ class CliIT {
         var unreachable = run("", "jdbc:kafcacheql://" + brokers + "?default.api.timeout.ms=500&request.timeout.ms=100", "SHOW TABLES");
         assertEquals("ERROR: Can't reach Kafka at " + brokers + ": timed out after 0.5 s.\n", unreachable.err());
         assertEquals(1, run("").status(), "usage error");
+        // §14.1: safe diagnostics and cells, schema queries on the selected Java runtime, native SQLite UNION types.
+        String schemaTopic = TestStack.uniqueTopic("cli-schema");
+        TestStack.createTopic(schemaTopic, 1, Map.of());
+        var schema = new org.apache.avro.Schema.Parser().parse("""
+                {"type":"record","name":"CliSchema","fields":[{"name":"ms","type":"long"}]}
+                """);
+        var record = new org.apache.avro.generic.GenericData.Record(schema); record.put("ms", 42L);
+        TestStack.sendAvro(schemaTopic, "k", record, null, TestStack.SchemaIdIn.PREFIX);
+        String schemaUrl = url(schemaTopic) + "&topic." + schemaTopic + ".value.format=auto&schema.registry.url=" + TestStack.REGISTRY;
+        assertAll(
+                () -> {
+                    var typo = run("", "jdbc:kafcacheq://localhost:9092?password=PLANTED-CLI-SECRET", "SHOW TABLES");
+                    assertEquals(1, typo.status());
+                    assertEquals("ERROR: Not a KafCacheQL URL: it must start with jdbc:kafcacheql:\n", typo.err());
+                    assertFalse(typo.out().contains("PLANTED-CLI-SECRET"));
+                },
+                () -> {
+                    String control = "before\u001b[2Jafter\r\n\t\u0000\u007f\u0085";
+                    // Kafka payload and a SQL column label must both be safe in a terminal.
+                    TestStack.sendString(schemaTopic, "control", control, null);
+                    String label = "head\u001b[2J\r\u0085";
+                    String query = "SELECT _value ->> '$' AS '" + label + "' FROM \"" + schemaTopic + "\" WHERE _offset=1";
+                    var cells = run("", schemaUrl, query);
+                    assertEquals(0, cells.status(), cells.err()); assertEquals("", cells.err());
+                    String heading = "head\\x1b[2J\\r\\x85", value = "before\\x1b[2Jafter\\r\\n\\t\\x00\\x7f\\x85";
+                    int width = Math.max(heading.length(), value.length());
+                    assertEquals(heading + " ".repeat(width-heading.length()) + "\n" + "-".repeat(width) + "\n" + value + "\n", cells.out());
+                    var escaped = run("", "--json", schemaUrl, query);
+                    assertEquals(0, escaped.status(), escaped.err()); assertEquals("", escaped.err());
+                    assertEquals(control, JSON.readTree(escaped.out()).get(0).get(label).textValue());
+                    assertFalse(escaped.out().contains("\u001b")); assertFalse(escaped.out().contains("\r"));
+                },
+                () -> {
+                    var backed = run("", "--json", schemaUrl, "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0");
+                    assertEquals(0, backed.status(), backed.err()); assertEquals("", backed.err());
+                    assertEquals(42, JSON.readTree(backed.out()).get(0).get("ms").longValue());
+                    String direct = "SELECT ms FROM \"" + schemaTopic + "\" WHERE _offset=0", literal = "SELECT 1.5 AS ms";
+                    for (String query : List.of(direct + " UNION ALL " + literal, literal + " UNION ALL " + direct)) {
+                        var union = run("", "--json", schemaUrl, query);
+                        assertEquals(0, union.status(), union.err()); assertEquals("", union.err());
+                        var values = JSON.readTree(union.out());
+                        assertEquals(query.startsWith(direct) ? 42 : 1.5, values.get(0).get("ms").doubleValue());
+                        assertEquals(query.startsWith(direct) ? 1.5 : 42, values.get(1).get("ms").doubleValue());
+                    }
+                });
+        // §14.1: no log output on Protobuf queries, including on Java 25 (no Unsafe warning).
+        String protobufTopic = TestStack.uniqueTopic("cli-protobuf");
+        TestStack.createTopic(protobufTopic, 1, Map.of());
+        var protobufSchema = new io.confluent.kafka.schemaregistry.protobuf.ProtobufSchema(
+                "syntax = \"proto3\"; message CliProto { int64 id = 1; }");
+        var descriptor = protobufSchema.toDescriptor();
+        var message = com.google.protobuf.DynamicMessage.newBuilder(descriptor)
+                .setField(descriptor.findFieldByName("id"), 42L).build();
+        try (var serializer = new io.confluent.kafka.serializers.protobuf.KafkaProtobufSerializer<com.google.protobuf.Message>()) {
+            serializer.configure(Map.of("schema.registry.url", TestStack.REGISTRY), false);
+            TestStack.send(protobufTopic, 0, null, null, serializer.serialize(protobufTopic, message), null);
+        }
+        String protobufUrl = url(protobufTopic) + "&topic." + protobufTopic + ".value.format=auto&schema.registry.url=" + TestStack.REGISTRY;
+        var protobuf = run("", "--json", protobufUrl, "SELECT id FROM \"" + protobufTopic + "\"");
+        assertEquals(0, protobuf.status(), protobuf.err()); assertEquals("", protobuf.err());
+        assertEquals(42, JSON.readTree(protobuf.out()).get(0).get("id").longValue());
     }
 
     /** §14.1: stdin ends statements at a semicolon ending a line; first failure stops with status 1. */

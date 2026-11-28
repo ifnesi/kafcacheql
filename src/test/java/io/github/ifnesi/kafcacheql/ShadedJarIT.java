@@ -40,7 +40,7 @@ class ShadedJarIT {
             "net/sf/jsqlparser/", "com/google/", "org/apache/commons/", "org/apache/hc/",
             "com/squareup/", "com/palantir/javapoet/", "okio/",
             "org/yaml/snakeyaml/", "io/swagger/", "com/eclipsesource/json/",
-            "org/checkerframework/", "javax/annotation/",
+            "org/jspecify/", "javax/annotation/",
             "org/everit/", "org/json/", "com/damnhandy/", "com/github/erosb/", "com/sanctionco/", "org/joda/", "com/kjetland/", "javax/validation/", "io/github/classgraph/", "nonapi/io/github/classgraph/", "kotlin/", "org/intellij/", "org/jetbrains/");
 
     /**

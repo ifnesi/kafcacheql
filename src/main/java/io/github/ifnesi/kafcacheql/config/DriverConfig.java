@@ -181,6 +181,7 @@ public record DriverConfig(
 
     /** URL hosts win; a different bootstrap.servers elsewhere is a conflict, not silently ignored. */
     private static Optional<String> bootstrap(JdbcUrl url, String setting) throws SQLException {
+        if (setting != null && !setting.isBlank()) JdbcUrl.validateBootstrapServers(setting);
         if (url.servers().isEmpty()) {
             return Optional.ofNullable(setting).map(String::trim).filter(s -> !s.isEmpty());
         }

@@ -235,7 +235,16 @@ public final class ClientSettings {
     private static void validate(Map<String, Object> consumer, Map<String, Object> admin,
                                  Map<String, Object> schemaRegistry, Map<String, String> given) throws SQLException {
         try {
-            ConsumerConfig.configDef().parse(consumer);
+            var parsed = ConsumerConfig.configDef().parse(consumer);
+            for (var entry : Map.of(
+                    "sasl.login.callback.handler.class", org.apache.kafka.common.security.auth.AuthenticateCallbackHandler.class,
+                    "sasl.client.callback.handler.class", org.apache.kafka.common.security.auth.AuthenticateCallbackHandler.class,
+                    "sasl.login.class", org.apache.kafka.common.security.auth.Login.class,
+                    "ssl.engine.factory.class", org.apache.kafka.common.security.auth.SslEngineFactory.class).entrySet()) {
+                var configured = (Class<?>) parsed.get(entry.getKey());
+                if (configured != null && !entry.getValue().isAssignableFrom(configured))
+                    throw ConfigErrors.problem(entry.getKey() + " must name a class that implements " + entry.getValue().getSimpleName());
+            }
             AdminClientConfig.configDef().parse(admin);
             if (schemaRegistry.containsKey(AbstractKafkaSchemaSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG)) {
                 AbstractKafkaSchemaSerDeConfig.baseConfigDef().parse(schemaRegistry);

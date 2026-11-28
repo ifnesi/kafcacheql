@@ -78,9 +78,9 @@ With the [quick start](../README.md#quick-start)'s stack running, from the repos
 
 ```sh
 mvn test-compile failsafe:integration-test failsafe:verify \
-  '-Dit.test=PerformanceMeasurement#measure' -DargLine="-Xms1g -Xmx4g"
+  '-Dit.test=PerformanceMeasurement#measure' -Dtest.heap=4g
 mvn test-compile failsafe:integration-test failsafe:verify \
-  '-Dit.test=PerformanceMeasurement#parallelFetch' -DargLine="-Xms1g -Xmx4g"
+  '-Dit.test=PerformanceMeasurement#parallelFetch' -Dtest.heap=4g
 ```
 
 `PerformanceMeasurement` isn't part of `mvn verify`. It creates its own uniquely named `perf-` topics, deletes

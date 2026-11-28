@@ -9,6 +9,10 @@ The cache is the driver's local SQLite copy of fetched Kafka records. Transforms
 before storage. The JSON columns `_key` and `_value`, headers and schema-derived columns all show the
 transformed data. Offline queries read that stored copy; transforms do not run again.
 
+Transforms change records only. The schemas fetched from Schema Registry are cached unchanged, including
+field names, documentation and default values, so a schema that itself contains sensitive text, such as a
+real address as a field's default, is copied into the cache as it is.
+
 This is not access control. Original data still crosses the network to your machine, and anyone who can
 change settings can remove a transform. Transforms do not erase earlier caches or exports. See
 [cache security](configuration.md#cache-security) for protecting those copies.

@@ -76,9 +76,19 @@ public record JdbcUrl(List<String> servers, Map<String, String> params) {
     }
 
     /** host:port, [ipv6]:port; hosts are letters, digits, '.', '-' and '_'. */
+    static void validateBootstrapServers(String servers) throws SQLException {
+        for (String entry : servers.split(",", -1)) {
+            server(entry.trim(), reason -> ConfigErrors.problem("Invalid bootstrap.servers: " + reason));
+        }
+    }
+
     private static String server(String server) throws SQLException {
+        return server(server, ConfigErrors::malformedUrl);
+    }
+
+    private static String server(String server, java.util.function.Function<String, SQLException> error) throws SQLException {
         if (server.contains("@")) {
-            throw ConfigErrors.malformedUrl("the host list can't hold credentials (user:password@host); "
+            throw error.apply("the host list can't hold credentials (user:password@host); "
                     + "put them in sasl.jaas.config");
         }
         String host;
@@ -86,28 +96,28 @@ public record JdbcUrl(List<String> servers, Map<String, String> params) {
         if (server.startsWith("[")) {
             int close = server.indexOf("]:");
             if (close < 0) {
-                throw ConfigErrors.malformedUrl("host " + shown(server) + " needs a port: [address]:port");
+                throw error.apply("host " + shown(server) + " needs a port: [address]:port");
             }
             host = server.substring(1, close);
             port = server.substring(close + 2);
             if (host.isEmpty() || !host.matches("[0-9A-Fa-f:.]+")) {
-                throw ConfigErrors.malformedUrl("host " + shown(server) + " isn't an IPv6 address");
+                throw error.apply("host " + shown(server) + " isn't an IPv6 address");
             }
         } else {
             int colon = server.lastIndexOf(':');
             if (colon < 0) {
-                throw ConfigErrors.malformedUrl(server.isEmpty()
+                throw error.apply(server.isEmpty()
                         ? "the host list has an empty entry"
                         : "host " + shown(server) + " needs a port: host:port");
             }
             host = server.substring(0, colon);
             port = server.substring(colon + 1);
             if (host.isEmpty() || !host.matches("[A-Za-z0-9._-]+")) {
-                throw ConfigErrors.malformedUrl("host " + shown(server) + " isn't a host name or address");
+                throw error.apply("host " + shown(server) + " isn't a host name or address");
             }
         }
         if (!port.matches("[0-9]{1,5}") || Integer.parseInt(port) < 1 || Integer.parseInt(port) > 65535) {
-            throw ConfigErrors.malformedUrl("host " + shown(server) + " needs a port between 1 and 65535");
+            throw error.apply("host " + shown(server) + " needs a port between 1 and 65535");
         }
         return server;
     }
